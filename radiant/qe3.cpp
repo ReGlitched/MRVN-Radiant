@@ -48,6 +48,7 @@
 #include "stream/stringstream.h"
 #include "os/path.h"
 #include "scenelib.h"
+#include "string/string.h"
 
 #include "gtkutil/messagebox.h"
 #include "error.h"
@@ -61,6 +62,38 @@
 #include "autosave.h"
 
 QEGlobals_t g_qeglobals;
+
+#if defined( WIN32 )
+#include <windows.h>
+#include <tlhelp32.h>
+static int terminate_processes_by_name( const char* exeName ){
+	HANDLE snapshot = CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 );
+	if ( snapshot == INVALID_HANDLE_VALUE ) {
+		return 0;
+	}
+
+	int killed = 0;
+	PROCESSENTRY32 entry = {};
+	entry.dwSize = sizeof( PROCESSENTRY32 );
+	if ( Process32First( snapshot, &entry ) ) {
+		do {
+			if ( string_equal_nocase( entry.szExeFile, exeName ) ) {
+				HANDLE proc = OpenProcess( PROCESS_TERMINATE | SYNCHRONIZE, FALSE, entry.th32ProcessID );
+				if ( proc ) {
+					if ( TerminateProcess( proc, 0 ) ) {
+						WaitForSingleObject( proc, 2000 );
+						++killed;
+					}
+					CloseHandle( proc );
+				}
+			}
+		} while ( Process32Next( snapshot, &entry ) );
+	}
+
+	CloseHandle( snapshot );
+	return killed;
+}
+#endif
 
 
 #if defined( POSIX )
@@ -295,6 +328,13 @@ void BuildAndLaunchGame(){
 		globalErrorStream() << "build cancelled: the map is unnamed\n";
 		return;
 	}
+
+#if defined( WIN32 )
+	const int killed = terminate_processes_by_name( "r5apex.exe" );
+	if ( killed > 0 ) {
+		globalOutputStream() << "Closed r5apex.exe (" << killed << ")\n";
+	}
+#endif
 
 	BuildLaunch_Request();
 	Build_runRecentExecutedBuild();
