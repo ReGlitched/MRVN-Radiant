@@ -38,3 +38,4 @@ void Build_constructMenu( class QMenu* menu );
 extern QMenu* g_bsp_menu;
 
 void Build_runRecentExecutedBuild();
+bool Build_hasRecentExecutedBuild();

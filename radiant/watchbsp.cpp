@@ -36,6 +36,7 @@
 #include "watchbsp.h"
 
 #include <algorithm>
+#include <cstring>
 #include <QTimer>
 
 #include "commandlib.h"
@@ -51,6 +52,8 @@
 #include "mainframe.h"
 #include "sockets.h"
 #include "timer.h"
+#include "os/path.h"
+#include "os/file.h"
 
 void message_flush( message_info_t* self ){
 	Sys_Print( self->msg_level, self->m_buffer, self->m_length );
@@ -142,6 +145,7 @@ public:
 	void DoMonitoringLoop( const std::vector<CopiedString>& commands, const char *sBSPName );
 	void EndMonitoringLoop(){
 		Reset();
+		BuildLaunch_Clear();
 	}
 // close everything - may be called from the outside to abort the process
 	void Reset();
@@ -159,6 +163,17 @@ bool g_WatchBSP_Enabled = true;
 bool g_WatchBSP_LeakStop = true;
 bool g_WatchBSP_RunQuake = false;
 bool g_WatchBSP0_DumpLog = false;
+bool g_Launch_Offline = false;
+bool g_Launch_Dev = false;
+bool g_Launch_DevSdk = false;
+bool g_Launch_NoBorder = false;
+bool g_Launch_ForceBorder = false;
+bool g_Launch_Windowed = false;
+bool g_Launch_Fullscreen = false;
+bool g_Launch_PlaylistEnabled = true;
+CopiedString g_Launch_Playlist( "survival_dev" );
+CopiedString g_Launch_ExtraArgs;
+static bool g_Launch_AfterBuild = false;
 // timeout when beginning a step (in seconds)
 // if we don't get a connection quick enough we assume something failed and go back to idling
 const int g_WatchBSP_Timeout = 5;
@@ -276,6 +291,27 @@ void Build_registerPreferencesPage(){
 	PreferencesDialog_addSettingsPage( FreeCaller1<PreferenceGroup&, Build_constructPage>() );
 }
 
+void Launch_constructPreferences( PreferencesPage& page ){
+	page.appendCheckBox( "", "Offline (-offline)", g_Launch_Offline );
+	page.appendCheckBox( "", "Dev (-dev)", g_Launch_Dev );
+	page.appendCheckBox( "", "DevSdk (-devsdk)", g_Launch_DevSdk );
+	page.appendCheckBox( "", "No Border (-noborder)", g_Launch_NoBorder );
+	page.appendCheckBox( "", "Force Border (-forceborder)", g_Launch_ForceBorder );
+	page.appendCheckBox( "", "Windowed (-windowed)", g_Launch_Windowed );
+	page.appendCheckBox( "", "Fullscreen (-fullscreen)", g_Launch_Fullscreen );
+	QCheckBox* playlistEnabled = page.appendCheckBox( "", "Use Launch Playlist", g_Launch_PlaylistEnabled );
+	QWidget* playlist = page.appendEntry( "Launch Playlist", g_Launch_Playlist );
+	Widget_connectToggleDependency( playlist, playlistEnabled );
+	page.appendEntry( "Extra Launch Args", g_Launch_ExtraArgs );
+}
+void Launch_constructPage( PreferenceGroup& group ){
+	PreferencesPage page( group.createPage( "Launch", "Launch Options" ) );
+	Launch_constructPreferences( page );
+}
+void Launch_registerPreferencesPage(){
+	PreferencesDialog_addSettingsPage( FreeCaller1<PreferenceGroup&, Launch_constructPage>() );
+}
+
 #include "preferencesystem.h"
 #include "stringio.h"
 
@@ -292,8 +328,19 @@ void BuildMonitor_Construct(){
 	GlobalPreferenceSystem().registerPreference( "BuildEngineArgs", g_engineArgs.getImportCaller(), g_engineArgs.getExportCaller() );
 	GlobalPreferenceSystem().registerPreference( "BuildEngineArgsMP", g_engineArgsMP.getImportCaller(), g_engineArgsMP.getExportCaller() );
 	GlobalPreferenceSystem().registerPreference( "BuildDumpLog", BoolImportStringCaller( g_WatchBSP0_DumpLog ), BoolExportStringCaller( g_WatchBSP0_DumpLog ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchOffline", BoolImportStringCaller( g_Launch_Offline ), BoolExportStringCaller( g_Launch_Offline ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchDev", BoolImportStringCaller( g_Launch_Dev ), BoolExportStringCaller( g_Launch_Dev ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchDevSdk", BoolImportStringCaller( g_Launch_DevSdk ), BoolExportStringCaller( g_Launch_DevSdk ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchNoBorder", BoolImportStringCaller( g_Launch_NoBorder ), BoolExportStringCaller( g_Launch_NoBorder ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchForceBorder", BoolImportStringCaller( g_Launch_ForceBorder ), BoolExportStringCaller( g_Launch_ForceBorder ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchWindowed", BoolImportStringCaller( g_Launch_Windowed ), BoolExportStringCaller( g_Launch_Windowed ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchFullscreen", BoolImportStringCaller( g_Launch_Fullscreen ), BoolExportStringCaller( g_Launch_Fullscreen ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchPlaylistEnabled", BoolImportStringCaller( g_Launch_PlaylistEnabled ), BoolExportStringCaller( g_Launch_PlaylistEnabled ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchPlaylist", CopiedStringImportStringCaller( g_Launch_Playlist ), CopiedStringExportStringCaller( g_Launch_Playlist ) );
+	GlobalPreferenceSystem().registerPreference( "LaunchExtraArgs", CopiedStringImportStringCaller( g_Launch_ExtraArgs ), CopiedStringExportStringCaller( g_Launch_ExtraArgs ) );
 
 	Build_registerPreferencesPage();
+	Launch_registerPreferencesPage();
 }
 
 void BuildMonitor_Destroy(){
@@ -307,6 +354,127 @@ CWatchBSP *GetWatchBSP(){
 
 void BuildMonitor_Run( const std::vector<CopiedString>& commands, const char* mapName ){
 	GetWatchBSP()->DoMonitoringLoop( commands, mapName );
+}
+
+void BuildLaunch_Request(){
+	g_Launch_AfterBuild = true;
+}
+
+bool BuildLaunch_IsPending(){
+	return g_Launch_AfterBuild;
+}
+
+void BuildLaunch_Clear(){
+	g_Launch_AfterBuild = false;
+}
+
+static CopiedString BuildLaunch_makeArgs( const char* mapName ){
+	CopiedString mapBaseName = mapName;
+	if ( const char* dot = strrchr( mapName, '.' ) ) {
+		mapBaseName = StringRange( mapName, dot );
+	}
+	StringOutputStream args( 256 );
+	args << "+map " << mapBaseName;
+	args << " +sv_cheats 1";
+	if ( g_Launch_PlaylistEnabled && !g_Launch_Playlist.empty() ) {
+		args << " +launchplaylist " << g_Launch_Playlist;
+	}
+	if ( g_Launch_Offline ) {
+		args << " -offline";
+	}
+	if ( g_Launch_Dev ) {
+		args << " -dev";
+	}
+	if ( g_Launch_DevSdk ) {
+		args << " -devsdk";
+	}
+	if ( g_Launch_NoBorder ) {
+		args << " -noborder";
+	}
+	if ( g_Launch_ForceBorder ) {
+		args << " -forceborder";
+	}
+	if ( g_Launch_Windowed ) {
+		args << " -windowed";
+	}
+	if ( g_Launch_Fullscreen ) {
+		args << " -fullscreen";
+	}
+	if ( !g_Launch_ExtraArgs.empty() ) {
+		args << ' ' << g_Launch_ExtraArgs;
+	}
+	
+	args << " +map " << mapBaseName;
+	return args.c_str();
+}
+
+static CopiedString BuildLaunch_makeExePath(){
+	const char* enginePath = EnginePath_get();
+	StringOutputStream path( 256 );
+	path << enginePath;
+	if ( !string_empty( enginePath ) ) {
+		const char last = enginePath[strlen( enginePath ) - 1];
+		if ( last != '/' && last != '\\' ) {
+			path << '/';
+		}
+	}
+	path << "r5apex.exe";
+	return path.c_str();
+}
+
+static void BuildLaunch_RunR5Apex( const char* mapName ){
+	const auto exePath = BuildLaunch_makeExePath();
+	if ( !file_exists( exePath.c_str() ) ) {
+		const auto msg = StringStream(
+			"r5apex.exe was not found in the Engine Path:\n",
+			exePath,
+			"\n\nEngine Path:\n",
+			EnginePath_get(),
+			'\n'
+		);
+		globalOutputStream() << msg;
+		qt_MessageBox( MainFrame_getWindow(), msg, "Launch game", EMessageBoxType::Error );
+		return;
+	}
+
+	const auto args = BuildLaunch_makeArgs( mapName );
+	auto cmd = StringStream( '"', exePath, '"', ' ', args );
+	globalOutputStream() << "Launch debug:\n";
+	globalOutputStream() << "  Engine Path: " << EnginePath_get() << '\n';
+	globalOutputStream() << "  Exe Path: " << exePath << '\n';
+	globalOutputStream() << "  Map Name: " << mapName << '\n';
+	globalOutputStream() << "  Args: " << args << '\n';
+	globalOutputStream() << "  Full Cmd: " << cmd << '\n';
+	globalOutputStream() << "  Flags: "
+	                     << ( g_Launch_Offline ? "-offline " : "" )
+	                     << ( g_Launch_Dev ? "-dev " : "" )
+	                     << ( g_Launch_DevSdk ? "-devsdk " : "" )
+	                     << ( g_Launch_NoBorder ? "-noborder " : "" )
+	                     << ( g_Launch_ForceBorder ? "-forceborder " : "" )
+	                     << ( g_Launch_Windowed ? "-windowed " : "" )
+	                     << ( g_Launch_Fullscreen ? "-fullscreen " : "" )
+	                     << ( g_Launch_PlaylistEnabled ? "playlist:on " : "playlist:off " )
+	                     << '\n';
+	if ( g_Launch_PlaylistEnabled ) {
+		globalOutputStream() << "  Playlist: " << g_Launch_Playlist << '\n';
+	}
+	if ( !g_Launch_ExtraArgs.empty() ) {
+		globalOutputStream() << "  Extra Args: " << g_Launch_ExtraArgs << '\n';
+	}
+
+	if ( !Q_Exec( nullptr, cmd.c_str(), EnginePath_get(), false, false ) ) {
+		const auto msg = StringStream(
+			"Failed to execute the following command: ",
+			cmd,
+			"\n\nEngine Path:\n",
+			EnginePath_get(),
+			"\nArgs:\n",
+			args,
+			'\n'
+		);
+		globalOutputStream() << msg;
+		qt_MessageBox( MainFrame_getWindow(), msg, "Launch game", EMessageBoxType::Error );
+	}
 }
 
 
@@ -724,33 +892,39 @@ void CWatchBSP::RoutineProcessing(){
 					}
 					else
 					{
-						// launch the engine .. OMG
-						if ( g_WatchBSP_RunQuake ) {
+						const bool launchOverride = BuildLaunch_IsPending();
+						if ( launchOverride || g_WatchBSP_RunQuake ) {
 							globalOutputStream() << "Running engine...\n";
 
-							// this is game dependant
-							const auto [exe, args] = [&](){
-								if( string_equal( gamemode_get(), "mp" ) ){
-									if( const auto exe = g_engineExecutableMP.string(); !exe.empty() )
-										return std::pair( std::move( exe ), g_engineArgsMP.string() );
+							if ( launchOverride ) {
+								BuildLaunch_Clear();
+								BuildLaunch_RunR5Apex( m_sBSPName.c_str() );
+							}
+							else {
+								// this is game dependant
+								const auto [exe, args] = [&](){
+									if( string_equal( gamemode_get(), "mp" ) ){
+										if( const auto exe = g_engineExecutableMP.string(); !exe.empty() )
+											return std::pair( std::move( exe ), g_engineArgsMP.string() );
+									}
+									return std::pair( g_engineExecutable.string(), g_engineArgs.string() );
+								}();
+
+								auto cmd = StringStream( '"', EnginePath_get(), exe, '"', ' ' );
+
+								if( const char *map = strstr( args.c_str(), "%mapname%" ) )
+									cmd << StringRange( args.c_str(), map ) << m_sBSPName << ( map + strlen( "%mapname%" ) );
+								else
+									cmd << args;
+
+								globalOutputStream() << cmd << '\n';
+
+								// execute now
+								if ( !Q_Exec( nullptr, cmd.c_str(), EnginePath_get(), false, false ) ) {
+									const auto msg = StringStream( "Failed to execute the following command: ", cmd, '\n' );
+									globalOutputStream() << msg;
+									qt_MessageBox( MainFrame_getWindow(), msg, "Build monitoring", EMessageBoxType::Error );
 								}
-								return std::pair( g_engineExecutable.string(), g_engineArgs.string() );
-							}();
-
-							auto cmd = StringStream( '"', EnginePath_get(), exe, '"', ' ' );
-
-							if( const char *map = strstr( args.c_str(), "%mapname%" ) )
-								cmd << StringRange( args.c_str(), map ) << m_sBSPName << ( map + strlen( "%mapname%" ) );
-							else
-								cmd << args;
-
-							globalOutputStream() << cmd << '\n';
-
-							// execute now
-							if ( !Q_Exec( nullptr, cmd.c_str(), EnginePath_get(), false, false ) ) {
-								const auto msg = StringStream( "Failed to execute the following command: ", cmd, '\n' );
-								globalOutputStream() << msg;
-								qt_MessageBox( MainFrame_getWindow(), msg, "Build monitoring", EMessageBoxType::Error );
 							}
 						}
 						EndMonitoringLoop();
