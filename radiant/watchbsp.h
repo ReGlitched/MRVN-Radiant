@@ -41,3 +41,7 @@ void BuildMonitor_Run( const std::vector<CopiedString>& commands, const char* ma
 extern bool g_WatchBSP_Enabled;
 extern bool g_WatchBSP_LeakStop;
 extern bool g_WatchBSP0_DumpLog;
+
+void BuildLaunch_Request();
+bool BuildLaunch_IsPending();
+void BuildLaunch_Clear();

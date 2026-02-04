@@ -1084,3 +1084,7 @@ void Build_runRecentExecutedBuild(){
 	if( !g_build_project.empty() )
 		RunBSP( Project_find( g_build_project, g_lastExecutedBuild ) );
 }
+
+bool Build_hasRecentExecutedBuild(){
+	return !g_build_project.empty();
+}

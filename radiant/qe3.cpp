@@ -231,6 +231,13 @@ void RunBSP( size_t buildIdx ){
 	const bool monitor = std::any_of( commands.cbegin(), commands.cend(), []( const CopiedString& command ){
 		return strstr( command.c_str(), RADIANT_MONITOR_ADDRESS ) != 0;
 	} );
+	if ( BuildLaunch_IsPending() && !monitor ) {
+		const char* msg = "Build + Launch requires Build Process Monitoring and a build command using [MonitorAddress].\n"
+		                  "Enable Build Process Monitoring and ensure your build menu uses [MonitorAddress].\n";
+		globalOutputStream() << msg;
+		qt_MessageBox( MainFrame_getWindow(), msg, "Launch game", EMessageBoxType::Error );
+		BuildLaunch_Clear();
+	}
 
 	if ( g_WatchBSP_Enabled && monitor ) {
 		// grab the file name for engine running
@@ -274,6 +281,23 @@ void RunBSP( size_t buildIdx ){
 	}
 
 	bsp_shutdown();
+}
+
+void BuildAndLaunchGame(){
+	if ( !Build_hasRecentExecutedBuild() ) {
+		const char* msg = "No build is configured. Use Build > Customize to add a build first.\n";
+		globalOutputStream() << msg;
+		qt_MessageBox( MainFrame_getWindow(), msg, "Launch game", EMessageBoxType::Error );
+		return;
+	}
+
+	if ( Map_Unnamed( g_map ) ) {
+		globalErrorStream() << "build cancelled: the map is unnamed\n";
+		return;
+	}
+
+	BuildLaunch_Request();
+	Build_runRecentExecutedBuild();
 }
 
 // =============================================================================

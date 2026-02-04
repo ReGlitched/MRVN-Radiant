@@ -50,6 +50,7 @@
 #include "commandlib.h"
 #include "stream/textfilestream.h"
 #include "os/path.h"
+#include "os/file.h"
 #include "uniquenames.h"
 #include "modulesystem/singletonmodule.h"
 #include "modulesystem/moduleregistry.h"
@@ -2361,9 +2362,15 @@ public:
 	}
 	void realise(){
 		if ( --m_unrealised == 0 ) {
-			ASSERT_MESSAGE( !g_qeglobals.m_userGamePath.empty(), "maps_directory: user-game-path is empty" );
-			g_mapsPath = StringStream( g_qeglobals.m_userGamePath, "maps/" );
-			Q_mkdir( g_mapsPath.c_str() );
+			const auto platformMapsPath = StringStream( EnginePath_get(), "platform/maps/" );
+			if ( file_is_directory( platformMapsPath ) ) {
+				g_mapsPath = platformMapsPath;
+			}
+			else {
+				ASSERT_MESSAGE( !g_qeglobals.m_userGamePath.empty(), "maps_directory: user-game-path is empty" );
+				g_mapsPath = StringStream( g_qeglobals.m_userGamePath, "maps/" );
+				Q_mkdir( g_mapsPath.c_str() );
+			}
 		}
 	}
 	void unrealise(){
