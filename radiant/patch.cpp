@@ -2576,25 +2576,49 @@ void Patch::accumulateVertexTangentSpace( std::size_t index, Vector3 tangentX[6]
 const std::size_t PATCH_MAX_VERTEX_ARRAY = 1048576;
 
 void Patch::BuildVertexArray(){
-	m_tess.m_vertices.resize(m_ctrlTransformed.size());
-	m_tess.m_indices.resize(m_width*(m_height-1)*2);
+	m_tess.m_vertices.resize( m_ctrlTransformed.size() );
+	m_tess.m_indices.resize( m_width * ( m_height - 1 ) * 2 );
 
-	// Copy control vertices to m_tess vertices, this is a leftover from old tesselation system
-	// TODO: Clean this up
-	for( std::size_t i = 0; i < m_ctrlTransformed.size(); i++ ) {
-		vertex_assign_ctrl(m_tess.m_vertices[i], m_ctrlTransformed[i]);
+	for ( std::size_t i = 0; i < m_ctrlTransformed.size(); ++i ) {
+		vertex_assign_ctrl( m_tess.m_vertices[i], m_ctrlTransformed[i] );
+		normal_for_index( m_tess.m_vertices, i ) = g_vector3_identity;
+		tangent_for_index( m_tess.m_vertices, i ) = g_vector3_identity;
+		bitangent_for_index( m_tess.m_vertices, i ) = g_vector3_identity;
 	}
 
 	m_tess.m_numStrips = m_height - 1;
 	m_tess.m_lenStrips = m_width * 2;
-	
-	// Triangles
-	for( int y = 0; y < m_height - 1; y++ ) {
-		for( int x = 0; x < m_width; x++ ) {
-			std::size_t index = x + y * m_width;
-		
-			m_tess.m_indices[index * 2] = index;
-			m_tess.m_indices[index * 2 + 1] = index + m_width;
+
+	for ( std::size_t y = 0; y < m_height - 1; ++y ) {
+		for ( std::size_t x = 0; x < m_width; ++x ) {
+			const std::size_t stripIndex = ( y * m_width + x ) * 2;
+			const std::size_t index = x + y * m_width;
+			m_tess.m_indices[stripIndex] = index;
+			m_tess.m_indices[stripIndex + 1] = index + m_width;
+		}
+	}
+
+	for ( std::size_t y = 0; y + 1 < m_height; ++y ) {
+		for ( std::size_t x = 0; x + 1 < m_width; ++x ) {
+			const std::size_t i00 = y * m_width + x;
+			const std::size_t i10 = y * m_width + ( x + 1 );
+			const std::size_t i01 = ( y + 1 ) * m_width + x;
+			const std::size_t i11 = ( y + 1 ) * m_width + ( x + 1 );
+
+			ArbitraryMeshTriangle_sumTangents( m_tess.m_vertices[i00], m_tess.m_vertices[i01], m_tess.m_vertices[i11] );
+			ArbitraryMeshTriangle_sumTangents( m_tess.m_vertices[i00], m_tess.m_vertices[i11], m_tess.m_vertices[i10] );
+		}
+	}
+
+	for ( Array<ArbitraryMeshVertex>::iterator i = m_tess.m_vertices.begin(); i != m_tess.m_vertices.end(); ++i ) {
+		if ( vector3_length_squared( reinterpret_cast<Vector3&>( ( *i ).normal ) ) != 0 ) {
+			vector3_normalise( reinterpret_cast<Vector3&>( ( *i ).normal ) );
+		}
+		if ( vector3_length_squared( reinterpret_cast<Vector3&>( ( *i ).tangent ) ) != 0 ) {
+			vector3_normalise( reinterpret_cast<Vector3&>( ( *i ).tangent ) );
+		}
+		if ( vector3_length_squared( reinterpret_cast<Vector3&>( ( *i ).bitangent ) ) != 0 ) {
+			vector3_normalise( reinterpret_cast<Vector3&>( ( *i ).bitangent ) );
 		}
 	}
 
@@ -3052,3 +3076,4 @@ bool patch_filtered( Patch& patch ){
 	}
 	return false;
 }
+

@@ -207,6 +207,30 @@ public:
 class RenderablePatchWireframe : public OpenGLRenderable
 {
 	PatchTesselation& m_tess;
+	void renderTriSplitLines() const {
+		if ( m_tess.m_numStrips == 0 || m_tess.m_lenStrips < 4 ) {
+			return;
+		}
+		const std::size_t width = m_tess.m_numStrips + 1;
+		const std::size_t height = m_tess.m_lenStrips >> 1;
+		if ( width < 2 || height < 2 ) {
+			return;
+		}
+		gl().glLineWidth( 0.5f );
+		gl().glBegin( GL_LINES );
+		for ( std::size_t y = 0; y + 1 < height; ++y )
+		{
+			for ( std::size_t x = 0; x + 1 < width; ++x )
+			{
+				const auto& a = ( m_tess.m_vertices.data() + ( y * width + x ) )->vertex;
+				const auto& b = ( m_tess.m_vertices.data() + ( ( y + 1 ) * width + ( x + 1 ) ) )->vertex;
+				gl().glVertex3fv( vertex3f_to_array( a ) );
+				gl().glVertex3fv( vertex3f_to_array( b ) );
+			}
+		}
+		gl().glEnd();
+		gl().glLineWidth( 1.0f );
+	}
 public:
 	RenderablePatchWireframe( PatchTesselation& tess ) : m_tess( tess ){
 	}
@@ -217,12 +241,37 @@ public:
 		{
 			gl().glDrawElements( GL_QUAD_STRIP, GLsizei( m_tess.m_lenStrips ), RenderIndexTypeID, strip_indices );
 		}
+		renderTriSplitLines();
 	}
 };
 
 class RenderablePatchFixedWireframe : public OpenGLRenderable
 {
 	PatchTesselation& m_tess;
+	void renderTriSplitLines() const {
+		if ( m_tess.m_numStrips == 0 || m_tess.m_lenStrips < 4 ) {
+			return;
+		}
+		const std::size_t width = m_tess.m_numStrips + 1;
+		const std::size_t height = m_tess.m_lenStrips >> 1;
+		if ( width < 2 || height < 2 ) {
+			return;
+		}
+		gl().glLineWidth( 0.5f );
+		gl().glBegin( GL_LINES );
+		for ( std::size_t y = 0; y + 1 < height; ++y )
+		{
+			for ( std::size_t x = 0; x + 1 < width; ++x )
+			{
+				const auto& a = ( m_tess.m_vertices.data() + ( y * width + x ) )->vertex;
+				const auto& b = ( m_tess.m_vertices.data() + ( ( y + 1 ) * width + ( x + 1 ) ) )->vertex;
+				gl().glVertex3fv( vertex3f_to_array( a ) );
+				gl().glVertex3fv( vertex3f_to_array( b ) );
+			}
+		}
+		gl().glEnd();
+		gl().glLineWidth( 1.0f );
+	}
 public:
 	RenderablePatchFixedWireframe( PatchTesselation& tess ) : m_tess( tess ){
 	}
@@ -233,12 +282,35 @@ public:
 		{
 			gl().glDrawElements( GL_QUAD_STRIP, GLsizei( m_tess.m_lenStrips ), RenderIndexTypeID, strip_indices );
 		}
+		renderTriSplitLines();
 	}
 };
 
 class RenderablePatchSolid : public OpenGLRenderable
 {
 	PatchTesselation& m_tess;
+	void renderTriSplitLines() const {
+		if ( m_tess.m_numStrips == 0 || m_tess.m_lenStrips < 4 ) {
+			return;
+		}
+		const std::size_t width = m_tess.m_numStrips + 1;
+		const std::size_t height = m_tess.m_lenStrips >> 1;
+		if ( width < 2 || height < 2 ) {
+			return;
+		}
+		gl().glBegin( GL_LINES );
+		for ( std::size_t y = 0; y + 1 < height; ++y )
+		{
+			for ( std::size_t x = 0; x + 1 < width; ++x )
+			{
+				const auto& a = ( m_tess.m_vertices.data() + ( y * width + x ) )->vertex;
+				const auto& b = ( m_tess.m_vertices.data() + ( ( y + 1 ) * width + ( x + 1 ) ) )->vertex;
+				gl().glVertex3fv( vertex3f_to_array( a ) );
+				gl().glVertex3fv( vertex3f_to_array( b ) );
+			}
+		}
+		gl().glEnd();
+	}
 public:
 	RenderablePatchSolid( PatchTesselation& tess ) : m_tess( tess ){
 	}
@@ -268,6 +340,7 @@ public:
 			{
 				gl().glDrawElements( GL_QUAD_STRIP, GLsizei( m_tess.m_lenStrips ), RenderIndexTypeID, strip_indices );
 			}
+			renderTriSplitLines();
 		}
 
 #if defined( _DEBUG ) && !defined( _DEBUG_QUICKER )
@@ -1549,6 +1622,16 @@ public:
 		{
 			if ( ( *i ).m_selectable.isSelected() ) {
 				callback( ( *i ).m_ctrl->m_vertex );
+			}
+		}
+	}
+	template<typename Functor>
+	void forEachSelectedControlPoint( const Functor& functor ) const {
+		std::size_t index = 0;
+		for ( PatchControlInstances::const_iterator i = m_ctrl_instances.begin(); i != m_ctrl_instances.end(); ++i, ++index )
+		{
+			if ( ( *i ).m_selectable.isSelected() ) {
+				functor( index, *( *i ).m_ctrl );
 			}
 		}
 	}

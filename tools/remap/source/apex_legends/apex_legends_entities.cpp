@@ -69,7 +69,9 @@ void ApexLegends::EmitEntity(const entity_t &e) {
     } else if (striEqualPrefix(e.valueForKey("classname"), "info_target")
             || striEqualPrefix(e.valueForKey("classname"), "prop_dynamic")
             || striEqualPrefix(e.valueForKey("classname"), "trigger_hurt")
-            || striEqualPrefix(e.valueForKey("classname"), "zipline")) {
+            || striEqualPrefix(e.valueForKey("classname"), "zipline") 
+            || striEqualPrefix(e.valueForKey("classname"), "trigger_teleport") 
+        ) {
         Titanfall::Ent::script.insert(Titanfall::Ent::script.end(), str.begin(), str.end());
     // snd
     // spawn
