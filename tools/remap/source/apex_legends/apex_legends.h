@@ -159,9 +159,10 @@ static_assert(sizeof(ShadowMeshAlphaVertex_t) == 20, "ShadowMeshAlphaVertex_t mu
 #pragma pack(push, 1)
 struct LightProbe_t {
     int16_t  ambientSH[3][4];       // +0x00 - Spherical harmonics for R, G, B (24 bytes)
-    uint16_t staticLightIndexes[4]; // +0x18 - Indices into worldLights (8 bytes)
-                                    //         Stored as: actualIndex + (32 - numLightEnvs)
-                                    //         Game retrieves: storedIndex - (32 - numLightEnvs)
+    uint16_t staticLightIndexes[4]; // +0x18 - Raw worldlight indices (8 bytes)
+                                    //         BSP stores 0-based worldlight index
+                                    //         Engine's Mod_LoadLightProbes adds +32 at load time
+                                    //         to convert to global light handles (0-31=shadowenvs, 32+=worldlights)
                                     //         0xFFFF = no light in this slot
     uint8_t  staticLightFlags[4];   // +0x20 - Weight/flags for each static light (4 bytes)
                                     //         Game calls this "staticLightWeights"

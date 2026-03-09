@@ -254,21 +254,24 @@ static void InitLightmapAtlas() {
     page.height = MAX_LIGHTMAP_HEIGHT;
     
     // Use neutral gray - engine adds dynamic ambient/sun on top
-    // This is the base that indirect/bounced lighting would add to
-    uint8_t neutralValue = 128;  // Neutral gray (0.5 after gamma)
+    // Bias-128 RGBE: finalColor = (RGB/255) * 2^(exp - 128)
+    // exp=128 → 2^0 = 1.0x (neutral), RGB=180 sRGB ≈ 0.45 linear
+    uint8_t neutralValue = 180;  // Mid-gray mantissa in sRGB
+    uint8_t exponent = 128;      // Neutral exposure: 2^(128-128) = 1.0x
     
     size_t dataSize = page.width * page.height * 8;
     page.pixels.resize(dataSize);
     for (size_t i = 0; i < dataSize; i += 8) {
-        // Neutral base - dynamic lighting adds on top
+        // Direct light (bytes 0-3)
         page.pixels[i + 0] = neutralValue;
         page.pixels[i + 1] = neutralValue;
         page.pixels[i + 2] = neutralValue;
-        page.pixels[i + 3] = 255;  // A
+        page.pixels[i + 3] = exponent;
+        // Indirect light (bytes 4-7)
         page.pixels[i + 4] = neutralValue;
         page.pixels[i + 5] = neutralValue;
         page.pixels[i + 6] = neutralValue;
-        page.pixels[i + 7] = 128;  // Neutral multiplier
+        page.pixels[i + 7] = exponent;
     }
     ApexLegends::Bsp::lightmapPages.push_back(page);
     
@@ -845,47 +848,43 @@ void ApexLegends::ComputeLightmapLighting() {
     EncodeHDRTexel
     Encode a floating-point RGB color to the 8-byte RGBE-style HDR format
     
-    Based on analysis of official Apex Legends lightmaps:
-    - Bytes 0-2: Direct light RGB mantissa (0-255, sRGB gamma)
-    - Byte 3: Direct light exponent (0-255, typical range 0-60)
-    - Bytes 4-6: Indirect/bounce light RGB mantissa (0-255, sRGB gamma)
-    - Byte 7: Indirect light exponent (0-255, typical range 0-60)
+    Apex Legends lightmap texel format (4 bytes per sub-texel):
+    - Bytes 0-2: RGB mantissa (0-255, sRGB gamma)
+    - Byte 3: Exponent with bias-128
     
-    Format is RGBE-style where:
-      finalColor = (RGB / 255) * 2^(exponent / 8)
+    Decoding formula:
+      finalColor = (RGB / 255) * 2^(exponent - 128)
     
-    Examples from official maps:
-    - exp=0: multiplier 1.0x (normal/shadow areas)
-    - exp=8: multiplier 2.0x
-    - exp=16: multiplier 4.0x
-    - exp=50-60: very bright sunlit areas (80-150x)
+    Examples:
+    - exp=128: multiplier 2^0  = 1.0x  (neutral/normal lighting)
+    - exp=129: multiplier 2^1  = 2.0x  (bright)
+    - exp=130: multiplier 2^2  = 4.0x  (very bright sunlit surface)
+    - exp=127: multiplier 2^-1 = 0.5x  (dim)
+    - exp=0:   multiplier 2^-128 ≈ 0   (black)
     
     For simple maps without bounce lighting, direct and indirect are the same.
 */
 static void EncodeHDRTexel(const Vector3 &color, uint8_t *out) {
     // Input is in linear HDR space (0.0 to potentially >1.0 for HDR)
-    // Find the maximum component to determine exponent
     float maxComponent = std::max({color.x(), color.y(), color.z()});
     
     uint8_t exponent;
     float scale;
     
     if (maxComponent <= 0.001f) {
-        // Near-black - use exp=0 with dark RGB
-        exponent = 0;
-        scale = 1.0f;
-    } else if (maxComponent <= 1.0f) {
-        // LDR range - exp=0 gives 1.0x multiplier
+        // Near-black: use lowest representable exponent
         exponent = 0;
         scale = 1.0f;
     } else {
-        // HDR range - need positive exponent
-        // exp = 8 * log2(maxComponent) rounded up
-        int exp = (int)std::ceil(8.0f * std::log2(maxComponent));
-        exponent = (uint8_t)std::min(255, std::max(0, exp));
+        // Bias-128 RGBE: find exponent so mantissa fits in 0-1 range
+        // We need 2^(exp-128) >= maxComponent, so exp = 128 + ceil(log2(maxComponent))
+        int e = (int)std::ceil(std::log2(maxComponent));
+        int biasedExp = 128 + e;
+        biasedExp = std::max(0, std::min(255, biasedExp));
+        exponent = (uint8_t)biasedExp;
         
-        // Scale factor: divide by 2^(exp/8) to get mantissa in 0-1 range
-        scale = 1.0f / std::pow(2.0f, exponent / 8.0f);
+        // Scale factor: divide by 2^(exp-128) to normalize mantissa to 0-1
+        scale = 1.0f / std::pow(2.0f, (float)(exponent - 128));
     }
     
     // Scale color and apply gamma correction (linear to sRGB)
@@ -937,23 +936,28 @@ void ApexLegends::EmitLightmaps()
         ApexLegends::Bsp::lightmapHeaders.push_back(header);
         
         // Neutral stub lightmap - engine applies dynamic ambient/sun from worldLights
-        // This allows _ambient/_light changes in .ent files to work immediately
-        // Format: RGB (sRGB gamma) + exponent where finalColor = RGB * 2^(exp/8)
-        // exp=0 means 2^0 = 1.0x multiplier (neutral)
-        // RGB=180 gives a mid-gray tone in sRGB (linear ~0.45)
+        // Engine expects PLANAR format: all direct texels first, then all indirect texels
+        // Bias-128 RGBE: finalColor = (RGB/255) * 2^(exp - 128)
+        // exp=128 means 2^0 = 1.0x multiplier (neutral)
         uint8_t neutralGray = 180;  // Mid-gray mantissa in sRGB
-        uint8_t exponent = 0;       // Neutral exposure (2^0 = 1.0x)
-        size_t dataSize = 256 * 256 * 8;
+        uint8_t exponent = 128;     // Neutral exposure: 2^(128-128) = 2^0 = 1.0x
+        size_t numTexels = 256 * 256;
+        size_t dataSize = numTexels * 8;  // 4 bytes direct + 4 bytes indirect per texel
         ApexLegends::Bsp::lightmapDataSky.resize(dataSize);
-        for (size_t i = 0; i < dataSize; i += 8) {
-            ApexLegends::Bsp::lightmapDataSky[i + 0] = neutralGray;  // R
-            ApexLegends::Bsp::lightmapDataSky[i + 1] = neutralGray;  // G
-            ApexLegends::Bsp::lightmapDataSky[i + 2] = neutralGray;  // B
-            ApexLegends::Bsp::lightmapDataSky[i + 3] = exponent;     // Direct exp
-            ApexLegends::Bsp::lightmapDataSky[i + 4] = neutralGray;  // R indirect
-            ApexLegends::Bsp::lightmapDataSky[i + 5] = neutralGray;  // G indirect
-            ApexLegends::Bsp::lightmapDataSky[i + 6] = neutralGray;  // B indirect
-            ApexLegends::Bsp::lightmapDataSky[i + 7] = exponent;     // Indirect exp
+        // Sub-texture 0 (direct): first 4*numTexels bytes
+        for (size_t i = 0; i < numTexels; i++) {
+            ApexLegends::Bsp::lightmapDataSky[i * 4 + 0] = neutralGray;
+            ApexLegends::Bsp::lightmapDataSky[i * 4 + 1] = neutralGray;
+            ApexLegends::Bsp::lightmapDataSky[i * 4 + 2] = neutralGray;
+            ApexLegends::Bsp::lightmapDataSky[i * 4 + 3] = exponent;
+        }
+        // Sub-texture 1 (indirect): next 4*numTexels bytes
+        size_t offset = numTexels * 4;
+        for (size_t i = 0; i < numTexels; i++) {
+            ApexLegends::Bsp::lightmapDataSky[offset + i * 4 + 0] = neutralGray;
+            ApexLegends::Bsp::lightmapDataSky[offset + i * 4 + 1] = neutralGray;
+            ApexLegends::Bsp::lightmapDataSky[offset + i * 4 + 2] = neutralGray;
+            ApexLegends::Bsp::lightmapDataSky[offset + i * 4 + 3] = exponent;
         }
         
         return;
@@ -976,7 +980,9 @@ void ApexLegends::EmitLightmaps()
         }
     }
     
-    // Create headers and concatenate pixel data
+    // Create headers and concatenate pixel data in PLANAR format
+    // Engine expects: [all direct texels (4 bytes each)] [all indirect texels (4 bytes each)]
+    // NOT interleaved per-texel as stored in page.pixels during building
     for (size_t i = 0; i < ApexLegends::Bsp::lightmapPages.size(); i++) {
         const ApexLegends::LightmapPage_t &page = ApexLegends::Bsp::lightmapPages[i];
         
@@ -989,10 +995,30 @@ void ApexLegends::EmitLightmaps()
         header.height = page.height;
         ApexLegends::Bsp::lightmapHeaders.push_back(header);
         
-        // Append pixel data
-        ApexLegends::Bsp::lightmapDataSky.insert(
-            ApexLegends::Bsp::lightmapDataSky.end(),
-            page.pixels.begin(), page.pixels.end());
+        // Write planar: all direct texels first, then all indirect texels
+        size_t numTexels = (size_t)page.width * page.height;
+        size_t baseOffset = ApexLegends::Bsp::lightmapDataSky.size();
+        ApexLegends::Bsp::lightmapDataSky.resize(baseOffset + numTexels * 8);
+        uint8_t *dst = &ApexLegends::Bsp::lightmapDataSky[baseOffset];
+        
+        // Sub-texture 0 (direct light): bytes 0-3 of each interleaved texel
+        for (size_t t = 0; t < numTexels; t++) {
+            size_t srcOff = t * 8;
+            dst[t * 4 + 0] = page.pixels[srcOff + 0];
+            dst[t * 4 + 1] = page.pixels[srcOff + 1];
+            dst[t * 4 + 2] = page.pixels[srcOff + 2];
+            dst[t * 4 + 3] = page.pixels[srcOff + 3];
+        }
+        
+        // Sub-texture 1 (indirect light): bytes 4-7 of each interleaved texel
+        uint8_t *dst2 = dst + numTexels * 4;
+        for (size_t t = 0; t < numTexels; t++) {
+            size_t srcOff = t * 8;
+            dst2[t * 4 + 0] = page.pixels[srcOff + 4];
+            dst2[t * 4 + 1] = page.pixels[srcOff + 5];
+            dst2[t * 4 + 2] = page.pixels[srcOff + 6];
+            dst2[t * 4 + 3] = page.pixels[srcOff + 7];
+        }
     }
 
     Sys_Printf("     %9zu lightmap pages\n", ApexLegends::Bsp::lightmapHeaders.size());
