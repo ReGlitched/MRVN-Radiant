@@ -2226,15 +2226,13 @@ static void AssignStaticLightsToProbe(const Vector3 &probePos, LightProbe_t &pro
               });
     
     // Assign up to 4 lights
-    // CRITICAL: The game expects stored indices to be offset by (32 - numShadowEnvironments)
-    // Game retrieves actual index as: storedIndex - (32 - numShadowEnvironments)
-    // So we must store: actualIndex + (32 - numShadowEnvironments)
-    uint16_t lightIndexOffset = static_cast<uint16_t>(32 - ApexLegends::Bsp::shadowEnvironments.size());
-    
+    // Store raw 0-based worldlight indices in the BSP.
+    // Engine's Mod_LoadLightProbes adds +32 at load time to convert to
+    // global light handles (0-31 = shadow envs, 32+ = worldlights).
     int validLightCount = 0;
     for (int slot = 0; slot < 4; slot++) {
         if (slot < static_cast<int>(influences.size())) {
-            probe.staticLightIndexes[slot] = influences[slot].index + lightIndexOffset;
+            probe.staticLightIndexes[slot] = influences[slot].index;
             validLightCount++;
         } else {
             probe.staticLightIndexes[slot] = 0xFFFF;  // No light in this slot
