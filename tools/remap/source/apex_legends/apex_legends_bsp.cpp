@@ -119,29 +119,52 @@ void WriteR5BSPFile(const char *filename) {
     AddLump(file, header.lumps[R5_LUMP_ENTITY_PARTITIONS],        Titanfall::Bsp::entityPartitions);
     AddLump(file, header.lumps[R5_LUMP_VERTEX_NORMALS],           Titanfall::Bsp::vertexNormals);
 
-    // GameLump
+    // GameLump (0x23) - Static Props
+    // Format: Header -> PathHeader -> Paths[] -> PropHeader -> Props[] -> numParented -> ParentInfos[]
     {
+        const uint32_t numPaths = ApexLegends::Bsp::gameLumpPaths.size();
+        const uint32_t numProps = ApexLegends::Bsp::gameLumpProps.size();
+        const uint32_t numParented = ApexLegends::Bsp::gameLumpParentInfos.size();
+
+        // Inner data size (everything after the 20-byte GameLumpHeader)
+        const uint32_t innerSize = sizeof(ApexLegends::GameLumpPathHeader_t)
+                                 + sizeof(Titanfall::GameLumpPath_t) * numPaths
+                                 + sizeof(ApexLegends::GameLumpPropHeader_t)
+                                 + sizeof(ApexLegends::GameLumpProp_t) * numProps
+                                 + sizeof(uint32_t)  // numParentedStaticProps
+                                 + sizeof(ApexLegends::GameLumpParentInfo_t) * numParented;
+
+        // Outer lump size (header + inner data)
         header.lumps[R5_LUMP_GAME_LUMP].offset = ftell(file);
-        header.lumps[R5_LUMP_GAME_LUMP].length = sizeof(Titanfall2::GameLumpHeader_t)
-                                               + sizeof(Titanfall2::GameLumpPathHeader_t)
-                                               + sizeof(Titanfall::GameLumpPath_t) * Titanfall2::Bsp::gameLumpPathHeader.numPaths
-                                               + sizeof(Titanfall2::GameLumpPropHeader_t)
-                                               + sizeof(Titanfall2::GameLumpProp_t) * Titanfall2::Bsp::gameLumpPropHeader.numProps
-                                               + sizeof(Titanfall2::GameLumpUnknownHeader_t);
+        header.lumps[R5_LUMP_GAME_LUMP].length = sizeof(ApexLegends::GameLumpHeader_t) + innerSize;
 
-        Titanfall2::Bsp::gameLumpHeader.offset = ftell(file) + sizeof(Titanfall2::GameLumpHeader_t);
-        Titanfall2::Bsp::gameLumpHeader.length = sizeof(Titanfall2::GameLumpPathHeader_t)
-                                              + sizeof(Titanfall::GameLumpPath_t) * Titanfall::Bsp::gameLumpPaths.size()
-                                              + sizeof(Titanfall2::GameLumpPropHeader_t)
-                                              + sizeof(Titanfall2::GameLumpProp_t) * Titanfall::Bsp::gameLumpProps.size()
-                                              + sizeof(Titanfall2::GameLumpUnknownHeader_t);
+        // Set inner header fields
+        ApexLegends::Bsp::gameLumpHeader.offset = ftell(file) + sizeof(ApexLegends::GameLumpHeader_t);
+        ApexLegends::Bsp::gameLumpHeader.length = innerSize;
 
-        SafeWrite(file, &Titanfall2::Bsp::gameLumpHeader, sizeof(Titanfall2::GameLumpHeader_t));
-        SafeWrite(file, &Titanfall2::Bsp::gameLumpPathHeader, sizeof(Titanfall2::GameLumpPathHeader_t));
-        SafeWrite(file, Titanfall::Bsp::gameLumpPaths.data(), sizeof(Titanfall::GameLumpPath_t) * Titanfall::Bsp::gameLumpPaths.size());
-        SafeWrite(file, &Titanfall2::Bsp::gameLumpPropHeader, sizeof(Titanfall2::GameLumpPropHeader_t));
-        SafeWrite(file, Titanfall2::Bsp::gameLumpProps.data(), sizeof(Titanfall2::GameLumpProp_t) * Titanfall2::Bsp::gameLumpProps.size());
-        SafeWrite(file, &Titanfall2::Bsp::gameLumpUnknownHeader, sizeof(Titanfall2::GameLumpUnknownHeader_t));
+        // Write GameLumpHeader
+        SafeWrite(file, &ApexLegends::Bsp::gameLumpHeader, sizeof(ApexLegends::GameLumpHeader_t));
+
+        // Write paths
+        SafeWrite(file, &ApexLegends::Bsp::gameLumpPathHeader, sizeof(ApexLegends::GameLumpPathHeader_t));
+        if (numPaths > 0) {
+            SafeWrite(file, ApexLegends::Bsp::gameLumpPaths.data(),
+                      sizeof(Titanfall::GameLumpPath_t) * numPaths);
+        }
+
+        // Write prop header + props
+        SafeWrite(file, &ApexLegends::Bsp::gameLumpPropHeader, sizeof(ApexLegends::GameLumpPropHeader_t));
+        if (numProps > 0) {
+            SafeWrite(file, ApexLegends::Bsp::gameLumpProps.data(),
+                      sizeof(ApexLegends::GameLumpProp_t) * numProps);
+        }
+
+        // Write parented static props
+        SafeWrite(file, &numParented, sizeof(uint32_t));
+        if (numParented > 0) {
+            SafeWrite(file, ApexLegends::Bsp::gameLumpParentInfos.data(),
+                      sizeof(ApexLegends::GameLumpParentInfo_t) * numParented);
+        }
     }
 
     AddLump(file, header.lumps[R5_LUMP_CELL_AABB_NUM_OBJ_REFS_TOTAL], ApexLegends::Bsp::cellAABBNumObjRefsTotal);

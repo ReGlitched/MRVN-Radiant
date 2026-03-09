@@ -94,11 +94,19 @@ void ApexLegends::EndModel() {
 */
 void ApexLegends::EmitLevelInfo() {
     ApexLegends::LevelInfo_t &li = ApexLegends::Bsp::levelInfo.emplace_back();
-    li.unk0 = 51;
-    li.unk1 = 51;
-    li.unk2 = 51;
-    li.unk3 = 256;
-    li.unk4 = 22;
+
+    // Compute mesh type counts for firstMeshIdx
+    // unk0/unk1/unk2 = firstMeshIdx[1]/[2]/[3] = cumulative mesh counts by type
+    uint32_t totalMeshes = static_cast<uint32_t>(Shared::meshes.size());
+    li.unk0 = totalMeshes;  // firstMeshIdx[1]
+    li.unk1 = totalMeshes;  // firstMeshIdx[2]
+    li.unk2 = totalMeshes;  // firstMeshIdx[3] = numWorldObjIDs
+
+    // firstPropObjID: aligned up to 64 from numWorldObjIDs
+    uint32_t firstPropObjID = (totalMeshes + 63) & ~63u;
+    uint32_t numPropObjIDs = static_cast<uint32_t>(ApexLegends::Bsp::gameLumpProps.size());
+    li.unk3 = firstPropObjID;
+    li.unk4 = numPropObjIDs;
 
     // Find the last light_environment entity and extract sun direction for unk5
     // unk5 is the sun direction vector used by the engine

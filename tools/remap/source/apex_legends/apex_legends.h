@@ -467,7 +467,63 @@ namespace ApexLegends {
     };
 
 
-    // GameLump Stub
+    // 0x23 - GameLump structures for Apex Legends
+    // These differ from TF2 in prop fields at +52 and prop header semantics
+    struct GameLumpHeader_t {
+        uint32_t  version;            // Always 1
+        char      ident[4];           // "prps"
+        uint32_t  gameConst;          // 3080192 (0x002F0000) for Apex v47
+        uint32_t  offset;             // Absolute offset to data after this header
+        uint32_t  length;             // Size of data after this header
+    };
+    static_assert(sizeof(GameLumpHeader_t) == 20, "GameLumpHeader_t must be exactly 20 bytes");
+
+    struct GameLumpPathHeader_t {
+        uint32_t  numPaths;
+    };
+
+    struct GameLumpPropHeader_t {
+        uint32_t  numStaticProps;     // Total count of static props
+        uint32_t  numOpaqueProps;     // Number of opaque props (sorted first)
+        uint32_t  firstTransProp;     // Index of first transparent prop
+    };
+    static_assert(sizeof(GameLumpPropHeader_t) == 12, "GameLumpPropHeader_t must be exactly 12 bytes");
+
+    // Apex Legends Static Prop (64 bytes)
+    // Differs from TF2 at +0x34: diffuseMod/wind/setDress instead of cpu/gpu/diffuse/collision
+    #pragma pack(push, 1)
+    struct GameLumpProp_t {
+        Vector3   origin;             // +0x00 (12 bytes)
+        Vector3   angles;             // +0x0C (12 bytes) - pitch, yaw, roll
+        float     scale;              // +0x18 (4 bytes)
+        uint16_t  modelName;          // +0x1C (2 bytes) - index into path array
+        uint8_t   solid;              // +0x1E (1 byte) - solid type
+        uint8_t   flags;              // +0x1F (1 byte) - prop flags
+        uint16_t  skin;               // +0x20 (2 bytes)
+        int16_t   envCubemap;         // +0x22 (2 bytes) - cubemap index, 0xFFFF = default
+        float     fadeDist;           // +0x24 (4 bytes) - fade distance, -1 = use default
+        Vector3   lightingOrigin;     // +0x28 (12 bytes) - custom lighting sample pos
+        uint8_t   diffuseModulation[4]; // +0x34 (4 bytes) - sRGB RGBA tint
+        uint32_t  precompiledWind;    // +0x38 (4 bytes) - packed wind evaluation data
+        uint8_t   setDressLevel;      // +0x3C (1 byte) - set dressing LOD level
+        uint8_t   padding[3];         // +0x3D (3 bytes)
+    };
+    #pragma pack(pop)
+    static_assert(sizeof(GameLumpProp_t) == 64, "GameLumpProp_t must be exactly 64 bytes");
+
+    // Apex Legends Parented Static Prop Info (64 bytes)
+    // Links a static prop to a brush model for moving/parenting
+    #pragma pack(push, 1)
+    struct GameLumpParentInfo_t {
+        float     modelToParent[12];  // +0x00 (48 bytes) - 3x4 transform matrix
+        uint32_t  parentBrushModelIndex; // +0x30 (4 bytes)
+        uint32_t  staticPropIndex;    // +0x34 (4 bytes) - must be sorted ascending
+        uint32_t  padding[2];         // +0x38 (8 bytes)
+    };
+    #pragma pack(pop)
+    static_assert(sizeof(GameLumpParentInfo_t) == 64, "GameLumpParentInfo_t must be exactly 64 bytes");
+
+    // GameLump Stub (for empty game lumps)
     struct GameLump_Stub_t {
         uint32_t  version = 1;
         char      magic[4];
@@ -597,5 +653,13 @@ namespace ApexLegends {
         // Cell AABB system lumps (visibility/streaming)
         inline std::vector<uint32_t>             cellAABBNumObjRefsTotal;  // Lump 0x25 - cumulative obj ref count per node
         inline std::vector<uint16_t>             cellAABBFadeDists;        // Lump 0x27 - fade distances for objects
+
+        // GameLump (0x23) - Static props
+        inline GameLumpHeader_t                         gameLumpHeader;
+        inline GameLumpPathHeader_t                     gameLumpPathHeader;
+        inline std::vector<Titanfall::GameLumpPath_t>   gameLumpPaths;    // 128-byte path strings (.rmdl)
+        inline GameLumpPropHeader_t                     gameLumpPropHeader;
+        inline std::vector<GameLumpProp_t>              gameLumpProps;
+        inline std::vector<GameLumpParentInfo_t>        gameLumpParentInfos;
     }
 }

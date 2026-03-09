@@ -55,6 +55,12 @@ void ApexLegends::EmitVisTree() {
     Vector3 largeMin(-50000.0f, -50000.0f, -50000.0f);
     Vector3 largeMax(50000.0f, 50000.0f, 50000.0f);
 
+    // Compute firstPropObjID: aligned up to 64 from total mesh count
+    uint32_t totalMeshes = static_cast<uint32_t>(Shared::meshes.size());
+    uint32_t firstPropObjID = (totalMeshes + 63) & ~63u;
+    uint32_t numProps = static_cast<uint32_t>(ApexLegends::Bsp::gameLumpProps.size());
+    uint32_t totalObjRefs = static_cast<uint32_t>(Shared::visRefs.size()) + numProps;
+
     ApexLegends::CellAABBNode_t &bn = ApexLegends::Bsp::cellAABBNodes.emplace_back();
     bn.maxs = largeMax;
     bn.mins = largeMin;
@@ -62,12 +68,12 @@ void ApexLegends::EmitVisTree() {
     bn.childCount = 0;
     bn.childFlags = 0x40;
     
-    // Put ALL mesh references directly in the root node
+    // Put ALL references (meshes + props) directly in the root node
     bn.objRefOffset = 0;
-    bn.objRefCount = Shared::visRefs.size();
+    bn.objRefCount = totalObjRefs;
     bn.objRefFlags = 0x40;
     
-    // Emit all references with large bounds and fade distances
+    // Emit mesh references with large bounds and fade distances
     for (Shared::visRef_t &ref : Shared::visRefs) {
         Titanfall::ObjReferenceBounds_t &rb = Titanfall::Bsp::objReferenceBounds.emplace_back();
         rb.maxs = largeMax;
@@ -78,11 +84,21 @@ void ApexLegends::EmitVisTree() {
         // Fade distance: 0xFFFF = maximum draw distance (no fade)
         ApexLegends::Bsp::cellAABBFadeDists.push_back(0xFFFF);
     }
+
+    // Emit static prop references
+    for (uint32_t i = 0; i < numProps; i++) {
+        Titanfall::ObjReferenceBounds_t &rb = Titanfall::Bsp::objReferenceBounds.emplace_back();
+        rb.maxs = largeMax;
+        rb.mins = largeMin;
+
+        ApexLegends::Bsp::objReferences.emplace_back(firstPropObjID + i);
+
+        ApexLegends::Bsp::cellAABBFadeDists.push_back(0xFFFF);
+    }
     
     // Emit cumulative obj ref count for each AABB node
     // For a single root node, this is just the total count
-    uint32_t numObjRefs = static_cast<uint32_t>(Shared::visRefs.size());
-    ApexLegends::Bsp::cellAABBNumObjRefsTotal.push_back(numObjRefs);
+    ApexLegends::Bsp::cellAABBNumObjRefsTotal.push_back(totalObjRefs);
 }
 
 /*

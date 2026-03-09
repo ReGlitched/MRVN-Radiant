@@ -2736,6 +2736,32 @@ void ApexLegends::EmitLightProbes() {
         }
     }
     Sys_Printf("     %9zu probes with static lights\n", probesWithLights);
+
+    // Populate static prop lightprobe indices (lump 0x66)
+    // One entry per static prop, pointing to the nearest light probe
+    const uint32_t numStaticProps = ApexLegends::Bsp::gameLumpPropHeader.numStaticProps;
+    if (numStaticProps > 0 && !ApexLegends::Bsp::lightprobeReferences.empty()) {
+        ApexLegends::Bsp::staticPropLightprobeIndices.resize(numStaticProps);
+        for (uint32_t i = 0; i < numStaticProps; i++) {
+            const ApexLegends::GameLumpProp_t &prop = ApexLegends::Bsp::gameLumpProps[i];
+            // Find nearest light probe reference by distance
+            float bestDistSq = FLT_MAX;
+            uint32_t bestIdx = 0;
+            for (uint32_t j = 0; j < ApexLegends::Bsp::lightprobeReferences.size(); j++) {
+                const LightProbeRef_t &ref = ApexLegends::Bsp::lightprobeReferences[j];
+                float dx = ref.origin[0] - prop.origin[0];
+                float dy = ref.origin[1] - prop.origin[1];
+                float dz = ref.origin[2] - prop.origin[2];
+                float distSq = dx*dx + dy*dy + dz*dz;
+                if (distSq < bestDistSq) {
+                    bestDistSq = distSq;
+                    bestIdx = ref.lightProbeIndex;
+                }
+            }
+            ApexLegends::Bsp::staticPropLightprobeIndices[i] = bestIdx;
+        }
+        Sys_Printf("     %9u static prop lightprobe indices\n", numStaticProps);
+    }
     
     // Export probe positions for visualization in Radiant
     if (!ApexLegends::Bsp::lightprobeReferences.empty()) {

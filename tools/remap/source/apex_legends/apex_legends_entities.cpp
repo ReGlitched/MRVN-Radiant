@@ -99,28 +99,40 @@ void ApexLegends::EmitStaticProp(entity_t &e) {
         return;
     }
 
-    Sys_FPrintf(SYS_VRB, "  Emitting static prop: %s\n", model);
+    // Strip "models/" prefix — Apex game lump paths start at "mdl/"
+    const char *lumpPath = model;
+    if (striEqualPrefix(lumpPath, "models/"))
+        lumpPath += 7;
 
-    for(std::size_t i = 0; i < Titanfall::Bsp::gameLumpPaths.size(); i++) {
-        Titanfall::GameLumpPath_t &path = Titanfall::Bsp::gameLumpPaths.at(i);
+    Sys_FPrintf(SYS_VRB, "  Emitting static prop: %s\n", lumpPath);
 
-        if(!string_compare_nocase(path.path, model)) {
+    // Find existing path or add new one
+    for(std::size_t i = 0; i < ApexLegends::Bsp::gameLumpPaths.size(); i++) {
+        Titanfall::GameLumpPath_t &path = ApexLegends::Bsp::gameLumpPaths.at(i);
+
+        if(!string_compare_nocase(path.path, lumpPath)) {
             pathIdx = i;
             break;
         }
     }
 
     if(pathIdx == -1) {
-        Titanfall2::Bsp::gameLumpPathHeader.numPaths++;
-        Titanfall::GameLumpPath_t &path = Titanfall::Bsp::gameLumpPaths.emplace_back();
-        strncpy(path.path, model, 127);
-        pathIdx = Titanfall::Bsp::gameLumpPaths.size() - 1;
+        ApexLegends::Bsp::gameLumpPathHeader.numPaths++;
+        Titanfall::GameLumpPath_t &path = ApexLegends::Bsp::gameLumpPaths.emplace_back();
+        strncpy(path.path, lumpPath, 127);
+        path.path[127] = '\0';
+        pathIdx = ApexLegends::Bsp::gameLumpPaths.size() - 1;
     }
 
-    Titanfall2::Bsp::gameLumpPropHeader.numProps++;
-    Titanfall2::Bsp::gameLumpPropHeader.unk0++;
-    Titanfall2::Bsp::gameLumpPropHeader.unk1++;
-    Titanfall2::GameLumpProp_t &prop = Titanfall2::Bsp::gameLumpProps.emplace_back();
+    // Increment prop counts
+    // All remap-compiled props are treated as opaque for now
+    ApexLegends::Bsp::gameLumpPropHeader.numStaticProps++;
+    ApexLegends::Bsp::gameLumpPropHeader.numOpaqueProps++;
+    ApexLegends::Bsp::gameLumpPropHeader.firstTransProp++;
+
+    ApexLegends::GameLumpProp_t &prop = ApexLegends::Bsp::gameLumpProps.emplace_back();
+    memset(&prop, 0, sizeof(prop));
+
     Vector3 origin;
     Vector3 angles;
     if(!e.read_keyvalue(origin, "origin")) {
@@ -133,30 +145,37 @@ void ApexLegends::EmitStaticProp(entity_t &e) {
         angles.y() = 0.0f;
         angles.z() = 0.0f;
     }
-    
-    // Apex uses Source engine style angles: pitch (X), yaw (Z), roll (Y)
-    // GameLumpProp_t stores angles directly as Vector3
-    prop.angles = angles;
-    
+
     prop.origin = origin;
-    prop.scale = e.floatForKey("scale", "1.0");
+    prop.angles = angles;
+
+    // floatForKey/intForKey treat all arguments as key names, not defaults
+    float scale = e.floatForKey("modelscale");
+    if (scale == 0.0f) scale = 1.0f;
+    prop.scale = scale;
+
     prop.modelName = pathIdx;
-    prop.solid = 0;
-    prop.flags = 0;
-    prop.skin = 0;
-    prop.envCubemap = 0;
-    prop.fade_scale = 1.0f;
-    prop.unk = Vector3(0, 0, 0);
-    prop.cpu_level[0] = -1;
-    prop.cpu_level[1] = -1;
-    prop.gpu_level[0] = -1;
-    prop.gpu_level[1] = -1;
-    prop.diffuse_modulation[0] = 255;
-    prop.diffuse_modulation[1] = 255;
-    prop.diffuse_modulation[2] = 255;
-    prop.diffuse_modulation[3] = 255;
-    prop.collision_flags[0] = 0;
-    prop.collision_flags[1] = 0;
+
+    int solid = e.intForKey("solid");
+    if (solid == 0) solid = 6;  // Default: SOLID_VPHYSICS
+    prop.solid = (uint8_t)solid;
+
+    prop.flags = (uint8_t)e.intForKey("staticPropFlags") | 0x04;  // Bit 2 always set (engine requires for staticPropFlags 0x40)
+    prop.skin = (uint16_t)e.intForKey("skin");
+    prop.envCubemap = 0xFFFF;       // Use default cubemap
+
+    float fadeDist = e.floatForKey("fademindist");
+    if (fadeDist == 0.0f) fadeDist = -1.0f;  // -1 = engine calculates default
+    prop.fadeDist = fadeDist;
+    // Use prop origin as lighting sample point; set flags bit 1 for custom origin
+    prop.flags |= 0x02;
+    prop.lightingOrigin = origin;
+    prop.diffuseModulation[0] = 255;  // R
+    prop.diffuseModulation[1] = 255;  // G
+    prop.diffuseModulation[2] = 255;  // B
+    prop.diffuseModulation[3] = 255;  // A
+    prop.precompiledWind = 0;         // No wind
+    prop.setDressLevel = 0;           // Default LOD level
 }
 
 /*
@@ -164,15 +183,13 @@ void ApexLegends::EmitStaticProp(entity_t &e) {
     Initializes the GameLump header data
 */
 void ApexLegends::SetupGameLump() {
-    Titanfall2::Bsp::gameLumpHeader.version = 1;
-    memcpy(Titanfall2::Bsp::gameLumpHeader.ident, "prps", 4);
-    Titanfall2::Bsp::gameLumpHeader.gameConst = 851968;  // Apex Legends constant
-    
-    Titanfall2::Bsp::gameLumpPathHeader.numPaths = 0;
-    
-    Titanfall2::Bsp::gameLumpPropHeader.numProps = 0;
-    Titanfall2::Bsp::gameLumpPropHeader.unk0 = 0;
-    Titanfall2::Bsp::gameLumpPropHeader.unk1 = 0;
-    
-    Titanfall2::Bsp::gameLumpUnknownHeader.unknown = 0;
+    ApexLegends::Bsp::gameLumpHeader.version = 1;
+    memcpy(ApexLegends::Bsp::gameLumpHeader.ident, "prps", 4);
+    ApexLegends::Bsp::gameLumpHeader.gameConst = 3080192;  // 0x002F0000 = bspVersion(47) << 16
+
+    ApexLegends::Bsp::gameLumpPathHeader.numPaths = 0;
+
+    ApexLegends::Bsp::gameLumpPropHeader.numStaticProps = 0;
+    ApexLegends::Bsp::gameLumpPropHeader.numOpaqueProps = 0;
+    ApexLegends::Bsp::gameLumpPropHeader.firstTransProp = 0;
 }
