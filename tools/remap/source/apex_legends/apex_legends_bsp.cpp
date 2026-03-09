@@ -234,7 +234,15 @@ void WriteR5BSPFile(const char *filename) {
 */
 void CompileR5BSPFile() {
     ApexLegends::SetupGameLump();
+
+    /* First pass: emit static props so they're available for the collision BVH */
+    for (entity_t &entity : entities) {
+        if (striEqual(entity.classname(), "prop_static")) {
+            ApexLegends::EmitStaticProp(entity);
+        }
+    }
     
+    /* Second pass: worldspawn, other entities */
     for (entity_t &entity : entities) {
         const char *pszClassname = entity.classname();
 
@@ -251,10 +259,8 @@ void CompileR5BSPFile() {
             ApexLegends::EmitBVHNode();
 
             ApexLegends::EndModel();
-        } else if (ENT_IS("prop_static")) { // Compile as static props into gamelump
-            // TODO: use prop_static instead
-            ApexLegends::EmitStaticProp(entity);
-            continue; // Don't emit as entity
+        } else if (ENT_IS("prop_static")) {
+            continue; // Already processed in first pass
         } else if (ENT_IS("func_occluder")) {
             Titanfall::EmitOcclusionMeshes(entity);
             continue; // Don't emit as entity

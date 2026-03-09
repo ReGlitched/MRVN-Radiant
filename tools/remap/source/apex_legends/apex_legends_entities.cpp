@@ -33,6 +33,8 @@
 #include "../bspfile_abstract.h"
 #include "../model.h"
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 
 /*
     EmitEntity()
@@ -178,6 +180,81 @@ void ApexLegends::EmitStaticProp(entity_t &e) {
     prop.diffuseModulation[3] = 255;  // A
     prop.precompiledWind = 0;         // No wind
     prop.setDressLevel = 0;           // Default LOD level
+
+    // Compute world-space AABB for collision BVH integration
+    // Only register if the prop has collision (solid != 0)
+    if (prop.solid != 0) {
+        // Compute local-space AABB from model mesh vertices
+        MinMax localBounds;
+        localBounds.mins = Vector3( FLT_MAX,  FLT_MAX,  FLT_MAX);
+        localBounds.maxs = Vector3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+
+        for (const AssMeshWalker* mesh : meshes) {
+            mesh->forEachFace([&](const Vector3 (&xyz)[3], const Vector2 (&)[3]) {
+                for (int i = 0; i < 3; i++) {
+                    localBounds.mins.x() = std::min(localBounds.mins.x(), xyz[i].x());
+                    localBounds.mins.y() = std::min(localBounds.mins.y(), xyz[i].y());
+                    localBounds.mins.z() = std::min(localBounds.mins.z(), xyz[i].z());
+                    localBounds.maxs.x() = std::max(localBounds.maxs.x(), xyz[i].x());
+                    localBounds.maxs.y() = std::max(localBounds.maxs.y(), xyz[i].y());
+                    localBounds.maxs.z() = std::max(localBounds.maxs.z(), xyz[i].z());
+                }
+            });
+        }
+
+        if (localBounds.mins.x() <= localBounds.maxs.x()) {
+            // Build rotation matrix from Source engine angles (pitch, yaw, roll)
+            // R = Rz(yaw) * Ry(pitch) * Rx(roll)
+            const float sp = std::sin(degrees_to_radians(angles.x()));
+            const float cp = std::cos(degrees_to_radians(angles.x()));
+            const float sy = std::sin(degrees_to_radians(angles.y()));
+            const float cy = std::cos(degrees_to_radians(angles.y()));
+            const float sr = std::sin(degrees_to_radians(angles.z()));
+            const float cr = std::cos(degrees_to_radians(angles.z()));
+
+            // Rotation matrix rows (Source AngleMatrix convention)
+            // row0: forward
+            // row1: right
+            // row2: up
+            float m[3][3];
+            m[0][0] = cp * cy;                     m[0][1] = cp * sy;                     m[0][2] = -sp;
+            m[1][0] = sr * sp * cy + cr * (-sy);    m[1][1] = sr * sp * sy + cr * cy;      m[1][2] = sr * cp;
+            m[2][0] = cr * sp * cy + (-sr) * (-sy); m[2][1] = cr * sp * sy + (-sr) * cy;   m[2][2] = cr * cp;
+
+            // Transform 8 AABB corners to world space and compute world AABB
+            MinMax worldBounds;
+            worldBounds.mins = Vector3( FLT_MAX,  FLT_MAX,  FLT_MAX);
+            worldBounds.maxs = Vector3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+
+            for (int corner = 0; corner < 8; corner++) {
+                Vector3 local(
+                    (corner & 1) ? localBounds.maxs.x() : localBounds.mins.x(),
+                    (corner & 2) ? localBounds.maxs.y() : localBounds.mins.y(),
+                    (corner & 4) ? localBounds.maxs.z() : localBounds.mins.z()
+                );
+
+                // Apply scale
+                local *= scale;
+
+                // Apply rotation then translation
+                Vector3 world(
+                    m[0][0] * local.x() + m[1][0] * local.y() + m[2][0] * local.z() + origin.x(),
+                    m[0][1] * local.x() + m[1][1] * local.y() + m[2][1] * local.z() + origin.y(),
+                    m[0][2] * local.x() + m[1][2] * local.y() + m[2][2] * local.z() + origin.z()
+                );
+
+                worldBounds.mins.x() = std::min(worldBounds.mins.x(), world.x());
+                worldBounds.mins.y() = std::min(worldBounds.mins.y(), world.y());
+                worldBounds.mins.z() = std::min(worldBounds.mins.z(), world.z());
+                worldBounds.maxs.x() = std::max(worldBounds.maxs.x(), world.x());
+                worldBounds.maxs.y() = std::max(worldBounds.maxs.y(), world.y());
+                worldBounds.maxs.z() = std::max(worldBounds.maxs.z(), world.z());
+            }
+
+            uint32_t propIndex = static_cast<uint32_t>(ApexLegends::Bsp::gameLumpProps.size() - 1);
+            ApexLegends::AddCollisionStaticProp(propIndex, worldBounds);
+        }
+    }
 }
 
 /*

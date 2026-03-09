@@ -256,6 +256,7 @@ namespace ApexLegends {
     void        EmitBVHNode();
     int         EmitBVHDataleaf();
     int         EmitContentsMask( int mask );
+    void        AddCollisionStaticProp( uint32_t propIndex, const MinMax& worldBounds );
     void        EmitMeshes(const entity_t &e);
     uint32_t    EmitTextureData(shaderInfo_t shader);
     uint16_t    EmitMaterialSort(uint32_t index, int offset, int count, int16_t lightmapIdx);
