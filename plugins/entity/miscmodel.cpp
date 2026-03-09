@@ -37,6 +37,7 @@
 #include "eclasslib.h"
 #include "render.h"
 #include "pivot.h"
+#include "ifilesystem.h"
 
 #include "targetable.h"
 #include "origin.h"
@@ -51,6 +52,12 @@
 #include "entity.h"
 
 #include "modelskinkey.h"
+#include <string>
+#include <unordered_map>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
 
 #include "modelskin.h"
 class RemapKeysObserver : public Entity::Observer, public ModelSkin
@@ -131,6 +138,151 @@ public:
 
 const char EXCLUDE_NAME[] = "prop_static";
 
+namespace
+{
+class ModelRotationOverrides
+{
+	std::unordered_map<std::string, Vector3> m_overrides;
+
+	static bool hasPrefix( const std::string& str, const char* prefix ){
+		const std::size_t prefixLen = strlen( prefix );
+		return str.size() >= prefixLen && str.compare( 0, prefixLen, prefix ) == 0;
+	}
+
+	static std::string normalisePath( const char* path ){
+		std::string result;
+		if ( path != nullptr ) {
+			result = path;
+		}
+
+		std::replace( result.begin(), result.end(), '\\', '/' );
+		std::transform( result.begin(), result.end(), result.begin(), []( unsigned char c ){
+			return static_cast<char>( std::tolower( c ) );
+		} );
+
+		while ( hasPrefix( result, "./" ) ) {
+			result.erase( 0, 2 );
+		}
+		return result;
+	}
+
+	static bool parseQuotedString( const std::string& text, std::size_t& pos, std::string& out ){
+		while ( pos < text.size() && text[pos] != '"' )
+			++pos;
+		if ( pos >= text.size() )
+			return false;
+
+		++pos;
+		out.clear();
+		while ( pos < text.size() )
+		{
+			const char c = text[pos++];
+			if ( c == '"' )
+				return true;
+
+			if ( c == '\\' && pos < text.size() )
+			{
+				const char escaped = text[pos];
+				switch ( escaped )
+				{
+				case '"':  out.push_back( '"' ); ++pos; continue;
+				case '\\': out.push_back( '\\' ); ++pos; continue;
+				case '/':  out.push_back( '/' ); ++pos; continue;
+				case 'n':  out.push_back( '\n' ); ++pos; continue;
+				case 'r':  out.push_back( '\r' ); ++pos; continue;
+				case 't':  out.push_back( '\t' ); ++pos; continue;
+				default:
+					// Keep backslashes for non-JSON-style escapes, e.g. "mdl\door\foo.rmdl".
+					out.push_back( '\\' );
+					continue;
+				}
+			}
+
+			out.push_back( c );
+		}
+
+		return false;
+	}
+
+	static bool parseRotation( const std::string& value, Vector3& rotation ){
+		std::string cleaned = value;
+		std::replace( cleaned.begin(), cleaned.end(), ',', ' ' );
+
+		float x = 0.f, y = 0.f, z = 0.f;
+		if ( std::sscanf( cleaned.c_str(), "%f %f %f", &x, &y, &z ) == 3 ) {
+			rotation = Vector3( x, y, z );
+			return true;
+		}
+
+		return false;
+	}
+
+	void reload(){
+		m_overrides.clear();
+
+		void* buffer = nullptr;
+		const int size = vfsLoadFile( "models/rotation_overrides.json", &buffer );
+		if ( size <= 0 || buffer == nullptr )
+			return;
+
+		const std::string text( static_cast<const char*>( buffer ), static_cast<std::size_t>( size ) );
+		vfsFreeFile( buffer );
+
+		std::size_t pos = 0;
+		std::string modelPath;
+		std::string rotationText;
+		while ( parseQuotedString( text, pos, modelPath ) && parseQuotedString( text, pos, rotationText ) )
+		{
+			Vector3 rotation;
+			if ( !parseRotation( rotationText, rotation ) )
+				continue;
+
+			const std::string key = normalisePath( modelPath.c_str() );
+			if ( key.empty() )
+				continue;
+
+			m_overrides[key] = rotation;
+		}
+	}
+
+public:
+	static ModelRotationOverrides& instance(){
+		static ModelRotationOverrides overrides;
+		return overrides;
+	}
+
+	bool lookup( const char* modelPath, Vector3& rotation ){
+		reload();
+
+		const std::string key = normalisePath( modelPath );
+		if ( key.empty() )
+			return false;
+
+		if ( const auto i = m_overrides.find( key ); i != m_overrides.end() ) {
+			rotation = i->second;
+			return true;
+		}
+
+		if ( hasPrefix( key, "models/" ) ) {
+			if ( const auto i = m_overrides.find( key.substr( 7 ) ); i != m_overrides.end() ) {
+				rotation = i->second;
+				return true;
+			}
+		}
+		else
+		{
+			const std::string fullPath = StringStream( "models/", key.c_str() );
+			if ( const auto i = m_overrides.find( fullPath ); i != m_overrides.end() ) {
+				rotation = i->second;
+				return true;
+			}
+		}
+
+		return false;
+	}
+};
+}
+
 class MiscModel :
 	public Snappable
 {
@@ -143,6 +295,7 @@ class MiscModel :
 	Vector3 m_origin;
 	AnglesKey m_anglesKey;
 	Vector3 m_angles;
+	Vector3 m_modelRotation;
 	ScaleKey m_scaleKey;
 	Vector3 m_scale;
 
@@ -159,18 +312,23 @@ class MiscModel :
 
 	void construct(){
 		m_keyObservers.insert( "classname", ClassnameFilter::ClassnameChangedCaller( m_filter ) );
+		m_keyObservers.insert( "classname", ClassnameChangedCaller( *this ) );
 		m_keyObservers.insert( Static<KeyIsName>::instance().m_nameKey, NamedEntity::IdentifierChangedCaller( m_named ) );
-		m_keyObservers.insert( m_entity.getEntityClass().miscmodel_key(), SingletonModel::ModelChangedCaller( m_model ) );
+		m_keyObservers.insert( m_entity.getEntityClass().miscmodel_key(), ModelKeyChangedCaller( *this ) );
 		m_keyObservers.insert( "origin", OriginKey::OriginChangedCaller( m_originKey ) );
 		m_keyObservers.insert( "angle", m_anglesKey.getAngleChangedCallback() );
 		m_keyObservers.insert( "angles", m_anglesKey.getAnglesChangedCallback() );
 		m_keyObservers.insert( "modelscale", ScaleKey::UniformScaleChangedCaller( m_scaleKey ) );
 		m_keyObservers.insert( "modelscale_vec", ScaleKey::ScaleChangedCaller( m_scaleKey ) );
+		classnameChanged( "" );
 	}
 
 	void updateTransform(){
 		m_transform.localToParent() = g_matrix4_identity;
-		matrix4_transform_by_euler_xyz_degrees( m_transform.localToParent(), m_origin, m_angles, m_scale );
+		matrix4_translate_by_vec3( m_transform.localToParent(), m_origin );
+		matrix4_rotate_by_euler_xyz_degrees( m_transform.localToParent(), m_angles );
+		matrix4_rotate_by_euler_xyz_degrees( m_transform.localToParent(), m_modelRotation );
+		matrix4_scale_by_vec3( m_transform.localToParent(), m_scale );
 		m_transformChanged();
 	}
 
@@ -195,6 +353,32 @@ public:
 	}
 	typedef MemberCaller<MiscModel, &MiscModel::scaleChanged> ScaleChangedCaller;
 
+	void reloadModelRotation( const char* modelPath ){
+		m_modelRotation = ANGLESKEY_IDENTITY;
+		if ( !ModelRotationOverrides::instance().lookup( modelPath, m_modelRotation ) )
+			m_modelRotation = ANGLESKEY_IDENTITY;
+	}
+
+	const char* effectiveModelPath() const {
+		const EntityClass& eclass = m_entity.getEntityClass();
+		const char* key = eclass.miscmodel_key();
+		const char* model = m_entity.getKeyValue( key );
+		return string_empty( model ) ? EntityClass_valueForKey( eclass, key ) : model;
+	}
+
+	void classnameChanged( const char* ){
+		reloadModelRotation( effectiveModelPath() );
+		updateTransform();
+	}
+	typedef MemberCaller1<MiscModel, const char*, &MiscModel::classnameChanged> ClassnameChangedCaller;
+
+	void modelKeyChanged( const char* value ){
+		m_model.modelChanged( value );
+		reloadModelRotation( value );
+		updateTransform();
+	}
+	typedef MemberCaller1<MiscModel, const char*, &MiscModel::modelKeyChanged> ModelKeyChangedCaller;
+
 	void skinChanged(){
 		scene::Node* node = m_model.getNode();
 		if ( node != 0 ) {
@@ -212,6 +396,7 @@ public:
 		m_origin( ORIGINKEY_IDENTITY ),
 		m_anglesKey( AnglesChangedCaller( *this ), m_entity ),
 		m_angles( ANGLESKEY_IDENTITY ),
+		m_modelRotation( ANGLESKEY_IDENTITY ),
 		m_scaleKey( ScaleChangedCaller( *this ), m_entity ),
 		m_scale( SCALEKEY_IDENTITY ),
 		m_filter( m_entity, node ),
@@ -229,6 +414,7 @@ public:
 		m_origin( ORIGINKEY_IDENTITY ),
 		m_anglesKey( AnglesChangedCaller( *this ), m_entity ),
 		m_angles( ANGLESKEY_IDENTITY ),
+		m_modelRotation( ANGLESKEY_IDENTITY ),
 		m_scaleKey( ScaleChangedCaller( *this ), m_entity ),
 		m_scale( SCALEKEY_IDENTITY ),
 		m_filter( m_entity, node ),
@@ -252,7 +438,7 @@ public:
 				const char *key = eclass.miscmodel_key();
 				const char *model = EntityClass_valueForKey( eclass, key );
 				if( !string_empty( model ) && !m_entity.hasKeyValue( key ) )
-					m_model.modelChanged( model );
+					modelKeyChanged( model );
 			}
 		}
 	}
