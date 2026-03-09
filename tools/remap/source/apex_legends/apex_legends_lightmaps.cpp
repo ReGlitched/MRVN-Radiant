@@ -71,6 +71,11 @@ constexpr int SUPERSAMPLE_PASSES = 2;                       // Max iterative ref
 constexpr float SUPERSAMPLE_GRADIENT_THRESHOLD = 0.0625f;   // Gradient threshold to trigger supersampling
 constexpr int SUPERSAMPLE_GRID = 4;                         // 4x4 sub-sample grid per texel
 
+// Ambient occlusion settings for indirect lightmap channel
+constexpr int AO_HEMISPHERE_RAYS = 8;            // Hemisphere ray count for sky AO per texel
+constexpr float AO_TRACE_DISTANCE = 2048.0f;     // Max trace distance for AO rays
+constexpr float INDIRECT_AMBIENT_SCALE = 0.35f;  // Scale factor for sky ambient in indirect channel
+
 // Light probe settings (adapted from Source SDK leaf_ambient_lighting.cpp)
 constexpr int LIGHT_PROBE_GRID_SPACING = 256;   // Units between probes on grid
 constexpr int LIGHT_PROBE_MIN_SPACING = 128;    // Minimum spacing between probes
@@ -288,7 +293,6 @@ static void InitLightmapAtlas() {
     LightmapBuild::pageCursorY = 0;
     LightmapBuild::pageRowHeight = 0;
 }
-
 
 /*
     AllocateLightmapRect
@@ -780,6 +784,24 @@ static TexelLighting_t ComputeLightingAtPoint(const Vector3 &worldPos, const Vec
         }
     }
 
+    // Add sky ambient with occlusion to indirect channel.
+    // This gives shadowed areas a soft ambient gradient instead of pure black,
+    // so the engine can distinguish open shadow from enclosed space.
+    if (sky.valid) {
+        int hemiRays = 0;
+        int unoccluded = 0;
+        // Sample a subset of sphere normals in the surface hemisphere
+        for (int i = 0; i < NUM_SPHERE_NORMALS; i += (NUM_SPHERE_NORMALS / AO_HEMISPHERE_RAYS)) {
+            if (vector3_dot(g_SphereNormals[i], sampleNormal) <= 0) continue;
+            hemiRays++;
+            if (!TraceRayAgainstMeshes(worldPos, g_SphereNormals[i], AO_TRACE_DISTANCE)) {
+                unoccluded++;
+            }
+        }
+        float aoFactor = (hemiRays > 0) ? (float)unoccluded / hemiRays : 0.5f;
+        result.indirect = result.indirect + sky.ambientColor * (aoFactor * INDIRECT_AMBIENT_SCALE);
+    }
+
     return result;
 }
 
@@ -1076,7 +1098,9 @@ static void EncodeHDRTexel(const Vector3 &color, uint8_t *out) {
         exponent = 0;
         scale = 1.0f;
     } else {
-        int exp = (int)std::ceil(8.0f * std::log2(maxComponent));
+        // Bias-128 RGBE: decode = (RGB/255) * 2^(exp-128)
+        // We need 2^(exp-128) >= maxComponent, so exp >= 128 + log2(maxComponent)
+        int exp = 128 + (int)std::ceil(std::log2(maxComponent));
         exponent = (uint8_t)std::min(255, std::max(0, exp));
 
         // Scale factor: divide by 2^(exp-128) to normalize mantissa to 0-1
@@ -1131,30 +1155,12 @@ void ApexLegends::EmitLightmaps()
         header.height = 256;
         ApexLegends::Bsp::lightmapHeaders.push_back(header);
         
-        // Neutral stub lightmap - engine applies dynamic ambient/sun from worldLights
+        // Black stub lightmap - engine applies dynamic ambient/sun from worldLights
         // Engine expects PLANAR format: all direct texels first, then all indirect texels
-        // Bias-128 RGBE: finalColor = (RGB/255) * 2^(exp - 128)
-        // exp=128 means 2^0 = 1.0x multiplier (neutral)
-        uint8_t neutralGray = 180;  // Mid-gray mantissa in sRGB
-        uint8_t exponent = 128;     // Neutral exposure: 2^(128-128) = 2^0 = 1.0x
+        // Black (all zeros) prevents bright bleed and lets engine handle dynamic lighting
         size_t numTexels = 256 * 256;
         size_t dataSize = numTexels * 8;  // 4 bytes direct + 4 bytes indirect per texel
-        ApexLegends::Bsp::lightmapDataSky.resize(dataSize);
-        // Sub-texture 0 (direct): first 4*numTexels bytes
-        for (size_t i = 0; i < numTexels; i++) {
-            ApexLegends::Bsp::lightmapDataSky[i * 4 + 0] = neutralGray;
-            ApexLegends::Bsp::lightmapDataSky[i * 4 + 1] = neutralGray;
-            ApexLegends::Bsp::lightmapDataSky[i * 4 + 2] = neutralGray;
-            ApexLegends::Bsp::lightmapDataSky[i * 4 + 3] = exponent;
-        }
-        // Sub-texture 1 (indirect): next 4*numTexels bytes
-        size_t offset = numTexels * 4;
-        for (size_t i = 0; i < numTexels; i++) {
-            ApexLegends::Bsp::lightmapDataSky[offset + i * 4 + 0] = neutralGray;
-            ApexLegends::Bsp::lightmapDataSky[offset + i * 4 + 1] = neutralGray;
-            ApexLegends::Bsp::lightmapDataSky[offset + i * 4 + 2] = neutralGray;
-            ApexLegends::Bsp::lightmapDataSky[offset + i * 4 + 3] = exponent;
-        }
+        ApexLegends::Bsp::lightmapDataSky.resize(dataSize, 0);
         
         return;
     }
@@ -1175,6 +1181,44 @@ void ApexLegends::EmitLightmaps()
                 
                 EncodeHDRTexelPair(directColor, indirectColor, &page.pixels[offset]);
             }
+        }
+    }
+    
+    // Dilate (pad) lightmap edges to prevent bilinear filtering from
+    // sampling black unallocated pixels at surface boundaries.
+    // 2 passes of 4-neighbor dilation.
+    for (auto &page : ApexLegends::Bsp::lightmapPages) {
+        int w = page.width;
+        int h = page.height;
+        
+        for (int pass = 0; pass < 2; pass++) {
+            std::vector<uint8_t> dilated = page.pixels;
+            
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    int off = (y * w + x) * 8;
+                    
+                    // Skip pixels that already have data (either channel has non-zero exponent)
+                    if (page.pixels[off + 3] != 0 || page.pixels[off + 7] != 0) continue;
+                    
+                    // Check 4 neighbors for a non-empty pixel to copy from
+                    const int dx[] = {-1, 1, 0, 0};
+                    const int dy[] = {0, 0, -1, 1};
+                    for (int d = 0; d < 4; d++) {
+                        int nx = x + dx[d];
+                        int ny = y + dy[d];
+                        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+                        
+                        int noff = (ny * w + nx) * 8;
+                        if (page.pixels[noff + 3] != 0 || page.pixels[noff + 7] != 0) {
+                            memcpy(&dilated[off], &page.pixels[noff], 8);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            page.pixels = dilated;
         }
     }
     
