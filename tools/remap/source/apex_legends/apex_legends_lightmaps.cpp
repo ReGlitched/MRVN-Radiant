@@ -66,6 +66,11 @@ constexpr int RADIOSITY_BOUNCES = 0;        // Number of light bounces (0 = dire
 constexpr float RADIOSITY_SCALE = 0.5f;     // Energy retention per bounce
 constexpr int RADIOSITY_SAMPLES = 32;       // Hemisphere samples for indirect lighting
 
+// Adaptive supersampling settings (from Source SDK vrad2 ComputeLightmapGradients/BuildSupersampleFaceLights)
+constexpr int SUPERSAMPLE_PASSES = 2;                       // Max iterative refinement passes
+constexpr float SUPERSAMPLE_GRADIENT_THRESHOLD = 0.0625f;   // Gradient threshold to trigger supersampling
+constexpr int SUPERSAMPLE_GRID = 4;                         // 4x4 sub-sample grid per texel
+
 // Light probe settings (adapted from Source SDK leaf_ambient_lighting.cpp)
 constexpr int LIGHT_PROBE_GRID_SPACING = 256;   // Units between probes on grid
 constexpr int LIGHT_PROBE_MIN_SPACING = 128;    // Minimum spacing between probes
@@ -224,7 +229,8 @@ struct SurfaceLightmap_t {
     Vector3 bitangent;          // V direction in world space
     float uMin, uMax;           // Tangent-space U bounds (for proper UV normalization)
     float vMin, vMax;           // Tangent-space V bounds (for proper UV normalization)
-    std::vector<Vector3> luxels; // Per-texel lighting values (RGB HDR)
+    std::vector<Vector3> luxels;         // Per-texel direct lighting (RGB HDR)
+    std::vector<Vector3> indirectLuxels;  // Per-texel indirect/ambient lighting (RGB HDR)
 };
 
 
@@ -257,7 +263,6 @@ static void InitLightmapAtlas() {
     // Bias-128 RGBE: finalColor = (RGB/255) * 2^(exp - 128)
     // exp=128 → 2^0 = 1.0x (neutral), RGB=180 sRGB ≈ 0.45 linear
     uint8_t neutralValue = 128;  // Mid-gray mantissa in sRGB
-    uint8_t exponent = 128;      // Neutral exposure: 2^(128-128) = 1.0x
     
     size_t dataSize = page.width * page.height * 8;
     page.pixels.resize(dataSize);
@@ -266,12 +271,12 @@ static void InitLightmapAtlas() {
         page.pixels[i + 0] = neutralValue;
         page.pixels[i + 1] = neutralValue;
         page.pixels[i + 2] = neutralValue;
-        page.pixels[i + 3] = 255;
+        page.pixels[i + 3] = 128;
         // Indirect light (bytes 4-7)
         page.pixels[i + 4] = neutralValue;
         page.pixels[i + 5] = neutralValue;
         page.pixels[i + 6] = neutralValue;
-        page.pixels[i + 7] = 128;
+        page.pixels[i + 7] = 255;
     }
     ApexLegends::Bsp::lightmapPages.push_back(page);
     
@@ -468,6 +473,7 @@ void ApexLegends::SetupSurfaceLightmaps() {
         surfLM.vMin = vMin;
         surfLM.vMax = vMax;
         surfLM.luxels.resize(rect.width * rect.height, Vector3(0, 0, 0));
+        surfLM.indirectLuxels.resize(rect.width * rect.height, Vector3(0, 0, 0));
         
         LightmapBuild::surfaces.push_back(surfLM);
         litSurfaces++;
@@ -672,32 +678,245 @@ static void GatherRadiosityLight(int bounceNum) {
 }
 
 
+// Forward declarations for sky environment (defined later with light probe code)
+struct SkyEnvironment {
+    Vector3 ambientColor;
+    Vector3 sunDir;
+    Vector3 sunColor;
+    float sunIntensity;
+    bool valid;
+};
+static SkyEnvironment GetSkyEnvironment();
+static void LogSkyEnvironment(const SkyEnvironment &sky);
+
+
+// =============================================================================
+// ADAPTIVE SUPERSAMPLING (adapted from Source SDK vrad2/lightmap.cpp)
+// ComputeLightmapGradients / BuildSupersampleFaceLights
+// =============================================================================
+
+/*
+    TexelLighting_t
+    Result of lighting computation at a single point.
+*/
+struct TexelLighting_t {
+    Vector3 direct;
+    Vector3 indirect;
+};
+
+/*
+    ComputeLightingAtPoint
+    Compute direct and indirect lighting at an arbitrary world position.
+    Extracted from the per-texel loop to enable reuse during supersampling.
+*/
+static TexelLighting_t ComputeLightingAtPoint(const Vector3 &worldPos, const Vector3 &sampleNormal,
+                                              const SkyEnvironment &sky) {
+    TexelLighting_t result;
+    result.direct = Vector3(0, 0, 0);
+    result.indirect = Vector3(0, 0, 0);
+
+    // Sun shadows (direct channel only)
+    if (sky.valid) {
+        Vector3 sunDir = sky.sunDir * -1.0f;
+        float sunNdotL = vector3_dot(sampleNormal, sunDir);
+        if (sunNdotL > 0) {
+            if (!TraceRayAgainstMeshes(worldPos, sunDir, 65536.0f)) {
+                result.direct = result.direct + sky.sunColor * (sunNdotL * sky.sunIntensity);
+            }
+        }
+    }
+
+    // Static point/spot lights (both channels)
+    for (const WorldLight_t &light : ApexLegends::Bsp::worldLights) {
+        if (light.type == emit_skyambient || light.type == emit_skylight) continue;
+        if (light.flags & WORLDLIGHT_FLAG_REALTIME) continue;
+
+        Vector3 lightPos(light.origin[0], light.origin[1], light.origin[2]);
+
+        if (light.type == emit_point) {
+            Vector3 toLight = lightPos - worldPos;
+            float dist = vector3_length(toLight);
+            if (dist < 0.001f) continue;
+
+            Vector3 lightDir = toLight / dist;
+            float NdotL = vector3_dot(sampleNormal, lightDir);
+            if (NdotL > 0) {
+                if (TraceRayAgainstMeshes(worldPos, lightDir, dist - 1.0f)) continue;
+
+                float atten = 1.0f;
+                if (light.quadratic_attn > 0 || light.linear_attn > 0) {
+                    atten = 1.0f / (light.constant_attn +
+                                   light.linear_attn * dist +
+                                   light.quadratic_attn * dist * dist);
+                } else {
+                    atten = 1.0f / (1.0f + dist * dist * 0.0001f);
+                }
+                Vector3 contribution = light.intensity * NdotL * atten * 100.0f;
+                result.direct = result.direct + contribution;
+                result.indirect = result.indirect + contribution;
+            }
+        } else if (light.type == emit_spotlight) {
+            Vector3 toLight = lightPos - worldPos;
+            float dist = vector3_length(toLight);
+            if (dist < 0.001f) continue;
+
+            Vector3 lightDir = toLight / dist;
+            float NdotL = vector3_dot(sampleNormal, lightDir);
+            if (NdotL > 0) {
+                float spotDot = vector3_dot(-lightDir, light.normal);
+                if (spotDot > light.stopdot2) {
+                    if (TraceRayAgainstMeshes(worldPos, lightDir, dist - 1.0f)) continue;
+
+                    float spotAtten = 1.0f;
+                    if (spotDot < light.stopdot) {
+                        spotAtten = (spotDot - light.stopdot2) / (light.stopdot - light.stopdot2);
+                    }
+                    float distAtten = 1.0f / (1.0f + dist * dist * 0.0001f);
+                    Vector3 contribution = light.intensity * NdotL * spotAtten * distAtten * 100.0f;
+                    result.direct = result.direct + contribution;
+                    result.indirect = result.indirect + contribution;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+/*
+    ComputeTexelWorldPos
+    Compute world-space position for a (potentially sub-texel) coordinate.
+*/
+static Vector3 ComputeTexelWorldPos(const SurfaceLightmap_t &surf, float texelX, float texelY) {
+    float normalizedU = (surf.rect.width > 1) ? texelX / (surf.rect.width - 1) : 0.5f;
+    float normalizedV = (surf.rect.height > 1) ? texelY / (surf.rect.height - 1) : 0.5f;
+    normalizedU = std::max(0.0f, std::min(1.0f, normalizedU));
+    normalizedV = std::max(0.0f, std::min(1.0f, normalizedV));
+    float localU = surf.uMin + normalizedU * (surf.uMax - surf.uMin);
+    float localV = surf.vMin + normalizedV * (surf.vMax - surf.vMin);
+    return surf.worldBounds.mins
+        + surf.tangent * localU
+        + surf.bitangent * localV
+        + surf.plane.normal() * 0.1f;
+}
+
+/*
+    ComputeTexelIntensity
+    Convert HDR color to perceptual intensity for gradient computation.
+    Same formula as Source SDK ComputeLuxelIntensity.
+*/
+static float ComputeTexelIntensity(const Vector3 &color) {
+    float intensity = std::max({color.x(), color.y(), color.z()});
+    return std::pow(std::max(0.0f, intensity / 256.0f), 1.0f / 2.2f);
+}
+
+/*
+    ComputeLightmapGradients
+    Compute maximum intensity gradient at each texel from its 8 neighbors.
+    Adapted directly from Source SDK vrad2/lightmap.cpp ComputeLightmapGradients.
+    High gradients indicate shadow edges or lighting discontinuities that need supersampling.
+*/
+static void ComputeLightmapGradients(const SurfaceLightmap_t &surf,
+                                      const std::vector<float> &intensity,
+                                      const std::vector<bool> &processed,
+                                      std::vector<float> &gradient) {
+    int w = surf.rect.width;
+    int h = surf.rect.height;
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int idx = y * w + x;
+            if (processed[idx]) continue;
+
+            gradient[idx] = 0.0f;
+            float val = intensity[idx];
+
+            // Check all 8 neighbors (same as Source SDK)
+            if (y > 0) {
+                if (x > 0)   gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y-1)*w + (x-1)]));
+                             gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y-1)*w + x]));
+                if (x < w-1) gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y-1)*w + (x+1)]));
+            }
+            if (y < h-1) {
+                if (x > 0)   gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y+1)*w + (x-1)]));
+                             gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y+1)*w + x]));
+                if (x < w-1) gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y+1)*w + (x+1)]));
+            }
+            if (x > 0)   gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[y*w + (x-1)]));
+            if (x < w-1) gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[y*w + (x+1)]));
+        }
+    }
+}
+
+/*
+    SupersampleTexel
+    Resample lighting at a texel using an NxN sub-sample grid.
+    Adapted from Source SDK SupersampleLightAtPoint.
+    Returns averaged lighting from all valid sub-samples.
+*/
+static TexelLighting_t SupersampleTexel(const SurfaceLightmap_t &surf, int texelX, int texelY,
+                                        const SkyEnvironment &sky) {
+    TexelLighting_t total;
+    total.direct = Vector3(0, 0, 0);
+    total.indirect = Vector3(0, 0, 0);
+    int validSamples = 0;
+
+    Vector3 sampleNormal = surf.plane.normal();
+
+    for (int sy = 0; sy < SUPERSAMPLE_GRID; sy++) {
+        for (int sx = 0; sx < SUPERSAMPLE_GRID; sx++) {
+            // Sub-texel position centered within each grid cell
+            float subX = texelX + (sx + 0.5f) / SUPERSAMPLE_GRID;
+            float subY = texelY + (sy + 0.5f) / SUPERSAMPLE_GRID;
+
+            Vector3 worldPos = ComputeTexelWorldPos(surf, subX, subY);
+            TexelLighting_t sample = ComputeLightingAtPoint(worldPos, sampleNormal, sky);
+
+            total.direct = total.direct + sample.direct;
+            total.indirect = total.indirect + sample.indirect;
+            validSamples++;
+        }
+    }
+
+    if (validSamples > 0) {
+        float inv = 1.0f / validSamples;
+        total.direct = total.direct * inv;
+        total.indirect = total.indirect * inv;
+    }
+
+    return total;
+}
+
+
 /*
     ComputeLightmapLighting
     Compute lighting for each texel.
     
-    IMPORTANT: emit_skyambient and emit_skylight are applied DYNAMICALLY by the engine
-    from the worldLights lump (0x36). Changing _ambient/_light in the .ent file updates
-    the map in real-time because the engine reads these values at runtime.
+    The direct lightmap channel bakes sun (emit_skylight) WITH shadow rays,
+    creating proper shadow contrast. The indirect channel stores ambient-only
+    so shadowed areas appear dark.
     
-    Lightmaps should only contain:
-    - Indirect/bounced lighting (radiosity)
-    - Static point/spot light contributions that aren't realtime
+    Static point/spot lights are baked into both channels with shadow tracing.
     
     Enhanced with:
-    - Supersampling (anti-aliased lighting)
+    - Sun shadow baking (direct channel only)
+    - Shadow ray tracing for all static lights
     - Radiosity (bounced indirect lighting)
 */
 void ApexLegends::ComputeLightmapLighting() {
     Sys_Printf("--- ComputeLightmapLighting ---\n");
     
-    // NOTE: We do NOT bake emit_skyambient or emit_skylight here!
-    // The engine applies these dynamically from worldLights lump.
-    // This is why changing _ambient/_light in .ent files works on official maps.
+    // We bake emit_skylight (sun) WITH shadow rays into the direct lightmap channel.
+    // The indirect channel gets only ambient/bounce (no sun), so shadowed areas are dark.
+    // emit_skyambient brightness is still dynamic from worldLights lump.
     
     if (ApexLegends::Bsp::worldLights.empty()) {
         Sys_Printf("  No worldlights found\n");
     }
+    
+    // Get sky environment for sun shadow baking
+    SkyEnvironment sky = GetSkyEnvironment();
+    LogSkyEnvironment(sky);
     
     // Initialize radiosity patches for bounce lighting
     if (RADIOSITY_BOUNCES > 0) {
@@ -710,98 +929,22 @@ void ApexLegends::ComputeLightmapLighting() {
     Sys_Printf("     Computing direct lighting...\n");
     
     for (SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
+        Vector3 sampleNormal = surf.plane.normal();
+        
         // For each texel
         for (int y = 0; y < surf.rect.height; y++) {
             for (int x = 0; x < surf.rect.width; x++) {
-                // Compute world position for this texel
-                // Normalize texel to [0,1] within the rect, then map to tangent-space bounds
-                float normalizedU = (surf.rect.width > 1) ? (x + 0.5f) / (surf.rect.width - 1) : 0.5f;
-                float normalizedV = (surf.rect.height > 1) ? (y + 0.5f) / (surf.rect.height - 1) : 0.5f;
-                normalizedU = std::max(0.0f, std::min(1.0f, normalizedU));
-                normalizedV = std::max(0.0f, std::min(1.0f, normalizedV));
-                float localU = surf.uMin + normalizedU * (surf.uMax - surf.uMin);
-                float localV = surf.vMin + normalizedV * (surf.vMax - surf.vMin);
+                Vector3 worldPos = ComputeTexelWorldPos(surf, x + 0.5f, y + 0.5f);
+                TexelLighting_t lighting = ComputeLightingAtPoint(worldPos, sampleNormal, sky);
                 
-                Vector3 worldPos = surf.worldBounds.mins 
-                    + surf.tangent * localU 
-                    + surf.bitangent * localV;
-                
-                // Offset slightly along normal to avoid self-intersection
-                worldPos = worldPos + surf.plane.normal() * 0.1f;
-                
-                // Use flat surface normal for lighting calculations
-                Vector3 sampleNormal = surf.plane.normal();
-                
-                // Start with neutral base - engine adds dynamic ambient/sun on top
-                // A small base value prevents completely black areas
-                Vector3 finalColor(0.1f, 0.1f, 0.1f);
-                
-                // Only bake NON-realtime static lights (point lights, spotlights)
-                // Skip emit_skyambient and emit_skylight - they're dynamic!
-                for (const WorldLight_t &light : ApexLegends::Bsp::worldLights) {
-                    // Skip sky lighting - applied dynamically by engine
-                    if (light.type == emit_skyambient || light.type == emit_skylight) {
-                        continue;
-                    }
-                    
-                    // Skip realtime lights - they're computed per-frame
-                    if (light.flags & WORLDLIGHT_FLAG_REALTIME) {
-                        continue;
-                    }
-                    
-                    Vector3 lightPos(light.origin[0], light.origin[1], light.origin[2]);
-                    Vector3 lightColor = light.intensity;
-                    
-                    if (light.type == emit_point) {
-                        // Static point light
-                        Vector3 toLight = lightPos - worldPos;
-                        float dist = vector3_length(toLight);
-                        if (dist < 0.001f) continue;
-                        
-                        Vector3 lightDir = toLight / dist;
-                        float NdotL = vector3_dot(sampleNormal, lightDir);
-                        
-                        if (NdotL > 0) {
-                            float atten = 1.0f;
-                            if (light.quadratic_attn > 0 || light.linear_attn > 0) {
-                                atten = 1.0f / (light.constant_attn + 
-                                               light.linear_attn * dist + 
-                                               light.quadratic_attn * dist * dist);
-                            } else {
-                                atten = 1.0f / (1.0f + dist * dist * 0.0001f);
-                            }
-                            finalColor = finalColor + lightColor * NdotL * atten * 100.0f;
-                        }
-                    } else if (light.type == emit_spotlight) {
-                        // Static spotlight
-                        Vector3 toLight = lightPos - worldPos;
-                        float dist = vector3_length(toLight);
-                        if (dist < 0.001f) continue;
-                        
-                        Vector3 lightDir = toLight / dist;
-                        float NdotL = vector3_dot(sampleNormal, lightDir);
-                        
-                        if (NdotL > 0) {
-                            float spotDot = vector3_dot(-lightDir, light.normal);
-                            if (spotDot > light.stopdot2) {
-                                float spotAtten = 1.0f;
-                                if (spotDot < light.stopdot) {
-                                    spotAtten = (spotDot - light.stopdot2) / (light.stopdot - light.stopdot2);
-                                }
-                                float distAtten = 1.0f / (1.0f + dist * dist * 0.0001f);
-                                finalColor = finalColor + lightColor * NdotL * spotAtten * distAtten * 100.0f;
-                            }
-                        }
-                    }
-                }
-                
-                // Store in luxel array
-                surf.luxels[y * surf.rect.width + x] = finalColor;
+                // Store in luxel arrays (direct and indirect separately)
+                surf.luxels[y * surf.rect.width + x] = lighting.direct;
+                surf.indirectLuxels[y * surf.rect.width + x] = lighting.indirect;
                 
                 // Store direct light for radiosity if enabled
                 if (RADIOSITY_BOUNCES > 0 && patchIndex < static_cast<int>(RadiosityData::patches.size())) {
-                    RadiosityData::patches[patchIndex].directLight = finalColor;
-                    RadiosityData::patches[patchIndex].totalLight = finalColor;
+                    RadiosityData::patches[patchIndex].directLight = lighting.direct;
+                    RadiosityData::patches[patchIndex].totalLight = lighting.direct;
                     patchIndex++;
                 }
                 
@@ -811,6 +954,63 @@ void ApexLegends::ComputeLightmapLighting() {
     }
     
     Sys_Printf("     %9d texels computed (direct)\n", totalTexels);
+    
+    // =====================================================
+    // ADAPTIVE SUPERSAMPLING (Source SDK style)
+    // Detect high-gradient areas and supersample them to
+    // smooth shadow edges and lighting discontinuities.
+    // =====================================================
+    if (SUPERSAMPLE_PASSES > 0) {
+        Sys_Printf("     Computing adaptive supersampling (%d passes, %dx%d grid)...\n",
+                   SUPERSAMPLE_PASSES, SUPERSAMPLE_GRID, SUPERSAMPLE_GRID);
+        int totalSupersampled = 0;
+        
+        for (SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
+            int w = surf.rect.width;
+            int h = surf.rect.height;
+            int numTexels = w * h;
+            
+            // Compute intensity at each texel for gradient detection
+            std::vector<float> intensity(numTexels);
+            for (int i = 0; i < numTexels; i++) {
+                intensity[i] = ComputeTexelIntensity(surf.luxels[i]);
+            }
+            
+            std::vector<bool> processed(numTexels, false);
+            std::vector<float> gradient(numTexels, 0.0f);
+            
+            // Iterative refinement: recheck gradients after each pass
+            // because supersampling one texel can change the gradient of neighbors
+            for (int pass = 0; pass < SUPERSAMPLE_PASSES; pass++) {
+                ComputeLightmapGradients(surf, intensity, processed, gradient);
+                
+                bool didWork = false;
+                for (int i = 0; i < numTexels; i++) {
+                    if (processed[i]) continue;
+                    if (gradient[i] < SUPERSAMPLE_GRADIENT_THRESHOLD) continue;
+                    
+                    // High gradient - supersample this texel
+                    processed[i] = true;
+                    didWork = true;
+                    
+                    int x = i % w;
+                    int y = i / w;
+                    
+                    TexelLighting_t ss = SupersampleTexel(surf, x, y, sky);
+                    surf.luxels[i] = ss.direct;
+                    surf.indirectLuxels[i] = ss.indirect;
+                    
+                    // Update intensity for next gradient pass
+                    intensity[i] = ComputeTexelIntensity(surf.luxels[i]);
+                    totalSupersampled++;
+                }
+                
+                if (!didWork) break;  // No more high-gradient texels
+            }
+        }
+        
+        Sys_Printf("     %9d texels supersampled\n", totalSupersampled);
+    }
     
     // =====================================================
     // RADIOSITY: Compute bounce lighting
@@ -876,13 +1076,9 @@ static void EncodeHDRTexel(const Vector3 &color, uint8_t *out) {
         exponent = 0;
         scale = 1.0f;
     } else {
-        // Bias-128 RGBE: find exponent so mantissa fits in 0-1 range
-        // We need 2^(exp-128) >= maxComponent, so exp = 128 + ceil(log2(maxComponent))
-        int e = (int)std::ceil(std::log2(maxComponent));
-        int biasedExp = 128 + e;
-        biasedExp = std::max(0, std::min(255, biasedExp));
-        exponent = (uint8_t)biasedExp;
-        
+        int exp = (int)std::ceil(8.0f * std::log2(maxComponent));
+        exponent = (uint8_t)std::min(255, std::max(0, exp));
+
         // Scale factor: divide by 2^(exp-128) to normalize mantissa to 0-1
         scale = 1.0f / std::pow(2.0f, (float)(exponent - 128));
     }
@@ -897,12 +1093,12 @@ static void EncodeHDRTexel(const Vector3 &color, uint8_t *out) {
     out[1] = (uint8_t)(g * 255.0f);
     out[2] = (uint8_t)(b * 255.0f);
     out[3] = exponent;
-    
-    // Indirect light (bytes 4-7) - same as direct for now
-    out[4] = out[0];
-    out[5] = out[1];
-    out[6] = out[2];
-    out[7] = exponent;
+}
+
+// Encode both direct and indirect channels into 8-byte output
+static void EncodeHDRTexelPair(const Vector3 &directColor, const Vector3 &indirectColor, uint8_t *out) {
+    EncodeHDRTexel(directColor, out);      // bytes 0-3: direct
+    EncodeHDRTexel(indirectColor, out + 4); // bytes 4-7: indirect
 }
 
 
@@ -969,13 +1165,15 @@ void ApexLegends::EmitLightmaps()
         
         for (int y = 0; y < surf.rect.height; y++) {
             for (int x = 0; x < surf.rect.width; x++) {
-                const Vector3 &color = surf.luxels[y * surf.rect.width + x];
+                int idx = y * surf.rect.width + x;
+                const Vector3 &directColor = surf.luxels[idx];
+                const Vector3 &indirectColor = surf.indirectLuxels[idx];
                 
                 int px = surf.rect.x + x;
                 int py = surf.rect.y + y;
                 int offset = (py * page.width + px) * 8;
                 
-                EncodeHDRTexel(color, &page.pixels[offset]);
+                EncodeHDRTexelPair(directColor, indirectColor, &page.pixels[offset]);
             }
         }
     }
@@ -1107,15 +1305,6 @@ int16_t ApexLegends::GetLightmapPageIndex(int meshIndex) {
     - LightProbeRef: Spatial reference to a probe
     - LightProbe: Actual ambient data (SH coefficients + static light refs)
 */
-
-// Sky environment data extracted from worldlights
-struct SkyEnvironment {
-    Vector3 ambientColor;      // Base ambient color (from emit_skyambient)
-    Vector3 sunDir;            // Sun direction (from emit_skylight)
-    Vector3 sunColor;          // Sun color (normalized)
-    float sunIntensity;        // Sun brightness multiplier
-    bool valid;                // Whether sky data was found
-};
 
 // Parse "_light" key format: "R G B brightness" (e.g., "255 252 242 510")
 // Returns normalized RGB color (0-1) and brightness multiplier
