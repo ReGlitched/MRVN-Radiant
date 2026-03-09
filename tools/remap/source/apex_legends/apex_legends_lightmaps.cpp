@@ -256,7 +256,7 @@ static void InitLightmapAtlas() {
     // Use neutral gray - engine adds dynamic ambient/sun on top
     // Bias-128 RGBE: finalColor = (RGB/255) * 2^(exp - 128)
     // exp=128 → 2^0 = 1.0x (neutral), RGB=180 sRGB ≈ 0.45 linear
-    uint8_t neutralValue = 180;  // Mid-gray mantissa in sRGB
+    uint8_t neutralValue = 128;  // Mid-gray mantissa in sRGB
     uint8_t exponent = 128;      // Neutral exposure: 2^(128-128) = 1.0x
     
     size_t dataSize = page.width * page.height * 8;
@@ -266,12 +266,12 @@ static void InitLightmapAtlas() {
         page.pixels[i + 0] = neutralValue;
         page.pixels[i + 1] = neutralValue;
         page.pixels[i + 2] = neutralValue;
-        page.pixels[i + 3] = exponent;
+        page.pixels[i + 3] = 255;
         // Indirect light (bytes 4-7)
         page.pixels[i + 4] = neutralValue;
         page.pixels[i + 5] = neutralValue;
         page.pixels[i + 6] = neutralValue;
-        page.pixels[i + 7] = exponent;
+        page.pixels[i + 7] = 128;
     }
     ApexLegends::Bsp::lightmapPages.push_back(page);
     
