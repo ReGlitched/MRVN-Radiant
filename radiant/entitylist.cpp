@@ -55,6 +55,7 @@
 
 void RedrawEntityList();
 typedef FreeCaller<RedrawEntityList> RedrawEntityListCaller;
+void entitylist_queue_draw();
 
 class EntityList
 {
@@ -83,6 +84,9 @@ public:
 		m_dirty( EntityList::eDefault ),
 		m_idleDraw( RedrawEntityListCaller() ),
 		m_window( 0 ),
+		m_check( nullptr ),
+		m_tree_view( nullptr ),
+		m_tree_model( nullptr ),
 		m_status_label( nullptr ),
 		m_selection_disabled( false ),
 		m_search_from_start( false ){
@@ -108,6 +112,8 @@ void entitylist_focusSelected( bool checked ){
 		FocusAllViews();
 }
 
+void EntityList_connectSelectionModel();
+
 template<typename Functor>
 void item_model_foreach( Functor f, QAbstractItemModel* model, QModelIndex parent = QModelIndex() )
 {
@@ -123,14 +129,29 @@ void item_model_foreach( Functor f, QAbstractItemModel* model, QModelIndex paren
 }
 
 void EntityList_UpdateSelection( QAbstractItemModel* model, QTreeView* view ){
-	item_model_foreach( [view]( QModelIndex &index ){
+	if ( model == nullptr || view == nullptr || view->selectionModel() == nullptr ) {
+		return;
+	}
+
+	QModelIndex firstSelected;
+	item_model_foreach( [view, &firstSelected]( QModelIndex &index ){
 		scene::Instance* instance = static_cast<scene::Instance*>( index.data( c_ItemDataRole_Instance ).value<void*>() );
+		if ( instance == nullptr ) {
+			return;
+		}
 		if ( Selectable* selectable = Instance_getSelectable( *instance ) ) {
 			view->selectionModel()->select( index, selectable->isSelected()
 			                                     ? QItemSelectionModel::SelectionFlag::Select
 			                                     : QItemSelectionModel::SelectionFlag::Deselect );
+			if ( selectable->isSelected() && !firstSelected.isValid() ) {
+				firstSelected = index;
+			}
 		}
 	}, model );
+
+	if ( firstSelected.isValid() ) {
+		view->scrollTo( firstSelected, QAbstractItemView::ScrollHint::EnsureVisible );
+	}
 }
 
 
@@ -139,7 +160,9 @@ void RedrawEntityList(){
 	{
 	case EntityList::eInsertRemove:
 	case EntityList::eSelection:
+		getEntityList().m_selection_disabled = true;
 		EntityList_UpdateSelection( getEntityList().m_tree_model, getEntityList().m_tree_view );
+		getEntityList().m_selection_disabled = false;
 	default:
 		break;
 	}
@@ -172,21 +195,8 @@ void EntityList_SelectionUpdate(){
 		// Update status bar
 		EntityList_UpdateStatus();
 		
-		// deselect tree items on deseletion in the scene for some degree of consistency
-		if( getEntityList().m_tree_view->selectionModel()->hasSelection() ){
-			QTimer::singleShot( 0, [](){
-				for( const auto& index : getEntityList().m_tree_view->selectionModel()->selectedRows( 0 ) ){
-					scene::Instance* instance = static_cast<scene::Instance*>( index.data( c_ItemDataRole_Instance ).value<void*>() );
-					if ( Selectable* selectable = Instance_getSelectable( *instance ) )
-						if( !selectable->isSelected() )
-							getEntityList().m_tree_view->selectionModel()->select( index, QItemSelectionModel::SelectionFlag::Deselect );
-				}
-			} );
-		}
-
 		getEntityList().m_tree_view->viewport()->update(); // reads in Qt::ItemDataRole::BackgroundRole of visible items
 	}
-	return; //. making actual selection is ULTRA SLOW :F thus using Qt::ItemDataRole::BackgroundRole instead
 
 	if ( getEntityList().m_selection_disabled ) {
 		return;
@@ -201,7 +211,6 @@ void EntityList_SelectionUpdate(){
 void EntityList_SelectionChanged( const Selectable& selectable ){
 	EntityList_SelectionUpdate();
 }
-
 
 void EntityList_SetShown( bool shown ){
 	getEntityList().m_window->setVisible( shown );
@@ -249,6 +258,10 @@ void searchEntrySetModeIcon( QAction *action, bool search_from_start ){
 
 /* search */
 void tree_view_filter( const char *string, bool from_start ){
+	if ( getEntityList().m_tree_model == nullptr || getEntityList().m_tree_view == nullptr ) {
+		return;
+	}
+
 	const auto traverse = [=]( const auto& self, QAbstractItemModel* model, QTreeView *tree, QModelIndex parent = QModelIndex() ) -> bool {
 		if ( !parent.isValid() )
 			parent = model->index( 0, 0, QModelIndex() );
@@ -272,30 +285,50 @@ void tree_view_filter( const char *string, bool from_start ){
 }
 
 
-void AttachEntityTreeModel(){
-	getEntityList().m_tree_model = (QAbstractItemModel*)scene_graph_get_tree_model();
-	getEntityList().m_tree_view->setModel( getEntityList().m_tree_model );
+void EntityList_connectSelectionModel(){
+	if ( getEntityList().m_tree_view == nullptr || getEntityList().m_tree_view->selectionModel() == nullptr ) {
+		return;
+	}
+
+	QObject::disconnect( getEntityList().m_tree_view->selectionModel(), nullptr, nullptr, nullptr );
 
 	QObject::connect( getEntityList().m_tree_view->selectionModel(), &QItemSelectionModel::selectionChanged,
 		[]( const QItemSelection &selected, const QItemSelection &deselected ){
+			if ( getEntityList().m_selection_disabled ) {
+				return;
+			}
+
 			for( const auto& index : deselected.indexes() ){
 				scene::Instance* instance = static_cast<scene::Instance*>( index.data( c_ItemDataRole_Instance ).value<void*>() );
-				if( Selectable* selectable = Instance_getSelectable( *instance ) )
-					selectable->setSelected( false );
+				if( instance != nullptr ){
+					if( Selectable* selectable = Instance_getSelectable( *instance ) ){
+						selectable->setSelected( false );
+					}
+				}
 			}
 			for( const auto& index : selected.indexes() ){
 				scene::Instance* instance = static_cast<scene::Instance*>( index.data( c_ItemDataRole_Instance ).value<void*>() );
-				if( Selectable* selectable = Instance_getSelectable( *instance ) )
-					selectable->setSelected( true );
+				if( instance != nullptr ){
+					if( Selectable* selectable = Instance_getSelectable( *instance ) ){
+						selectable->setSelected( true );
+					}
+				}
 			}
+
 			if( !selected.empty() && getEntityList().m_check->isChecked() )
 				FocusAllViews();
 		} );
 }
 
+void AttachEntityTreeModel(){
+	getEntityList().m_tree_model = (QAbstractItemModel*)scene_graph_get_tree_model();
+	getEntityList().m_tree_view->setModel( getEntityList().m_tree_model );
+	EntityList_connectSelectionModel();
+}
+
 void DetachEntityTreeModel(){
-	getEntityList().m_tree_model = 0;
 	getEntityList().m_tree_view->setModel( nullptr );
+	getEntityList().m_tree_model = nullptr;
 }
 
 void EntityList_constructWindow( QWidget* main_window ){
@@ -413,6 +446,10 @@ void EntityList_constructWindow( QWidget* main_window ){
 void EntityList_destroyWindow(){
 	DetachEntityTreeModel();
 	delete getEntityList().m_window;
+	getEntityList().m_window = nullptr;
+	getEntityList().m_check = nullptr;
+	getEntityList().m_tree_view = nullptr;
+	getEntityList().m_status_label = nullptr;
 }
 
 #include "preferencesystem.h"
@@ -429,4 +466,5 @@ void EntityList_Construct(){
 }
 void EntityList_Destroy(){
 	delete g_EntityList;
+	g_EntityList = nullptr;
 }
