@@ -7170,7 +7170,8 @@ public:
 				case RadiantSelectionSystem::eReplace:
 					{
 						// select closest
-						( *selector_point_ents.begin() ).second->setSelected( true );
+						Selectable* selectable = ( *selector_point_ents.begin() ).second;
+						selectable->setSelected( true );
 					}
 					break;
 				case RadiantSelectionSystem::eSelect:
@@ -7202,7 +7203,8 @@ public:
 					case RadiantSelectionSystem::eReplace:
 						{
 							// select closest
-							( *selector.begin() ).second->setSelected( true );
+							Selectable* selectable = ( *selector.begin() ).second;
+							selectable->setSelected( true );
 						}
 						break;
 					// select the next object in the list from the one already selected
@@ -7273,7 +7275,8 @@ public:
 				Scene_TestSelect( selector_point_ents, volume, scissored, eEntity, ComponentMode() );
 			}
 			if( prefer_point_ents && !selector_point_ents.failed() ){
-				const bool wasSelected = ( *selector_point_ents.begin() ).second->isSelected();
+				Selectable* selectable = ( *selector_point_ents.begin() ).second;
+				const bool wasSelected = selectable->isSelected();
 				SelectionPool_Select( selector_point_ents, !wasSelected, SELECT_MATCHING_DIST );
 				return !wasSelected;
 			}
@@ -7285,7 +7288,8 @@ public:
 					Scene_TestSelect( selector, volume, scissored, g_modifiers == c_modifierAlt? ePrimitive : Mode(), ComponentMode() );
 				}
 				if ( !selector.failed() ){
-					const bool wasSelected = ( *selector.begin() ).second->isSelected();
+					Selectable* selectable = ( *selector.begin() ).second;
+					const bool wasSelected = selectable->isSelected();
 					SelectionPool_Select( selector, !wasSelected, ( Mode() == eComponent && g_modifiers != c_modifierAlt )? SELECT_MATCHING_COMPONENTS_DIST : SELECT_MATCHING_DIST );
 
 #if 0

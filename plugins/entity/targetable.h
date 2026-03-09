@@ -23,6 +23,7 @@
 
 #include <set>
 #include <map>
+#include <cstdlib>
 
 #include "cullable.h"
 #include "renderable.h"
@@ -33,6 +34,7 @@
 #include "selectionlib.h"
 #include "entitylib.h"
 #include "eclasslib.h"
+#include "pivot.h"
 #include "stringio.h"
 
 class Targetable
@@ -413,6 +415,15 @@ public:
 	const TargetingEntities& getTargeting() const {
 		return m_targeting.get();
 	}
+	const EntityKeyValues& entity() const {
+		return m_entity;
+	}
+	const char* className() const {
+		return m_entity.getClassName();
+	}
+	const char* keyValue( const char* key ) const {
+		return m_entity.getKeyValue( key );
+	}
 };
 
 #include "entity.h"
@@ -420,8 +431,204 @@ public:
 class RenderableConnectionLines : public Renderable
 {
 	typedef std::set<TargetableInstance*> TargetableInstances;
+	typedef std::pair<const TargetableInstance*, const TargetableInstance*> TargetPair;
 	TargetableInstances m_instances;
+	mutable RenderablePointVector m_zipline_lines;
+	static bool isZiplineClass( const char* classname ){
+		return string_equal( classname, "zipline" );
+	}
+	static bool isMoveRopeClass( const char* classname ){
+		return string_equal( classname, "move_rope" );
+	}
+	static float parseSagKey( const char* value ){
+		if ( string_empty( value ) ) {
+			return 0.f;
+		}
+		const float parsed = static_cast<float>( atof( value ) );
+		return parsed < 0.f ? 0.f : parsed;
+	}
+	static float ziplineSagHeight( const TargetableInstance& source, const TargetableInstance& target ){
+		float sag = parseSagKey( source.keyValue( "ziplineSagHeight" ) );
+		if ( sag > 0.f ) {
+			return sag;
+		}
+		sag = parseSagKey( target.keyValue( "ziplineSagHeight" ) );
+		if ( sag > 0.f ) {
+			return sag;
+		}
+
+		if ( isMoveRopeClass( source.className() ) ) {
+			sag = parseSagKey( source.keyValue( "Slack" ) );
+			if ( sag > 0.f ) {
+				return sag;
+			}
+		}
+		if ( isMoveRopeClass( target.className() ) ) {
+			sag = parseSagKey( target.keyValue( "Slack" ) );
+			if ( sag > 0.f ) {
+				return sag;
+			}
+		}
+		return 0.f;
+	}
+	static Colour4b ziplineColor(){
+		return Colour4b( 255, 140, 0, 255 );
+	}
+	static void appendSegment( RenderablePointVector& lines, const Vector3& start, const Vector3& end ){
+		lines.push_back( PointVertex( reinterpret_cast<const Vertex3f&>( start ), ziplineColor() ) );
+		lines.push_back( PointVertex( reinterpret_cast<const Vertex3f&>( end ), ziplineColor() ) );
+	}
+	static Vector3 sagPoint( const Vector3& start, const Vector3& end, const float sagHeight, const float t ){
+		Vector3 point( start + ( end - start ) * t );
+		point[2] -= sagHeight * ( 4.f * t * ( 1.f - t ) );
+		return point;
+	}
+	static Vector3 sagTangent( const Vector3& start, const Vector3& end, const float sagHeight, const float t ){
+		Vector3 tangent( end - start );
+		tangent[2] += -sagHeight * ( 4.f * ( 1.f - 2.f * t ) );
+		return tangent;
+	}
+	static void appendDirectionArrow( RenderablePointVector& lines, const Vector3& start, const Vector3& end, const float sagHeight, const float t, const VolumeTest& volume ){
+		Vector3 dir( sagTangent( start, end, sagHeight, t ) );
+		const float dirLen = vector3_length( dir );
+		if ( dirLen <= 0.001f ) {
+			return;
+		}
+		dir *= ( 1.f / dirLen );
+
+		Vector3 side( vector3_cross( dir, Vector3( 0, 0, 1 ) ) );
+		float sideLen = vector3_length( side );
+		if ( sideLen <= 0.001f ) {
+			side = vector3_cross( dir, Vector3( 1, 0, 0 ) );
+			sideLen = vector3_length( side );
+			if ( sideLen <= 0.001f ) {
+				return;
+			}
+		}
+		side *= ( 1.f / sideLen );
+
+		const Vector3 tip( sagPoint( start, end, sagHeight, t ) );
+		const float arrowLen = 26.f;
+		const float arrowWidth = 12.f;
+		const Vector3 back( tip - dir * arrowLen );
+		const Vector3 wing1( back + side * arrowWidth );
+		const Vector3 wing2( back - side * arrowWidth );
+
+		if ( volume.TestLine( segment_for_startend( tip, wing1 ) ) ) {
+			appendSegment( lines, tip, wing1 );
+		}
+		if ( volume.TestLine( segment_for_startend( tip, wing2 ) ) ) {
+			appendSegment( lines, tip, wing2 );
+		}
+	}
+	static void appendSagLine( RenderablePointVector& lines, const Vector3& start, const Vector3& end, const float sagHeight, const VolumeTest& volume ){
+		constexpr int segments = 16;
+		Vector3 previous( start );
+		for ( int i = 1; i <= segments; ++i )
+		{
+			const float t = static_cast<float>( i ) / static_cast<float>( segments );
+			Vector3 current( start + ( end - start ) * t );
+			current[2] -= sagHeight * ( 4.f * t * ( 1.f - t ) );
+			if ( volume.TestLine( segment_for_startend( previous, current ) ) ) {
+				appendSegment( lines, previous, current );
+			}
+			previous = current;
+		}
+
+		const float len = vector3_length( end - start );
+		appendDirectionArrow( lines, start, end, sagHeight, 0.5f, volume );
+		if ( len > 1024.f ) {
+			appendDirectionArrow( lines, start, end, sagHeight, 0.33f, volume );
+			appendDirectionArrow( lines, start, end, sagHeight, 0.67f, volume );
+		}
+	}
+	const TargetableInstance* findByKeyValue( const char* key, const char* value, const TargetableInstance* skip ) const {
+		if ( string_empty( value ) ) {
+			return 0;
+		}
+		for ( TargetableInstances::const_iterator i = m_instances.begin(); i != m_instances.end(); ++i )
+		{
+			if ( *i == skip || !( *i )->path().top().get().visible() ) {
+				continue;
+			}
+			if ( string_equal( ( *i )->keyValue( key ), value ) ) {
+				return *i;
+			}
+		}
+		return 0;
+	}
+	const TargetableInstance* findByTargetName( const char* value, const TargetableInstance* skip ) const {
+		if ( const TargetableInstance* target = findByKeyValue( g_targetable_nameKey, value, skip ) ) {
+			return target;
+		}
+		if ( !string_equal( g_targetable_nameKey, "targetname" ) ) {
+			if ( const TargetableInstance* target = findByKeyValue( "targetname", value, skip ) ) {
+				return target;
+			}
+		}
+		if ( !string_equal( g_targetable_nameKey, "name" ) ) {
+			if ( const TargetableInstance* target = findByKeyValue( "name", value, skip ) ) {
+				return target;
+			}
+		}
+		return 0;
+	}
+	static TargetPair canonicalPair( const TargetableInstance& source, const TargetableInstance& target ){
+		return &source < &target ? TargetPair( &source, &target ) : TargetPair( &target, &source );
+	}
+	static bool appendConnection( RenderablePointVector& lines, std::set<TargetPair>& drawn, const TargetableInstance& source, const TargetableInstance& target, const VolumeTest& volume ){
+		if ( &source == &target ) {
+			return false;
+		}
+		const TargetPair pair = canonicalPair( source, target );
+		if ( !drawn.insert( pair ).second ) {
+			return false;
+		}
+		appendSagLine( lines, source.world_position(), target.world_position(), ziplineSagHeight( source, target ), volume );
+		return true;
+	}
+	void renderZiplineLines( Renderer& renderer, const VolumeTest& volume ) const {
+		m_zipline_lines.clear();
+		std::set<TargetPair> drawn;
+		Shader* shader = RenderablePivot::getShader();
+
+		for ( TargetableInstances::const_iterator i = m_instances.begin(); i != m_instances.end(); ++i )
+		{
+			const TargetableInstance& source = **i;
+			if ( !source.path().top().get().visible() ) {
+				continue;
+			}
+
+			const char* classname = source.className();
+			if ( isMoveRopeClass( classname ) ) {
+				const TargetableInstance* target = findByTargetName( source.keyValue( "NextKey" ), &source );
+				if ( target != 0 && appendConnection( m_zipline_lines, drawn, source, *target, volume ) && shader == 0 ) {
+					shader = source.entity().getEntityClass().m_state_wire;
+				}
+				continue;
+			}
+
+			if ( isZiplineClass( classname ) ) {
+				const char* linkKeys[2] = { "link_to_guid_0", "link_to_guid_1" };
+				for ( int k = 0; k < 2; ++k )
+				{
+					const TargetableInstance* target = findByKeyValue( "link_guid", source.keyValue( linkKeys[k] ), &source );
+					if ( target != 0 && appendConnection( m_zipline_lines, drawn, source, *target, volume ) && shader == 0 ) {
+						shader = source.entity().getEntityClass().m_state_wire;
+					}
+				}
+			}
+		}
+
+		if ( shader != 0 && !m_zipline_lines.empty() ) {
+			renderer.SetState( shader, Renderer::eWireframeOnly );
+			renderer.SetState( shader, Renderer::eFullMaterials );
+			renderer.addRenderable( m_zipline_lines, g_matrix4_identity );
+		}
+	}
 public:
+	RenderableConnectionLines() : m_zipline_lines( GL_LINES ){
+	}
 	void attach( TargetableInstance& instance ){
 		const bool inserted = m_instances.insert( &instance ).second;
 		ASSERT_MESSAGE( inserted, "cannot attach instance" );
@@ -439,6 +646,7 @@ public:
 					( *i )->render( renderer, volume );
 				}
 			}
+			renderZiplineLines( renderer, volume );
 		}
 	}
 	void renderWireframe( Renderer& renderer, const VolumeTest& volume ) const {

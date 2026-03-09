@@ -33,6 +33,7 @@
 
 #include "gtkutil/menu.h"
 #include "gtkutil/image.h"
+#include "gtkutil/widget.h"
 #include "map.h"
 #include "mainframe.h"
 #include "commands.h"
@@ -44,13 +45,11 @@
 #include "patch.h"
 #include "grid.h"
 #include "patchdialog.h"
+#include "iundo.h"
 
 PatchCreator* g_patchCreator = 0;
 
-void Scene_PatchConstructPrefab( scene::Graph& graph, const AABB aabb, const char* shader, EPatchPrefab eType, int axis, std::size_t width = 3, std::size_t height = 3, bool redisperse = false ){
-	Select_Delete();
-	GlobalSelectionSystem().setSelectedAll( false );
-
+static void Scene_PatchConstructPrefab_Append( scene::Graph& graph, const AABB aabb, const char* shader, EPatchPrefab eType, int axis, std::size_t width, std::size_t height, bool redisperse ){
 	NodeSmartReference node( g_patchCreator->createPatch() );
 	Node_getTraversable( Map_FindOrInsertWorldspawn( g_map ) )->insert( node );
 
@@ -62,6 +61,9 @@ void Scene_PatchConstructPrefab( scene::Graph& graph, const AABB aabb, const cha
 		patch->Redisperse( COL );
 		patch->Redisperse( ROW );
 	}
+	if( eType == EPatchPrefab::Plane ){
+		patch->NaturalTexture();
+	}
 	patch->controlPointsChanged();
 
 	{
@@ -70,6 +72,12 @@ void Scene_PatchConstructPrefab( scene::Graph& graph, const AABB aabb, const cha
 		patchpath.push( makeReference( node.get() ) );
 		Instance_getSelectable( *graph.find( patchpath ) )->setSelected( true );
 	}
+}
+
+void Scene_PatchConstructPrefab( scene::Graph& graph, const AABB aabb, const char* shader, EPatchPrefab eType, int axis, std::size_t width = 3, std::size_t height = 3, bool redisperse = false ){
+	Select_Delete();
+	GlobalSelectionSystem().setSelectedAll( false );
+	Scene_PatchConstructPrefab_Append( graph, aabb, shader, eType, axis, width, height, redisperse );
 }
 
 
@@ -681,6 +689,21 @@ void PatchPreferences_construct(){
 
 #include "generic/callback.h"
 
+static void Patch_TerrainCreate();
+static void Patch_TerrainSettings();
+static void Patch_TerrainRaise();
+static void Patch_TerrainLower();
+static void Patch_TerrainFlatten();
+static void Patch_TerrainSmooth();
+static void Patch_TerrainFillSelection();
+static void Patch_TerrainToolOff();
+static void Patch_TerrainBrushSizeIncrease();
+static void Patch_TerrainBrushSizeDecrease();
+extern ToggleItem g_terrainRaise_button;
+extern ToggleItem g_terrainLower_button;
+extern ToggleItem g_terrainFlatten_button;
+extern ToggleItem g_terrainSmooth_button;
+
 void Patch_registerCommands(){
 	GlobalCommands_insert( "InvertCurveTextureX", FreeCaller<Patch_FlipTextureX>(), QKeySequence( "Ctrl+Shift+I" ) );
 	GlobalCommands_insert( "InvertCurveTextureY", FreeCaller<Patch_FlipTextureY>(), QKeySequence( "Shift+I" ) );
@@ -720,14 +743,51 @@ void Patch_registerCommands(){
 //	GlobalCommands_insert( "ClearPatchOverlays", FreeCaller<Patch_OverlayOff>(), QKeySequence( "Ctrl+L" ) );
 	GlobalCommands_insert( "PatchDeform", FreeCaller<Patch_Deform>() );
 	GlobalCommands_insert( "PatchThicken", FreeCaller<Patch_Thicken>(), QKeySequence( "Ctrl+T" ) );
+	GlobalCommands_insert( "TerrainPatchCreate", FreeCaller<Patch_TerrainCreate>() );
+	GlobalCommands_insert( "TerrainToolSettings", FreeCaller<Patch_TerrainSettings>() );
+	GlobalToggles_insert( "TerrainRaise", FreeCaller<Patch_TerrainRaise>(), ToggleItem::AddCallbackCaller( g_terrainRaise_button ) );
+	GlobalToggles_insert( "TerrainLower", FreeCaller<Patch_TerrainLower>(), ToggleItem::AddCallbackCaller( g_terrainLower_button ) );
+	GlobalToggles_insert( "TerrainFlatten", FreeCaller<Patch_TerrainFlatten>(), ToggleItem::AddCallbackCaller( g_terrainFlatten_button ) );
+	GlobalToggles_insert( "TerrainSmooth", FreeCaller<Patch_TerrainSmooth>(), ToggleItem::AddCallbackCaller( g_terrainSmooth_button ) );
+	GlobalCommands_insert( "TerrainFillSelection", FreeCaller<Patch_TerrainFillSelection>() );
+	GlobalCommands_insert( "TerrainToolOff", FreeCaller<Patch_TerrainToolOff>() );
+	GlobalCommands_insert( "TerrainBrushSizeIncrease", FreeCaller<Patch_TerrainBrushSizeIncrease>(), QKeySequence( "]" ) );
+	GlobalCommands_insert( "TerrainBrushSizeDecrease", FreeCaller<Patch_TerrainBrushSizeDecrease>(), QKeySequence( "[" ) );
 }
 
 void Patch_constructToolbar( QToolBar* toolbar ){
 	toolbar_append_button( toolbar, "Put caps on the current patch", "curve_cap.png", "CapCurrentCurve" );
+	toolbar_append_button( toolbar, "Create terrain patch", "patch_wireframe.png", "TerrainPatchCreate" );
+	toolbar_append_toggle_button( toolbar, "Terrain raise tool", "ellipsis.png", "TerrainRaise" );
+	toolbar_append_toggle_button( toolbar, "Terrain lower tool", "ellipsis.png", "TerrainLower" );
+	toolbar_append_toggle_button( toolbar, "Terrain flatten tool", "ellipsis.png", "TerrainFlatten" );
+	toolbar_append_toggle_button( toolbar, "Terrain smooth tool", "ellipsis.png", "TerrainSmooth" );
+	toolbar_append_button( toolbar, "Fill terrain between selected verts", "ellipsis.png", "TerrainFillSelection" );
+	toolbar_append_button( toolbar, "Disable terrain tool", "ellipsis.png", "TerrainToolOff" );
+	toolbar_append_button( toolbar, "Terrain brush size -", "ellipsis.png", "TerrainBrushSizeDecrease" );
+	toolbar_append_button( toolbar, "Terrain brush size +", "ellipsis.png", "TerrainBrushSizeIncrease" );
+	toolbar_append_button( toolbar, "Terrain tool settings", "ellipsis.png", "TerrainToolSettings" );
 }
 
 void Patch_constructMenu( QMenu* menu ){
 	create_menu_item_with_mnemonic( menu, "Simple Patch Mesh...", "SimplePatchMesh" );
+	{
+		QMenu* submenu = menu->addMenu( "Terrain" );
+		submenu->setTearOffEnabled( g_Layout_enableDetachableMenus.m_value );
+		create_menu_item_with_mnemonic( submenu, "Create Terrain Patch...", "TerrainPatchCreate" );
+		submenu->addSeparator();
+		create_check_menu_item_with_mnemonic( submenu, "Raise Tool", "TerrainRaise" );
+		create_check_menu_item_with_mnemonic( submenu, "Lower Tool", "TerrainLower" );
+		create_check_menu_item_with_mnemonic( submenu, "Flatten Tool", "TerrainFlatten" );
+		create_check_menu_item_with_mnemonic( submenu, "Smooth Tool", "TerrainSmooth" );
+		create_menu_item_with_mnemonic( submenu, "Fill Selection", "TerrainFillSelection" );
+		create_menu_item_with_mnemonic( submenu, "Tool Off", "TerrainToolOff" );
+		submenu->addSeparator();
+		create_menu_item_with_mnemonic( submenu, "Brush Size +", "TerrainBrushSizeIncrease" );
+		create_menu_item_with_mnemonic( submenu, "Brush Size -", "TerrainBrushSizeDecrease" );
+		submenu->addSeparator();
+		create_menu_item_with_mnemonic( submenu, "Tool Settings...", "TerrainToolSettings" );
+	}
 	create_menu_item_with_mnemonic( menu, "Bevel", "PatchBevel" );
 	create_menu_item_with_mnemonic( menu, "End cap", "PatchEndCap" );
 	create_menu_item_with_mnemonic( menu, "Cylinder (9x3)", "PatchCylinder" );
@@ -826,6 +886,867 @@ void Patch_constructMenu( QMenu* menu ){
 #include <QDialogButtonBox>
 #include <QButtonGroup>
 #include <QRadioButton>
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+struct TerrainToolSettings
+{
+	int patchWidth = 9;
+	int patchHeight = 9;
+	int sizeX = 512;
+	int sizeY = 512;
+	int sizeZ = 64;
+	int gridCols = 1;
+	int gridRows = 1;
+	int brushRadius = 192;
+	int brushStrength = 16;
+	float smoothFactor = 0.5f;
+	bool flattenUseAverage = true;
+	int flattenHeight = 0;
+};
+
+static TerrainToolSettings g_terrainToolSettings;
+
+enum class ETerrainBrushMode
+{
+	None,
+	Raise,
+	Lower,
+	Flatten,
+	Smooth,
+};
+
+static ETerrainBrushMode g_terrainBrushMode = ETerrainBrushMode::None;
+static bool g_terrainBrushStrokeActive = false;
+static bool g_terrainBrushHasLastPoint = false;
+static Vector3 g_terrainBrushLastPoint( g_vector3_identity );
+static bool g_terrainBrushPreviewValid = false;
+static Vector3 g_terrainBrushPreviewPoint( g_vector3_identity );
+
+static bool TerrainRaiseModeActive(){ return g_terrainBrushMode == ETerrainBrushMode::Raise; }
+static bool TerrainLowerModeActive(){ return g_terrainBrushMode == ETerrainBrushMode::Lower; }
+static bool TerrainFlattenModeActive(){ return g_terrainBrushMode == ETerrainBrushMode::Flatten; }
+static bool TerrainSmoothModeActive(){ return g_terrainBrushMode == ETerrainBrushMode::Smooth; }
+
+template<bool( *BoolFunction )()>
+class TerrainBoolFunctionExport
+{
+public:
+	static void apply( const BoolImportCallback& importCallback ){
+		importCallback( BoolFunction() );
+	}
+};
+
+typedef FreeCaller1<const BoolImportCallback&, &TerrainBoolFunctionExport<TerrainRaiseModeActive>::apply> TerrainRaiseModeApplyCaller;
+typedef FreeCaller1<const BoolImportCallback&, &TerrainBoolFunctionExport<TerrainLowerModeActive>::apply> TerrainLowerModeApplyCaller;
+typedef FreeCaller1<const BoolImportCallback&, &TerrainBoolFunctionExport<TerrainFlattenModeActive>::apply> TerrainFlattenModeApplyCaller;
+typedef FreeCaller1<const BoolImportCallback&, &TerrainBoolFunctionExport<TerrainSmoothModeActive>::apply> TerrainSmoothModeApplyCaller;
+
+static TerrainRaiseModeApplyCaller g_terrainRaise_button_caller;
+static TerrainLowerModeApplyCaller g_terrainLower_button_caller;
+static TerrainFlattenModeApplyCaller g_terrainFlatten_button_caller;
+static TerrainSmoothModeApplyCaller g_terrainSmooth_button_caller;
+static BoolExportCallback g_terrainRaise_button_callback( g_terrainRaise_button_caller );
+static BoolExportCallback g_terrainLower_button_callback( g_terrainLower_button_caller );
+static BoolExportCallback g_terrainFlatten_button_callback( g_terrainFlatten_button_caller );
+static BoolExportCallback g_terrainSmooth_button_callback( g_terrainSmooth_button_caller );
+ToggleItem g_terrainRaise_button( g_terrainRaise_button_callback );
+ToggleItem g_terrainLower_button( g_terrainLower_button_callback );
+ToggleItem g_terrainFlatten_button( g_terrainFlatten_button_callback );
+ToggleItem g_terrainSmooth_button( g_terrainSmooth_button_callback );
+
+static void TerrainToolChanged(){
+	g_terrainRaise_button.update();
+	g_terrainLower_button.update();
+	g_terrainFlatten_button.update();
+	g_terrainSmooth_button.update();
+}
+
+static int terrain_clampOddPatchSize( int v ){
+	if ( v < 3 ) {
+		v = 3;
+	}
+	if ( v > 75 ) {
+		v = 75;
+	}
+	if ( ( v & 1 ) == 0 ) {
+		--v;
+	}
+	return v;
+}
+
+static float terrain_brushWeight( const Vector3& center, const Vector3& point, float radius ){
+	if ( radius <= 0.f ) {
+		return 0.f;
+	}
+	const float dx = point[0] - center[0];
+	const float dy = point[1] - center[1];
+	const float dist = std::sqrt( dx * dx + dy * dy );
+	if ( dist >= radius ) {
+		return 0.f;
+	}
+	const float t = 1.f - dist / radius;
+	return t * t;
+}
+
+static Vector3 terrain_patchCenterXY( const Patch& patch ){
+	Vector3 center( 0, 0, 0 );
+	int count = 0;
+	for ( const PatchControl& ctrl : patch.getControlPoints() ){
+		center[0] += ctrl.m_vertex[0];
+		center[1] += ctrl.m_vertex[1];
+		center[2] += ctrl.m_vertex[2];
+		++count;
+	}
+	if ( count > 0 ) {
+		center /= static_cast<float>( count );
+	}
+	return center;
+}
+
+enum class ETerrainSculptOp
+{
+	Raise,
+	Lower,
+	Flatten,
+	Smooth,
+};
+
+static ETerrainSculptOp terrain_modeToOp( ETerrainBrushMode mode ){
+	switch ( mode )
+	{
+	case ETerrainBrushMode::Raise: return ETerrainSculptOp::Raise;
+	case ETerrainBrushMode::Lower: return ETerrainSculptOp::Lower;
+	case ETerrainBrushMode::Flatten: return ETerrainSculptOp::Flatten;
+	case ETerrainBrushMode::Smooth: return ETerrainSculptOp::Smooth;
+	case ETerrainBrushMode::None: break;
+	}
+	return ETerrainSculptOp::Raise;
+}
+
+static bool terrain_viewAxes( int viewType, int& dim1, int& dim2, int& deformDim ){
+	switch ( viewType )
+	{
+	case XY: dim1 = 0; dim2 = 1; deformDim = 2; return true;
+	case XZ: dim1 = 0; dim2 = 2; deformDim = 1; return true;
+	case YZ: dim1 = 1; dim2 = 2; deformDim = 0; return true;
+	default: return false;
+	}
+}
+
+static float terrain_brushWeightProjected( const Vector3& center, const Vector3& point, float radius, int dim1, int dim2 ){
+	if ( radius <= 0.f ) {
+		return 0.f;
+	}
+	const float d1 = point[dim1] - center[dim1];
+	const float d2 = point[dim2] - center[dim2];
+	const float dist = std::sqrt( d1 * d1 + d2 * d2 );
+	if ( dist >= radius ) {
+		return 0.f;
+	}
+	const float t = 1.f - dist / radius;
+	return t * t;
+}
+
+static bool Patch_terrainSculptAt( Patch& patch, ETerrainSculptOp op, const Vector3& center, int viewType ){
+	if ( patch.getWidth() < 2 || patch.getHeight() < 2 ) {
+		return false;
+	}
+
+	int dim1, dim2, deformDim;
+	if ( !terrain_viewAxes( viewType, dim1, dim2, deformDim ) ) {
+		return false;
+	}
+
+	const float radius = std::max( 1, g_terrainToolSettings.brushRadius );
+	const float strength = static_cast<float>( g_terrainToolSettings.brushStrength );
+	const float smoothFactor = std::min( 1.f, std::max( 0.f, g_terrainToolSettings.smoothFactor ) );
+
+	std::vector<float> originalZ;
+	originalZ.reserve( patch.getControlPoints().size() );
+	for ( const PatchControl& ctrl : patch.getControlPoints() ){
+		originalZ.push_back( ctrl.m_vertex[deformDim] );
+	}
+
+	float flattenTarget = static_cast<float>( g_terrainToolSettings.flattenHeight );
+	if ( op == ETerrainSculptOp::Flatten && g_terrainToolSettings.flattenUseAverage ) {
+		float sum = 0.f;
+		int count = 0;
+		for ( std::size_t row = 0; row < patch.getHeight(); ++row ){
+			for ( std::size_t col = 0; col < patch.getWidth(); ++col ){
+				const PatchControl& ctrl = patch.ctrlAt( row, col );
+				if ( terrain_brushWeightProjected( center, ctrl.m_vertex, radius, dim1, dim2 ) > 0.f ) {
+					sum += ctrl.m_vertex[deformDim];
+					++count;
+				}
+			}
+		}
+		if ( count > 0 ) {
+			flattenTarget = sum / static_cast<float>( count );
+		}
+	}
+
+	bool changed = false;
+	patch.undoSave();
+
+	for ( std::size_t row = 0; row < patch.getHeight(); ++row ){
+		for ( std::size_t col = 0; col < patch.getWidth(); ++col ){
+			PatchControl& ctrl = patch.ctrlAt( row, col );
+			const float w = terrain_brushWeightProjected( center, ctrl.m_vertex, radius, dim1, dim2 );
+			if ( w <= 0.f ) {
+				continue;
+			}
+			changed = true;
+
+			switch ( op )
+			{
+			case ETerrainSculptOp::Raise:
+				ctrl.m_vertex[deformDim] += strength * w;
+				break;
+			case ETerrainSculptOp::Lower:
+				ctrl.m_vertex[deformDim] -= strength * w;
+				break;
+			case ETerrainSculptOp::Flatten:
+				ctrl.m_vertex[deformDim] += ( flattenTarget - ctrl.m_vertex[deformDim] ) * w;
+				break;
+			case ETerrainSculptOp::Smooth:
+			{
+				float sum = 0.f;
+				int count = 0;
+				const int r0 = std::max( 0, static_cast<int>( row ) - 1 );
+				const int r1 = std::min( static_cast<int>( patch.getHeight() ) - 1, static_cast<int>( row ) + 1 );
+				const int c0 = std::max( 0, static_cast<int>( col ) - 1 );
+				const int c1 = std::min( static_cast<int>( patch.getWidth() ) - 1, static_cast<int>( col ) + 1 );
+				for ( int rr = r0; rr <= r1; ++rr ){
+					for ( int cc = c0; cc <= c1; ++cc ){
+						sum += originalZ[rr * patch.getWidth() + cc];
+						++count;
+					}
+				}
+				if ( count > 0 ) {
+					const float avg = sum / static_cast<float>( count );
+					ctrl.m_vertex[deformDim] += ( avg - ctrl.m_vertex[deformDim] ) * ( smoothFactor * w );
+				}
+				break;
+			}
+			}
+		}
+	}
+
+	return changed;
+}
+
+struct TerrainStitchVertex
+{
+	Patch* patch;
+	std::size_t row;
+	std::size_t col;
+};
+
+static void Scene_PatchTerrainStitch_Selected( scene::Graph& graph, int viewType ){
+	int dim1, dim2, deformDim;
+	if ( !terrain_viewAxes( viewType, dim1, dim2, deformDim ) ) {
+		return;
+	}
+
+	std::vector<TerrainStitchVertex> verts;
+	Scene_forEachVisibleSelectedPatch( [&]( Patch& patch ){
+		for ( std::size_t row = 0; row < patch.getHeight(); ++row ){
+			for ( std::size_t col = 0; col < patch.getWidth(); ++col ){
+				verts.push_back( TerrainStitchVertex{ &patch, row, col } );
+			}
+		}
+	} );
+
+	const float epsilon = 0.01f;
+	for ( std::size_t i = 0; i < verts.size(); ++i ){
+		PatchControl& a = verts[i].patch->ctrlAt( verts[i].row, verts[i].col );
+		float sum = a.m_vertex[deformDim];
+		int count = 1;
+
+		for ( std::size_t j = i + 1; j < verts.size(); ++j ){
+			PatchControl& b = verts[j].patch->ctrlAt( verts[j].row, verts[j].col );
+			if ( std::fabs( a.m_vertex[dim1] - b.m_vertex[dim1] ) <= epsilon
+				&& std::fabs( a.m_vertex[dim2] - b.m_vertex[dim2] ) <= epsilon ) {
+				sum += b.m_vertex[deformDim];
+				++count;
+			}
+		}
+
+		if ( count <= 1 ) {
+			continue;
+		}
+
+		const float avg = sum / static_cast<float>( count );
+		a.m_vertex[deformDim] = avg;
+		for ( std::size_t j = i + 1; j < verts.size(); ++j ){
+			PatchControl& b = verts[j].patch->ctrlAt( verts[j].row, verts[j].col );
+			if ( std::fabs( a.m_vertex[dim1] - b.m_vertex[dim1] ) <= epsilon
+				&& std::fabs( a.m_vertex[dim2] - b.m_vertex[dim2] ) <= epsilon ) {
+				b.m_vertex[deformDim] = avg;
+			}
+		}
+	}
+}
+
+static void terrain_patchFillAxes( const Patch& patch, int& dim1, int& dim2, int& deformDim ){
+	Vector3 normal = patch.Calculate_AvgNormal();
+	normal[0] = std::fabs( normal[0] );
+	normal[1] = std::fabs( normal[1] );
+	normal[2] = std::fabs( normal[2] );
+	deformDim = 2;
+	if ( normal[0] >= normal[1] && normal[0] >= normal[2] ) {
+		deformDim = 0;
+	}
+	else if ( normal[1] >= normal[0] && normal[1] >= normal[2] ) {
+		deformDim = 1;
+	}
+	dim1 = ( deformDim + 1 ) % 3;
+	dim2 = ( deformDim + 2 ) % 3;
+}
+
+struct TerrainFillAnchor
+{
+	std::size_t row;
+	std::size_t col;
+	Vector3 pos;
+	float height;
+};
+
+static bool Patch_terrainFillFromSelectedVerts( PatchInstance& patchInstance ){
+	Patch& patch = patchInstance.getPatch();
+	const std::size_t width = patch.getWidth();
+	const std::size_t height = patch.getHeight();
+	if ( width < 2 || height < 2 ) {
+		return false;
+	}
+	if ( !patchInstance.selectedVertices() ) {
+		return false;
+	}
+
+	std::vector<TerrainFillAnchor> anchors;
+	anchors.reserve( width * height );
+	std::vector<unsigned char> selectedMask( width * height, 0 );
+
+	patchInstance.forEachSelectedControlPoint( [&]( std::size_t index, const PatchControl& ctrl ){
+		const std::size_t row = index / width;
+		const std::size_t col = index % width;
+		if ( row >= height || col >= width ) {
+			return;
+		}
+		selectedMask[index] = 1;
+		TerrainFillAnchor a;
+		a.row = row;
+		a.col = col;
+		a.pos = ctrl.m_vertex;
+		a.height = 0.f;
+		anchors.push_back( a );
+	} );
+
+	if ( anchors.size() < 2 ) {
+		return false;
+	}
+
+	int dim1, dim2, deformDim;
+	terrain_patchFillAxes( patch, dim1, dim2, deformDim );
+	for ( TerrainFillAnchor& a : anchors ){
+		a.height = a.pos[deformDim];
+	}
+
+	std::size_t minRow = height - 1, maxRow = 0, minCol = width - 1, maxCol = 0;
+	for ( const TerrainFillAnchor& a : anchors ){
+		minRow = std::min( minRow, a.row );
+		maxRow = std::max( maxRow, a.row );
+		minCol = std::min( minCol, a.col );
+		maxCol = std::max( maxCol, a.col );
+	}
+	if ( minRow == maxRow && minCol == maxCol ) {
+		return false;
+	}
+
+	patch.undoSave();
+	bool changed = false;
+
+	for ( std::size_t row = minRow; row <= maxRow; ++row ){
+		for ( std::size_t col = minCol; col <= maxCol; ++col ){
+			const std::size_t idx = row * width + col;
+			if ( selectedMask[idx] ) {
+				continue;
+			}
+
+			PatchControl& ctrl = patch.ctrlAt( row, col );
+			const float p1 = ctrl.m_vertex[dim1];
+			const float p2 = ctrl.m_vertex[dim2];
+
+			float weightedHeight = 0.f;
+			float totalWeight = 0.f;
+			bool exact = false;
+			float exactHeight = ctrl.m_vertex[deformDim];
+
+			for ( const TerrainFillAnchor& a : anchors ){
+				const float d1 = p1 - a.pos[dim1];
+				const float d2 = p2 - a.pos[dim2];
+				const float distSq = d1 * d1 + d2 * d2;
+				if ( distSq < 0.0001f ) {
+					exact = true;
+					exactHeight = a.height;
+					break;
+				}
+				const float w = 1.f / distSq;
+				weightedHeight += a.height * w;
+				totalWeight += w;
+			}
+
+			if ( exact ) {
+				if ( ctrl.m_vertex[deformDim] != exactHeight ) {
+					ctrl.m_vertex[deformDim] = exactHeight;
+					changed = true;
+				}
+				continue;
+			}
+
+			if ( totalWeight > 0.f ) {
+				const float target = weightedHeight / totalWeight;
+				if ( ctrl.m_vertex[deformDim] != target ) {
+					ctrl.m_vertex[deformDim] = target;
+					changed = true;
+				}
+			}
+		}
+	}
+
+	if ( !changed ) {
+		return false;
+	}
+
+	// Normalize the filled region into a smoother connection while preserving selected anchors.
+	for ( int iter = 0; iter < 2; ++iter ){
+		std::vector<float> heights( width * height, 0.f );
+		for ( std::size_t row = 0; row < height; ++row ){
+			for ( std::size_t col = 0; col < width; ++col ){
+				heights[row * width + col] = patch.ctrlAt( row, col ).m_vertex[deformDim];
+			}
+		}
+
+		for ( std::size_t row = minRow; row <= maxRow; ++row ){
+			for ( std::size_t col = minCol; col <= maxCol; ++col ){
+				const std::size_t idx = row * width + col;
+				if ( selectedMask[idx] ) {
+					continue;
+				}
+
+				const int r0 = std::max( static_cast<int>( minRow ), static_cast<int>( row ) - 1 );
+				const int r1 = std::min( static_cast<int>( maxRow ), static_cast<int>( row ) + 1 );
+				const int c0 = std::max( static_cast<int>( minCol ), static_cast<int>( col ) - 1 );
+				const int c1 = std::min( static_cast<int>( maxCol ), static_cast<int>( col ) + 1 );
+
+				float sum = 0.f;
+				int count = 0;
+				for ( int rr = r0; rr <= r1; ++rr ){
+					for ( int cc = c0; cc <= c1; ++cc ){
+						sum += heights[static_cast<std::size_t>( rr ) * width + static_cast<std::size_t>( cc )];
+						++count;
+					}
+				}
+				if ( count > 0 ) {
+					const float avg = sum / static_cast<float>( count );
+					PatchControl& ctrl = patch.ctrlAt( row, col );
+					ctrl.m_vertex[deformDim] = ctrl.m_vertex[deformDim] + ( avg - ctrl.m_vertex[deformDim] ) * 0.65f;
+				}
+			}
+		}
+	}
+
+	patch.controlPointsChanged();
+	return true;
+}
+
+static void Scene_PatchTerrainFillFromSelectedVerts( scene::Graph& graph ){
+	bool changed = false;
+	Scene_forEachVisibleSelectedPatchInstance( [&]( PatchInstance& patchInstance ){
+		changed = Patch_terrainFillFromSelectedVerts( patchInstance ) || changed;
+	} );
+	if ( changed ) {
+		SceneChangeNotify();
+	}
+}
+
+static void Scene_PatchTerrainSculpt_Selected( scene::Graph& graph, ETerrainSculptOp op ){
+	Scene_forEachVisibleSelectedPatch( [op]( Patch& patch ){ Patch_terrainSculptAt( patch, op, terrain_patchCenterXY( patch ), XY ); } );
+	SceneChangeNotify();
+}
+
+static void DoTerrainToolSettingsDlg(){
+	QDialog dialog( MainFrame_getWindow(), Qt::Dialog | Qt::WindowCloseButtonHint );
+	dialog.setWindowTitle( "Terrain Tool Settings" );
+
+	auto radius = new SpinBox( 1, 8192, g_terrainToolSettings.brushRadius );
+	auto strength = new SpinBox( 1, 4096, g_terrainToolSettings.brushStrength );
+	auto smooth = new DoubleSpinBox( 0.0, 1.0, 0, 2 );
+	smooth->setSingleStep( 0.05 );
+	smooth->setValue( g_terrainToolSettings.smoothFactor );
+	auto flattenAverage = new QCheckBox( "Flatten to average height in brush" );
+	flattenAverage->setChecked( g_terrainToolSettings.flattenUseAverage );
+	auto flattenHeight = new SpinBox( -65536, 65536, g_terrainToolSettings.flattenHeight );
+
+	auto form = new QFormLayout( &dialog );
+	form->setSizeConstraint( QLayout::SizeConstraint::SetFixedSize );
+	form->addRow( "Brush radius:", radius );
+	form->addRow( "Raise/lower strength:", strength );
+	form->addRow( "Smooth factor:", smooth );
+	form->addRow( "", flattenAverage );
+	form->addRow( "Flatten target Z:", flattenHeight );
+
+	auto buttons = new QDialogButtonBox( QDialogButtonBox::StandardButton::Ok | QDialogButtonBox::StandardButton::Cancel );
+	form->addWidget( buttons );
+	QObject::connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
+	QObject::connect( buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject );
+
+	if ( dialog.exec() ) {
+		g_terrainToolSettings.brushRadius = radius->value();
+		g_terrainToolSettings.brushStrength = strength->value();
+		g_terrainToolSettings.smoothFactor = static_cast<float>( smooth->value() );
+		g_terrainToolSettings.flattenUseAverage = flattenAverage->isChecked();
+		g_terrainToolSettings.flattenHeight = flattenHeight->value();
+	}
+}
+
+static void DoTerrainPatchDlg(){
+	QDialog dialog( MainFrame_getWindow(), Qt::Dialog | Qt::WindowCloseButtonHint );
+	dialog.setWindowTitle( "Create Terrain Patch" );
+
+	const AABB bounds = PatchCreator_getBounds();
+	auto densityW = new SpinBox( 3, 75, g_terrainToolSettings.patchWidth );
+	auto densityH = new SpinBox( 3, 75, g_terrainToolSettings.patchHeight );
+	auto sizeX = new SpinBox( 1, 65536, g_terrainToolSettings.sizeX ? g_terrainToolSettings.sizeX : static_cast<int>( bounds.extents[0] * 2 ) );
+	auto sizeY = new SpinBox( 1, 65536, g_terrainToolSettings.sizeY ? g_terrainToolSettings.sizeY : static_cast<int>( bounds.extents[1] * 2 ) );
+	auto sizeZ = new SpinBox( 1, 65536, g_terrainToolSettings.sizeZ ? g_terrainToolSettings.sizeZ : std::max( 1, static_cast<int>( bounds.extents[2] * 2 ) ) );
+	auto gridCols = new SpinBox( 1, 128, g_terrainToolSettings.gridCols );
+	auto gridRows = new SpinBox( 1, 128, g_terrainToolSettings.gridRows );
+
+	auto form = new QFormLayout( &dialog );
+	form->setSizeConstraint( QLayout::SizeConstraint::SetFixedSize );
+	form->addRow( "Patch width:", densityW );
+	form->addRow( "Patch height:", densityH );
+	form->addRow( "Size X:", sizeX );
+	form->addRow( "Size Y:", sizeY );
+	form->addRow( "Size Z:", sizeZ );
+	form->addRow( "Grid columns:", gridCols );
+	form->addRow( "Grid rows:", gridRows );
+
+	auto buttons = new QDialogButtonBox( QDialogButtonBox::StandardButton::Ok | QDialogButtonBox::StandardButton::Cancel );
+	form->addWidget( buttons );
+	QObject::connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
+	QObject::connect( buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject );
+
+	if ( dialog.exec() ) {
+		g_terrainToolSettings.patchWidth = terrain_clampOddPatchSize( densityW->value() );
+		g_terrainToolSettings.patchHeight = terrain_clampOddPatchSize( densityH->value() );
+		g_terrainToolSettings.sizeX = std::max( 1, sizeX->value() );
+		g_terrainToolSettings.sizeY = std::max( 1, sizeY->value() );
+		g_terrainToolSettings.sizeZ = std::max( 1, sizeZ->value() );
+		g_terrainToolSettings.gridCols = std::max( 1, gridCols->value() );
+		g_terrainToolSettings.gridRows = std::max( 1, gridRows->value() );
+
+		AABB terrainBounds = bounds;
+		terrainBounds.extents[0] = g_terrainToolSettings.sizeX * 0.5f;
+		terrainBounds.extents[1] = g_terrainToolSettings.sizeY * 0.5f;
+		terrainBounds.extents[2] = g_terrainToolSettings.sizeZ * 0.5f;
+		const int axis = GlobalXYWnd_getCurrentViewType();
+		const char* shader = TextureBrowser_GetSelectedShader();
+		Select_Delete();
+		GlobalSelectionSystem().setSelectedAll( false );
+		int dim1, dim2, deformDim;
+		if ( !terrain_viewAxes( axis, dim1, dim2, deformDim ) ) {
+			dim1 = 0; dim2 = 1;
+		}
+		for ( int gy = 0; gy < g_terrainToolSettings.gridRows; ++gy ){
+			for ( int gx = 0; gx < g_terrainToolSettings.gridCols; ++gx ){
+				AABB cell = terrainBounds;
+				cell.origin[dim1] += ( gx - ( g_terrainToolSettings.gridCols - 1 ) * 0.5f ) * ( g_terrainToolSettings.sizeX );
+				cell.origin[dim2] += ( gy - ( g_terrainToolSettings.gridRows - 1 ) * 0.5f ) * ( g_terrainToolSettings.sizeY );
+				Scene_PatchConstructPrefab_Append(
+					GlobalSceneGraph(),
+					cell,
+					shader,
+					EPatchPrefab::Plane,
+					axis,
+					g_terrainToolSettings.patchWidth,
+					g_terrainToolSettings.patchHeight,
+					false
+				);
+			}
+		}
+	}
+}
+
+static void Patch_TerrainCreate(){
+	UndoableCommand undo( "terrainPatchCreate" );
+	DoTerrainPatchDlg();
+}
+
+static const char* terrain_modeName( ETerrainBrushMode mode ){
+	switch ( mode )
+	{
+	case ETerrainBrushMode::Raise: return "Raise";
+	case ETerrainBrushMode::Lower: return "Lower";
+	case ETerrainBrushMode::Flatten: return "Flatten";
+	case ETerrainBrushMode::Smooth: return "Smooth";
+	case ETerrainBrushMode::None: return "Off";
+	}
+	return "Off";
+}
+
+static void terrain_setBrushMode( ETerrainBrushMode mode ){
+	g_terrainBrushMode = ( g_terrainBrushMode == mode ) ? ETerrainBrushMode::None : mode;
+	g_terrainBrushHasLastPoint = false;
+	g_terrainBrushPreviewValid = false;
+	TerrainToolChanged();
+}
+
+static void Patch_TerrainSettings(){
+	DoTerrainToolSettingsDlg();
+}
+
+static void Patch_TerrainRaise(){
+	terrain_setBrushMode( ETerrainBrushMode::Raise );
+}
+
+static void Patch_TerrainLower(){
+	terrain_setBrushMode( ETerrainBrushMode::Lower );
+}
+
+static void Patch_TerrainFlatten(){
+	terrain_setBrushMode( ETerrainBrushMode::Flatten );
+}
+
+static void Patch_TerrainSmooth(){
+	terrain_setBrushMode( ETerrainBrushMode::Smooth );
+}
+
+static void Patch_TerrainFillSelection(){
+	UndoableCommand undo( "terrainFillSelection" );
+	Scene_PatchTerrainFillFromSelectedVerts( GlobalSceneGraph() );
+}
+
+static void Patch_TerrainToolOff(){
+	g_terrainBrushMode = ETerrainBrushMode::None;
+	g_terrainBrushHasLastPoint = false;
+	g_terrainBrushPreviewValid = false;
+	TerrainToolChanged();
+}
+
+static void Patch_TerrainBrushSizeIncrease(){
+	g_terrainToolSettings.brushRadius = std::min( 8192, g_terrainToolSettings.brushRadius + std::max( 1, g_terrainToolSettings.brushRadius / 4 ) );
+}
+
+static void Patch_TerrainBrushSizeDecrease(){
+	g_terrainToolSettings.brushRadius = std::max( 1, g_terrainToolSettings.brushRadius - std::max( 1, g_terrainToolSettings.brushRadius / 4 ) );
+}
+
+bool Patch_TerrainTool_IsActive(){
+	return g_terrainBrushMode != ETerrainBrushMode::None;
+}
+
+int Patch_TerrainTool_GetBrushRadius(){
+	return g_terrainToolSettings.brushRadius;
+}
+
+void Patch_TerrainTool_Disable(){
+	Patch_TerrainToolOff();
+}
+
+bool Patch_TerrainTool_GetPreviewPoint( Vector3& point ){
+	if ( !g_terrainBrushPreviewValid ) {
+		return false;
+	}
+	point = g_terrainBrushPreviewPoint;
+	return true;
+}
+
+static bool Scene_PatchTerrainPaintAt_Selected( scene::Graph& graph, ETerrainSculptOp op, const Vector3& point, int viewType ){
+	bool touched = false;
+	std::vector<Patch*> changedPatches;
+	Scene_forEachVisibleSelectedPatch( [&]( Patch& patch ){
+		if ( Patch_terrainSculptAt( patch, op, point, viewType ) ) {
+			changedPatches.push_back( &patch );
+			touched = true;
+		}
+	} );
+	if ( touched ) {
+		if ( op == ETerrainSculptOp::Smooth ) {
+			Scene_PatchTerrainStitch_Selected( graph, viewType );
+		}
+		for ( Patch* patch : changedPatches ) {
+			patch->controlPointsChanged();
+		}
+		SceneChangeNotify();
+	}
+	return touched;
+}
+
+static bool Scene_PatchTerrainPaintAlongRay_Selected( scene::Graph& graph, ETerrainSculptOp op, const Vector3& rayOrigin, const Vector3& rayDir ){
+	Vector3 bestPoint( g_vector3_identity );
+	float bestT = 1e30f;
+	bool foundHit = false;
+
+	Scene_forEachVisibleSelectedPatch( [&]( Patch& patch ){
+		const Vector3 normal = vector3_normalised( patch.Calculate_AvgNormal() );
+		const Vector3 center = terrain_patchCenterXY( patch );
+		const float denom = vector3_dot( normal, rayDir );
+		if ( std::fabs( denom ) < 1e-4f ) {
+			return;
+		}
+		const float t = vector3_dot( center - rayOrigin, normal ) / denom;
+		if ( t <= 0.f || t >= bestT ) {
+			return;
+		}
+		bestT = t;
+		bestPoint = rayOrigin + rayDir * t;
+		foundHit = true;
+	} );
+
+	if ( !foundHit ) {
+		g_terrainBrushPreviewValid = false;
+		return false;
+	}
+	g_terrainBrushPreviewPoint = bestPoint;
+	g_terrainBrushPreviewValid = true;
+
+	bool changed = false;
+	std::vector<Patch*> changedPatches;
+	Scene_forEachVisibleSelectedPatch( [&]( Patch& patch ){
+		if ( Patch_terrainSculptAt( patch, op, bestPoint, XY ) ) {
+			changedPatches.push_back( &patch );
+			changed = true;
+		}
+	} );
+	if ( changed ) {
+		if ( op == ETerrainSculptOp::Smooth ) {
+			Scene_PatchTerrainStitch_Selected( graph, XY );
+		}
+		for ( Patch* patch : changedPatches ) {
+			patch->controlPointsChanged();
+		}
+		SceneChangeNotify();
+	}
+	return changed;
+}
+
+static bool Scene_PatchTerrainRayPreview_Selected( scene::Graph& graph, const Vector3& rayOrigin, const Vector3& rayDir ){
+	bool found = false;
+	float bestT = 1e30f;
+	Vector3 bestPoint( g_vector3_identity );
+	Scene_forEachVisibleSelectedPatch( [&]( Patch& patch ){
+		const Vector3 normal = vector3_normalised( patch.Calculate_AvgNormal() );
+		const Vector3 center = terrain_patchCenterXY( patch );
+		const float denom = vector3_dot( normal, rayDir );
+		if ( std::fabs( denom ) < 1e-4f ) {
+			return;
+		}
+		const float t = vector3_dot( center - rayOrigin, normal ) / denom;
+		if ( t <= 0.f || t >= bestT ) {
+			return;
+		}
+		bestT = t;
+		bestPoint = rayOrigin + rayDir * t;
+		found = true;
+	} );
+	g_terrainBrushPreviewValid = found;
+	if ( found ) {
+		g_terrainBrushPreviewPoint = bestPoint;
+	}
+	return found;
+}
+
+static bool terrain_beginStrokeIfNeeded(){
+	if ( !g_terrainBrushStrokeActive ) {
+		GlobalUndoSystem().start();
+		g_terrainBrushStrokeActive = true;
+	}
+	return true;
+}
+
+static bool terrain_paintAt( int viewType, const Vector3& point, bool spacingCheck ){
+	if ( g_terrainBrushMode == ETerrainBrushMode::None ) {
+		return false;
+	}
+	if ( Scene_GetUltimateSelectedVisiblePatch() == 0 ) {
+		return false;
+	}
+	if ( spacingCheck && g_terrainBrushHasLastPoint ) {
+		int dim1, dim2, deformDim;
+		if ( terrain_viewAxes( viewType, dim1, dim2, deformDim ) ) {
+			const float dx = point[dim1] - g_terrainBrushLastPoint[dim1];
+			const float dy = point[dim2] - g_terrainBrushLastPoint[dim2];
+			const float minStep = std::max( 1.f, g_terrainToolSettings.brushRadius * 0.08f );
+			if ( dx * dx + dy * dy < minStep * minStep ) {
+				return false;
+			}
+		}
+	}
+
+	terrain_beginStrokeIfNeeded();
+	const bool touched = Scene_PatchTerrainPaintAt_Selected( GlobalSceneGraph(), terrain_modeToOp( g_terrainBrushMode ), point, viewType );
+	if ( touched ) {
+		g_terrainBrushLastPoint = point;
+		g_terrainBrushHasLastPoint = true;
+	}
+	return touched;
+}
+
+bool Patch_TerrainTool_XYMouseDown( int viewType, const Vector3& point ){
+	g_terrainBrushHasLastPoint = false;
+	return terrain_paintAt( viewType, point, false );
+}
+
+bool Patch_TerrainTool_XYMouseMove( int viewType, const Vector3& point, bool leftButtonDown ){
+	if ( !leftButtonDown ) {
+		return false;
+	}
+	return terrain_paintAt( viewType, point, true );
+}
+
+bool Patch_TerrainTool_XYMouseUp(){
+	if ( g_terrainBrushStrokeActive ) {
+		GlobalUndoSystem().finish( "terrainBrushStroke" );
+		g_terrainBrushStrokeActive = false;
+		g_terrainBrushHasLastPoint = false;
+		return true;
+	}
+	return false;
+}
+
+bool Patch_TerrainTool_CamMouseDown( const Vector3& rayOrigin, const Vector3& rayDirection ){
+	g_terrainBrushHasLastPoint = false;
+	if ( g_terrainBrushMode == ETerrainBrushMode::None || Scene_GetUltimateSelectedVisiblePatch() == 0 ) {
+		return false;
+	}
+	terrain_beginStrokeIfNeeded();
+	const bool touched = Scene_PatchTerrainPaintAlongRay_Selected( GlobalSceneGraph(), terrain_modeToOp( g_terrainBrushMode ), rayOrigin, rayDirection );
+	return touched;
+}
+
+bool Patch_TerrainTool_CamMouseMove( const Vector3& rayOrigin, const Vector3& rayDirection, bool leftButtonDown ){
+	if ( !leftButtonDown || g_terrainBrushMode == ETerrainBrushMode::None || Scene_GetUltimateSelectedVisiblePatch() == 0 ) {
+		return false;
+	}
+	terrain_beginStrokeIfNeeded();
+	return Scene_PatchTerrainPaintAlongRay_Selected( GlobalSceneGraph(), terrain_modeToOp( g_terrainBrushMode ), rayOrigin, rayDirection );
+}
+
+bool Patch_TerrainTool_CamMouseUp(){
+	return Patch_TerrainTool_XYMouseUp();
+}
+
+void Patch_TerrainTool_CamHover( const Vector3& rayOrigin, const Vector3& rayDirection ){
+	if ( g_terrainBrushMode == ETerrainBrushMode::None || Scene_GetUltimateSelectedVisiblePatch() == 0 ) {
+		g_terrainBrushPreviewValid = false;
+		return;
+	}
+	Scene_PatchTerrainRayPreview_Selected( GlobalSceneGraph(), rayOrigin, rayDirection );
+}
 
 void DoNewPatchDlg( EPatchPrefab prefab, int minrows, int mincols, int defrows, int defcols, int maxrows, int maxcols ){
 	QDialog dialog( MainFrame_getWindow(), Qt::Dialog | Qt::WindowCloseButtonHint );
@@ -840,43 +1761,19 @@ void DoNewPatchDlg( EPatchPrefab prefab, int minrows, int mincols, int defrows, 
 		form->setSizeConstraint( QLayout::SizeConstraint::SetFixedSize );
 		{
 			{
-#define D_ITEM( x ) if ( x >= mincols && ( !maxcols || x <= maxcols ) ) width->addItem( # x )
-				D_ITEM( 3 );
-				D_ITEM( 5 );
-				D_ITEM( 7 );
-				D_ITEM( 9 );
-				D_ITEM( 11 );
-				D_ITEM( 13 );
-				D_ITEM( 15 );
-				D_ITEM( 17 );
-				D_ITEM( 19 );
-				D_ITEM( 21 );
-				D_ITEM( 23 );
-				D_ITEM( 25 );
-				D_ITEM( 27 );
-				D_ITEM( 29 );
-				D_ITEM( 31 ); // MAX_PATCH_SIZE is 32, so we should be able to do 31...
-#undef D_ITEM
+				for ( int x = 3; x <= 75; x += 2 ) {
+					if ( x >= mincols && ( !maxcols || x <= maxcols ) ) {
+						width->addItem( QString::number( x ) );
+					}
+				}
 				form->addRow( "Width:", width );
 			}
 			{
-#define D_ITEM( x ) if ( x >= minrows && ( !maxrows || x <= maxrows ) ) height->addItem( # x )
-				D_ITEM( 3 );
-				D_ITEM( 5 );
-				D_ITEM( 7 );
-				D_ITEM( 9 );
-				D_ITEM( 11 );
-				D_ITEM( 13 );
-				D_ITEM( 15 );
-				D_ITEM( 17 );
-				D_ITEM( 19 );
-				D_ITEM( 21 );
-				D_ITEM( 23 );
-				D_ITEM( 25 );
-				D_ITEM( 27 );
-				D_ITEM( 29 );
-				D_ITEM( 31 ); // MAX_PATCH_SIZE is 32, so we should be able to do 31...
-#undef D_ITEM
+				for ( int x = 3; x <= 75; x += 2 ) {
+					if ( x >= minrows && ( !maxrows || x <= maxrows ) ) {
+						height->addItem( QString::number( x ) );
+					}
+				}
 				form->addRow( "Height:", height );
 			}
 
@@ -1179,3 +2076,5 @@ void Patch_SetTexdef( const float* hShift, const float* vShift, const float* hSc
 		Patch_textureChanged();
 	} );
 }
+
+

@@ -1204,6 +1204,61 @@ static void selection_button_press( const QMouseEvent& event, WindowObserver* ob
 		observer->onMouseDown( WindowVector( event.x(), event.y() ), button_for_button( event.button() ), modifiers_for_state( event.modifiers() ) );
 }
 
+static Vector3 camera_ray_direction( CamWnd& camwnd, float x, float y ){
+	const camera_t& cam = camwnd.getCamera();
+	const Matrix4 screen2world = matrix4_affine_inverse( cam.m_view->GetViewMatrix() );
+
+	Vector3 normalized;
+	normalized[0] = 2.0f * x / cam.width - 1.0f;
+	normalized[1] = 2.0f * y / cam.height - 1.0f;
+	normalized[1] *= -1.f;
+	normalized[2] = 0.f;
+	normalized *= ( camera_t::near_z * 2.f );
+	matrix4_transform_point( screen2world, normalized );
+	return vector3_normalised( normalized - Camera_getOrigin( camwnd ) );
+}
+
+static void camera_draw_terrain_brush_preview( CamWnd& camwnd ){
+	if ( !Patch_TerrainTool_IsActive() ) {
+		return;
+	}
+	Vector3 p( g_vector3_identity );
+	if ( !Patch_TerrainTool_GetPreviewPoint( p ) ) {
+		return;
+	}
+	const float r = static_cast<float>( Patch_TerrainTool_GetBrushRadius() );
+	if ( r <= 0.f ) {
+		return;
+	}
+
+	gl().glMatrixMode( GL_PROJECTION );
+	gl().glLoadMatrixf( reinterpret_cast<const float*>( &camwnd.getCamera().projection ) );
+	gl().glMatrixMode( GL_MODELVIEW );
+	gl().glLoadMatrixf( reinterpret_cast<const float*>( &camwnd.getCamera().modelview ) );
+	gl().glDisable( GL_TEXTURE_2D );
+	gl().glDisable( GL_LIGHTING );
+	gl().glEnable( GL_BLEND );
+	gl().glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+	gl().glColor4f( 1.0f, 0.85f, 0.15f, 0.95f );
+	gl().glLineWidth( 1.5f );
+
+	constexpr int steps = 32;
+	auto drawCircle = [&]( int a, int b ){
+		gl().glBegin( GL_LINE_LOOP );
+		for ( int i = 0; i < steps; ++i ){
+			const float ang = static_cast<float>( ( 2.0 * c_pi * i ) / steps );
+			Vector3 v( p );
+			v[a] += std::cos( ang ) * r;
+			v[b] += std::sin( ang ) * r;
+			gl().glVertex3fv( vector3_to_array( v ) );
+		}
+		gl().glEnd();
+	};
+	drawCircle( 0, 1 );
+	drawCircle( 0, 2 );
+	drawCircle( 1, 2 );
+}
+
 static void selection_button_release( const QMouseEvent& event, WindowObserver* observer ){
 	observer->onMouseUp( WindowVector( event.x(), event.y() ), button_for_button( event.button() ), modifiers_for_state( event.modifiers() ) );
 }
@@ -1639,19 +1694,39 @@ protected:
 	}
 
 	void mousePressEvent( QMouseEvent *event ) override {
+		const auto e = scaledEvent( event );
+		if( !m_camwnd.m_bFreeMove && Patch_TerrainTool_IsActive() && e.button() == Qt::MouseButton::LeftButton ){
+			const Vector3 rayDir = camera_ray_direction( m_camwnd, e.x(), e.y() );
+			if( Patch_TerrainTool_CamMouseDown( Camera_getOrigin( m_camwnd ), rayDir ) ){
+				setFocus();
+				return;
+			}
+		}
 		if( !m_camwnd.m_bFreeMove ){
 			setFocus();
-			selection_button_press( scaledEvent( event ), m_camwnd.m_window_observer );
-			enable_freelook_button_press( scaledEvent( event ), m_camwnd );
+			selection_button_press( e, m_camwnd.m_window_observer );
+			enable_freelook_button_press( e, m_camwnd );
 		}
 		else{
-			selection_button_press_freemove( this, scaledEvent( event ), m_camwnd.m_window_observer );
-			disable_freelook_button_press( scaledEvent( event ), m_camwnd );
+			selection_button_press_freemove( this, e, m_camwnd.m_window_observer );
+			disable_freelook_button_press( e, m_camwnd );
 		}
 	}
 	void mouseMoveEvent( QMouseEvent *event ) override {
+		const auto e = scaledEvent( event );
+		if( !m_camwnd.m_bFreeMove && Patch_TerrainTool_IsActive() ){
+			const Vector3 rayDir = camera_ray_direction( m_camwnd, e.x(), e.y() );
+			Patch_TerrainTool_CamHover( Camera_getOrigin( m_camwnd ), rayDir );
+		}
+		if( !m_camwnd.m_bFreeMove && Patch_TerrainTool_IsActive() && e.buttons().testFlag( Qt::MouseButton::LeftButton ) ){
+			const Vector3 rayDir = camera_ray_direction( m_camwnd, e.x(), e.y() );
+			if( Patch_TerrainTool_CamMouseMove( Camera_getOrigin( m_camwnd ), rayDir, true ) ){
+				m_camwnd.queue_draw();
+				return;
+			}
+		}
 		if( !m_camwnd.m_bFreeMove ){
-			m_camwnd.m_deferred_motion.motion( scaledEvent( event ) );
+			m_camwnd.m_deferred_motion.motion( e );
 			m_camwnd.getCamera().m_idleDraw.queueDraw( DeferredMotion2::InvokeCaller( m_camwnd.m_deferred_motion ), false );
 		}
 		else{
@@ -1659,12 +1734,18 @@ protected:
 		}
 	}
 	void mouseReleaseEvent( QMouseEvent *event ) override {
+		const auto e = scaledEvent( event );
+		if( !m_camwnd.m_bFreeMove && Patch_TerrainTool_IsActive() && e.button() == Qt::MouseButton::LeftButton ){
+			if( Patch_TerrainTool_CamMouseUp() ){
+				return;
+			}
+		}
 		if( !m_camwnd.m_bFreeMove ){
-			selection_button_release( scaledEvent( event ), m_camwnd.m_window_observer );
+			selection_button_release( e, m_camwnd.m_window_observer );
 		}
 		else{
-			selection_button_release_freemove( this, scaledEvent( event ), m_camwnd.m_window_observer );
-			disable_freelook_button_release( scaledEvent( event ), m_camwnd );
+			selection_button_release_freemove( this, e, m_camwnd.m_window_observer );
+			disable_freelook_button_release( e, m_camwnd );
 		}
 	}
 	void wheelEvent( QWheelEvent *event ) override {
@@ -2125,6 +2206,8 @@ void CamWnd::Cam_Draw(){
 
 		renderer.render( m_Camera.modelview, m_Camera.projection );
 	}
+
+	camera_draw_terrain_brush_preview( *this );
 
 	// prepare for 2d stuff
 	gl().glColor4f( 1, 1, 1, 1 );

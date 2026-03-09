@@ -24,6 +24,7 @@
 #include "iscenegraph.h"
 #include "iselection.h"
 #include "mainframe.h"
+#include "patchmanip.h"
 #include "commands.h"
 #include "generic/callback.h"
 #include "signal/isignal.h"
@@ -258,6 +259,7 @@ void DragMode(){
 	}
 	else
 	{
+		Patch_TerrainTool_Disable();
 		g_currentToolMode = DragMode;
 		g_currentToolModeSupportsComponentEditing = true;
 
@@ -277,6 +279,7 @@ void TranslateMode(){
 	}
 	else
 	{
+		Patch_TerrainTool_Disable();
 		g_currentToolMode = TranslateMode;
 		g_currentToolModeSupportsComponentEditing = true;
 
@@ -295,6 +298,7 @@ void RotateMode(){
 	}
 	else
 	{
+		Patch_TerrainTool_Disable();
 		g_currentToolMode = RotateMode;
 		g_currentToolModeSupportsComponentEditing = true;
 
@@ -313,6 +317,7 @@ void ScaleMode(){
 	}
 	else
 	{
+		Patch_TerrainTool_Disable();
 		g_currentToolMode = ScaleMode;
 		g_currentToolModeSupportsComponentEditing = true;
 
@@ -331,6 +336,7 @@ void SkewMode(){
 	}
 	else
 	{
+		Patch_TerrainTool_Disable();
 		g_currentToolMode = SkewMode;
 		g_currentToolModeSupportsComponentEditing = true;
 
@@ -350,6 +356,7 @@ void ClipperMode(){
 	}
 	else
 	{
+		Patch_TerrainTool_Disable();
 		g_currentToolMode = ClipperMode;
 		g_currentToolModeSupportsComponentEditing = false;
 
@@ -372,6 +379,7 @@ void BuildMode(){
 	}
 	else
 	{
+		Patch_TerrainTool_Disable();
 		g_currentToolMode = BuildMode;
 		g_currentToolModeSupportsComponentEditing = false;
 
@@ -394,6 +402,7 @@ void UVMode(){
 	}
 	else
 	{
+		Patch_TerrainTool_Disable();
 		g_currentToolMode = UVMode;
 		g_currentToolModeSupportsComponentEditing = false;
 

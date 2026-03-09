@@ -51,11 +51,11 @@ void Patch_Construct( EPatchType type ){
 	PatchInstance::m_counter = &g_patchCount;
 
 	if ( type == ePatchTypeDoom3 ) {
-		MAX_PATCH_WIDTH = MAX_PATCH_HEIGHT = 99;
+		MAX_PATCH_WIDTH = MAX_PATCH_HEIGHT = 75;
 	}
 	else
 	{
-		MAX_PATCH_WIDTH = MAX_PATCH_HEIGHT = 31; // matching q3map2
+		MAX_PATCH_WIDTH = MAX_PATCH_HEIGHT = 75;
 	}
 }
 

@@ -336,7 +336,7 @@
 <targetname key="targetname" name="targetname">Auto-generated</targetname>
 </point>
 
-<point name="info_player_start" color="1 0 1" box="-8 -8 -8 8 8 8">
+<point name="info_player_start" color="1 0 1" box="-8 -8 -8 8 8 8" model="models/info_player_start.fbx">
 ----- KEYS -----
 <angles key="angles" name="angles">Auto-generated</angles>
 <real3 key="origin" name="origin">Auto-generated</real3>
@@ -1133,7 +1133,7 @@
 <string key="StartDisabled" name="StartDisabled">Auto-generated</string>
 </group>
 
-<point name="zipline" color="1 0 1" box="-8 -8 -8 8 8 8">
+<point name="zipline" color="1 0.55 0" box="-5.333 -5.333 -5.333 5.333 5.333 5.333">
 ----- KEYS -----
 <real3 key="_zipline_rest_point_0" name="_zipline_rest_point_0">Auto-generated</real3>
 <real3 key="_zipline_rest_point_1" name="_zipline_rest_point_1">Auto-generated</real3>
@@ -1191,7 +1191,7 @@
 <boolean key="ZiplineVertical" name="ZiplineVertical">Auto-generated</boolean>
 </point>
 
-<point name="zipline_end" color="1 0 1" box="-8 -8 -8 8 8 8">
+<point name="zipline_end" color="1 0.55 0" box="-5.333 -5.333 -5.333 5.333 5.333 5.333">
 ----- KEYS -----
 <string key="link_guid" name="link_guid">Auto-generated</string>
 <real3 key="origin" name="origin">Auto-generated</real3>
@@ -1207,4 +1207,3 @@
 </point>
 
 </classes>
-
