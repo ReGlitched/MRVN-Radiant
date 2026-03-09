@@ -559,10 +559,22 @@ public:
 
 	Resource* capture( const char* path ){
 		//globalOutputStream() << "capture: \"" << path << "\"\n";
+		// Apex Legends entities use "mdl/" paths, but files are under "models/mdl/"
+		if ( string_equal_prefix_nocase( path, "mdl/" ) ) {
+			const auto resolved = StringStream( "models/", path );
+			return m_references.capture( CopiedString( resolved.c_str() ) ).get();
+		}
 		return m_references.capture( CopiedString( path ) ).get();
 	}
 	void release( const char* path ){
-		m_references.release( CopiedString( path ) );
+		// Match the same key transformation as capture()
+		if ( string_equal_prefix_nocase( path, "mdl/" ) ) {
+			const auto resolved = StringStream( "models/", path );
+			m_references.release( CopiedString( resolved.c_str() ) );
+		}
+		else {
+			m_references.release( CopiedString( path ) );
+		}
 		//globalOutputStream() << "release: \"" << path << "\"\n";
 	}
 

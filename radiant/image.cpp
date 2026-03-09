@@ -29,6 +29,7 @@
 #include "generic/reference.h"
 #include "os/path.h"
 #include "stream/stringstream.h"
+#include "string/string.h"
 
 
 typedef Modules<_QERPlugImageTable> ImageModules;
@@ -57,6 +58,12 @@ Image* QERApp_LoadImage( void* environment, const char* name ){
 	};
 
 	Textures_getImageModules().foreachModule( LoadImageVisitor( name, image ) );
+
+	// If not found, try with "textures/" prefix
+	if ( image == 0 && !string_equal_prefix_nocase( name, "textures/" ) && !string_equal_prefix_nocase( name, "textures\\" ) ) {
+		const auto prefixed = StringStream( "textures/", name );
+		Textures_getImageModules().foreachModule( LoadImageVisitor( prefixed.c_str(), image ) );
+	}
 
 	return image;
 }
