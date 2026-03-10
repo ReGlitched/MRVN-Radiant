@@ -78,9 +78,9 @@ void ApexLegends::EmitEntity(const entity_t &e) {
         ) {
         Titanfall::Ent::script.insert(Titanfall::Ent::script.end(), str.begin(), str.end());
         // snd
-    } else if (striEqualPrefix(classname, "ambient_generic")
-            || striEqualPrefix(classname, "trigger_soundscape")
-            || striEqualPrefix(classname, "soundscape_")
+    } else if (striEqualPrefix(e.valueForKey("classname"), "ambient_generic")
+            || striEqualPrefix(e.valueForKey("classname"), "trigger_soundscape")
+            || striEqualPrefix(e.valueForKey("classname"), "soundscape_")
         ) {
         Titanfall::Ent::snd.insert(Titanfall::Ent::snd.end(), str.begin(), str.end());
     // spawn
