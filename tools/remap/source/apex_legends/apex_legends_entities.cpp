@@ -44,6 +44,7 @@
     - env: lights, fog, sky, color entities
     - fx: particle effects
     - script: info_target, prop_dynamic, trigger_hurt
+    - snd: ambient and soundscape entities
     - spawn: info_* entities
     - BSP entity lump: all other entities
 */
@@ -76,7 +77,12 @@ void ApexLegends::EmitEntity(const entity_t &e) {
             || striEqualPrefix(e.valueForKey("classname"), "script_mover")
         ) {
         Titanfall::Ent::script.insert(Titanfall::Ent::script.end(), str.begin(), str.end());
-    // snd
+        // snd
+    } else if (striEqualPrefix(classname, "ambient_generic")
+            || striEqualPrefix(classname, "trigger_soundscape")
+            || striEqualPrefix(classname, "soundscape_")
+        ) {
+        Titanfall::Ent::snd.insert(Titanfall::Ent::snd.end(), str.begin(), str.end());
     // spawn
     } else if (striEqualPrefix(e.valueForKey("classname"), "info_")) {
         Titanfall::Ent::spawn.insert(Titanfall::Ent::spawn.end(), str.begin(), str.end());
