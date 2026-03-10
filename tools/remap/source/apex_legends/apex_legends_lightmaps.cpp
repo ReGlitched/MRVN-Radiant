@@ -72,9 +72,9 @@ constexpr float SUPERSAMPLE_GRADIENT_THRESHOLD = 0.0625f;   // Gradient threshol
 constexpr int SUPERSAMPLE_GRID = 4;                         // 4x4 sub-sample grid per texel
 
 // Ambient occlusion settings for indirect lightmap channel
-constexpr int AO_HEMISPHERE_RAYS = 8;            // Hemisphere ray count for sky AO per texel
+constexpr int AO_HEMISPHERE_RAYS = 48;            // Hemisphere ray count for sky AO per texel
 constexpr float AO_TRACE_DISTANCE = 2048.0f;     // Max trace distance for AO rays
-constexpr float INDIRECT_AMBIENT_SCALE = 0.35f;  // Scale factor for sky ambient in indirect channel
+constexpr float INDIRECT_AMBIENT_SCALE = 0.5f;   // Scale factor for sky ambient in indirect channel
 
 // Light probe settings (adapted from Source SDK leaf_ambient_lighting.cpp)
 constexpr int LIGHT_PROBE_GRID_SPACING = 256;   // Units between probes on grid
@@ -264,24 +264,23 @@ static void InitLightmapAtlas() {
     page.width = MAX_LIGHTMAP_WIDTH;
     page.height = MAX_LIGHTMAP_HEIGHT;
     
-    // Use neutral gray - engine adds dynamic ambient/sun on top
-    // Bias-128 RGBE: finalColor = (RGB/255) * 2^(exp - 128)
-    // exp=128 → 2^0 = 1.0x (neutral), RGB=180 sRGB ≈ 0.45 linear
-    uint8_t neutralValue = 128;  // Mid-gray mantissa in sRGB
-    
+    // Initialize unallocated texels with neutral ambient values.
+    // Official lightmaps use signed exponent byte 0 (multiplier 1.0x) for shadow/ambient.
+    // Computed texels overwrite these; unallocated texels stay at neutral.
+    // Engine requires non-zero lightmap data to enable lightmap rendering.
     size_t dataSize = page.width * page.height * 8;
     page.pixels.resize(dataSize);
     for (size_t i = 0; i < dataSize; i += 8) {
-        // Direct light (bytes 0-3)
-        page.pixels[i + 0] = neutralValue;
-        page.pixels[i + 1] = neutralValue;
-        page.pixels[i + 2] = neutralValue;
-        page.pixels[i + 3] = 128;
-        // Indirect light (bytes 4-7)
-        page.pixels[i + 4] = neutralValue;
-        page.pixels[i + 5] = neutralValue;
-        page.pixels[i + 6] = neutralValue;
-        page.pixels[i + 7] = 255;
+        // Direct light: neutral gray, signed exp=0 (byte 0, multiplier 1.0x)
+        page.pixels[i + 0] = 200;
+        page.pixels[i + 1] = 200;
+        page.pixels[i + 2] = 200;
+        page.pixels[i + 3] = 128;   // signed exp 0 -> 2^0 = 1.0
+        // Indirect light: neutral tinted gray, signed exp=0
+        page.pixels[i + 4] = 130;
+        page.pixels[i + 5] = 130;
+        page.pixels[i + 6] = 150;
+        page.pixels[i + 7] = 128;   // signed exp 0 -> 2^0 = 1.0
     }
     ApexLegends::Bsp::lightmapPages.push_back(page);
     
@@ -684,7 +683,8 @@ static void GatherRadiosityLight(int bounceNum) {
 
 // Forward declarations for sky environment (defined later with light probe code)
 struct SkyEnvironment {
-    Vector3 ambientColor;
+    Vector3 ambientColor;     // Normalized ambient color (0-1)
+    float ambientIntensity;   // Ambient brightness (HDR scale)
     Vector3 sunDir;
     Vector3 sunColor;
     float sunIntensity;
@@ -717,20 +717,23 @@ static TexelLighting_t ComputeLightingAtPoint(const Vector3 &worldPos, const Vec
                                               const SkyEnvironment &sky) {
     TexelLighting_t result;
     result.direct = Vector3(0, 0, 0);
-    result.indirect = Vector3(0, 0, 0);
+    result.indirect = Vector3(1, 1, 1);  // Default: full ambient (1.0 = no occlusion)
 
-    // Sun shadows (direct channel only)
+    Vector3 directLight(0, 0, 0);
+    float aoFactor = 1.0f;
+
+    // Sun: trace shadow ray
     if (sky.valid) {
         Vector3 sunDir = sky.sunDir * -1.0f;
         float sunNdotL = vector3_dot(sampleNormal, sunDir);
         if (sunNdotL > 0) {
             if (!TraceRayAgainstMeshes(worldPos, sunDir, 65536.0f)) {
-                result.direct = result.direct + sky.sunColor * (sunNdotL * sky.sunIntensity);
+                directLight = directLight + sky.sunColor * (sunNdotL * sky.sunIntensity);
             }
         }
     }
 
-    // Static point/spot lights (both channels)
+    // Static point/spot lights with shadow rays
     for (const WorldLight_t &light : ApexLegends::Bsp::worldLights) {
         if (light.type == emit_skyambient || light.type == emit_skylight) continue;
         if (light.flags & WORLDLIGHT_FLAG_REALTIME) continue;
@@ -755,9 +758,7 @@ static TexelLighting_t ComputeLightingAtPoint(const Vector3 &worldPos, const Vec
                 } else {
                     atten = 1.0f / (1.0f + dist * dist * 0.0001f);
                 }
-                Vector3 contribution = light.intensity * NdotL * atten * 100.0f;
-                result.direct = result.direct + contribution;
-                result.indirect = result.indirect + contribution;
+                directLight = directLight + light.intensity * NdotL * atten * 100.0f;
             }
         } else if (light.type == emit_spotlight) {
             Vector3 toLight = lightPos - worldPos;
@@ -776,31 +777,37 @@ static TexelLighting_t ComputeLightingAtPoint(const Vector3 &worldPos, const Vec
                         spotAtten = (spotDot - light.stopdot2) / (light.stopdot - light.stopdot2);
                     }
                     float distAtten = 1.0f / (1.0f + dist * dist * 0.0001f);
-                    Vector3 contribution = light.intensity * NdotL * spotAtten * distAtten * 100.0f;
-                    result.direct = result.direct + contribution;
-                    result.indirect = result.indirect + contribution;
+                    directLight = directLight + light.intensity * NdotL * spotAtten * distAtten * 100.0f;
                 }
             }
         }
     }
 
-    // Add sky ambient with occlusion to indirect channel.
-    // This gives shadowed areas a soft ambient gradient instead of pure black,
-    // so the engine can distinguish open shadow from enclosed space.
+    // AO: hemisphere ray tracing for ambient occlusion
     if (sky.valid) {
         int hemiRays = 0;
         int unoccluded = 0;
-        // Sample a subset of sphere normals in the surface hemisphere
-        for (int i = 0; i < NUM_SPHERE_NORMALS; i += (NUM_SPHERE_NORMALS / AO_HEMISPHERE_RAYS)) {
-            if (vector3_dot(g_SphereNormals[i], sampleNormal) <= 0) continue;
+        int step = std::max(1, NUM_SPHERE_NORMALS / AO_HEMISPHERE_RAYS);
+        for (int i = 0; i < NUM_SPHERE_NORMALS; i += step) {
+            float cosTheta = vector3_dot(g_SphereNormals[i], sampleNormal);
+            if (cosTheta <= 0) continue;
             hemiRays++;
             if (!TraceRayAgainstMeshes(worldPos, g_SphereNormals[i], AO_TRACE_DISTANCE)) {
                 unoccluded++;
             }
         }
-        float aoFactor = (hemiRays > 0) ? (float)unoccluded / hemiRays : 0.5f;
-        result.indirect = result.indirect + sky.ambientColor * (aoFactor * INDIRECT_AMBIENT_SCALE);
+        aoFactor = (hemiRays > 0) ? (float)unoccluded / hemiRays : 1.0f;
+        aoFactor = std::pow(aoFactor, 1.5f);
     }
+
+    // Direct channel: sun + point/spot lights + ambient fill (AO-modulated)
+    // Official data shows shadow direct ~200-250 linear, sunlit ~4M linear
+    Vector3 ambientFill = sky.ambientColor * (sky.ambientIntensity * aoFactor);
+    result.direct = directLight + ambientFill;
+
+    // Indirect channel: ambient/bounce lighting modulated by AO
+    // Official data shows indirect ~130 linear at exp=0
+    result.indirect = sky.ambientColor * (sky.ambientIntensity * aoFactor * INDIRECT_AMBIENT_SCALE);
 
     return result;
 }
@@ -956,7 +963,7 @@ void ApexLegends::ComputeLightmapLighting() {
         // For each texel
         for (int y = 0; y < surf.rect.height; y++) {
             for (int x = 0; x < surf.rect.width; x++) {
-                Vector3 worldPos = ComputeTexelWorldPos(surf, x + 0.5f, y + 0.5f);
+                Vector3 worldPos = ComputeTexelWorldPos(surf, (float)x, (float)y);
                 TexelLighting_t lighting = ComputeLightingAtPoint(worldPos, sampleNormal, sky);
                 
                 // Store in luxel arrays (direct and indirect separately)
@@ -1068,58 +1075,49 @@ void ApexLegends::ComputeLightmapLighting() {
 
 /*
     EncodeHDRTexel
-    Encode a floating-point RGB color to the 8-byte RGBE-style HDR format
+    Encode a floating-point linear RGB color to ColorRGBExp32 format.
     
-    Apex Legends lightmap texel format (4 bytes per sub-texel):
-    - Bytes 0-2: RGB mantissa (0-255, sRGB gamma)
-    - Byte 3: Exponent with bias-128
+    Format (4 bytes): R, G, B mantissa (0-255, linear) + exponent byte.
+    Engine decode: linear = (mantissa / 255) * 2^(byte - 128)
     
-    Decoding formula:
-      finalColor = (RGB / 255) * 2^(exponent - 128)
+    Uses unsigned bias-128 exponent stored in the 4th byte:
+      byte 128 = 2^0   = 1.0x  (neutral)
+      byte 129 = 2^1   = 2.0x  (bright)
+      byte 136 = 2^8   = 256x  (sun direct)
+      byte 127 = 2^-1  = 0.5x  (dim)
+      byte 0   = 2^-128 ≈ 0    (black)
     
-    Examples:
-    - exp=128: multiplier 2^0  = 1.0x  (neutral/normal lighting)
-    - exp=129: multiplier 2^1  = 2.0x  (bright)
-    - exp=130: multiplier 2^2  = 4.0x  (very bright sunlit surface)
-    - exp=127: multiplier 2^-1 = 0.5x  (dim)
-    - exp=0:   multiplier 2^-128 ≈ 0   (black)
-    
-    For simple maps without bounce lighting, direct and indirect are the same.
+    Mantissa is kept in 128..255 range for precision.
 */
 static void EncodeHDRTexel(const Vector3 &color, uint8_t *out) {
-    // Input is in linear HDR space (0.0 to potentially >1.0 for HDR)
-    float maxComponent = std::max({color.x(), color.y(), color.z()});
+    float r = std::max(0.0f, color.x());
+    float g = std::max(0.0f, color.y());
+    float b = std::max(0.0f, color.z());
+    float maxComponent = std::max({r, g, b});
     
-    uint8_t exponent;
-    float scale;
-    
-    if (maxComponent <= 0.001f) {
-        // Near-black: use lowest representable exponent
-        exponent = 0;
-        scale = 1.0f;
-    } else {
-        // Bias-128 RGBE: decode = (RGB/255) * 2^(exp-128)
-        // We need 2^(exp-128) >= maxComponent, so exp >= 128 + log2(maxComponent)
-        int exp = 128 + (int)std::ceil(std::log2(maxComponent));
-        exponent = (uint8_t)std::min(255, std::max(0, exp));
-
-        // Scale factor: divide by 2^(exp-128) to normalize mantissa to 0-1
-        scale = 1.0f / std::pow(2.0f, (float)(exponent - 128));
+    if (maxComponent < 1e-12f) {
+        // Near-black: exponent 0 = 2^-128 ≈ 0
+        out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+        return;
     }
     
-    // Scale color and apply gamma correction (linear to sRGB)
-    float r = std::pow(std::min(1.0f, std::max(0.0f, color.x() * scale)), 1.0f / 2.2f);
-    float g = std::pow(std::min(1.0f, std::max(0.0f, color.y() * scale)), 1.0f / 2.2f);
-    float b = std::pow(std::min(1.0f, std::max(0.0f, color.z() * scale)), 1.0f / 2.2f);
+    // Find exponent such that mantissa = color / 2^(exp-128) falls in 0-255 range
+    // We want mantissa in 128-255 for precision
+    int exp = 128 + (int)std::ceil(std::log2(maxComponent));
+    exp = std::max(0, std::min(255, exp));
     
-    // Direct light (bytes 0-3)
-    out[0] = (uint8_t)(r * 255.0f);
-    out[1] = (uint8_t)(g * 255.0f);
-    out[2] = (uint8_t)(b * 255.0f);
-    out[3] = exponent;
+    // Scale: mantissa = color * 255 / 2^(exp-128)
+    // Equivalent: mantissa = color * 255 * 2^(128-exp)
+    float scale = 255.0f / std::pow(2.0f, (float)(exp - 128));
+    
+    out[0] = (uint8_t)std::min(255, std::max(0, (int)(r * scale + 0.5f)));
+    out[1] = (uint8_t)std::min(255, std::max(0, (int)(g * scale + 0.5f)));
+    out[2] = (uint8_t)std::min(255, std::max(0, (int)(b * scale + 0.5f)));
+    out[3] = (uint8_t)exp;
 }
 
 // Encode both direct and indirect channels into 8-byte output
+// Both channels use the same bias-128 RGBE format
 static void EncodeHDRTexelPair(const Vector3 &directColor, const Vector3 &indirectColor, uint8_t *out) {
     EncodeHDRTexel(directColor, out);      // bytes 0-3: direct
     EncodeHDRTexel(indirectColor, out + 4); // bytes 4-7: indirect
@@ -1165,7 +1163,13 @@ void ApexLegends::EmitLightmaps()
         return;
     }
     
-    // Encode luxels to lightmap pages
+    // Encode luxels to lightmap pages, tracking which pixels were computed
+    std::vector<std::vector<bool>> computedPixels(ApexLegends::Bsp::lightmapPages.size());
+    for (size_t p = 0; p < ApexLegends::Bsp::lightmapPages.size(); p++) {
+        const auto &pg = ApexLegends::Bsp::lightmapPages[p];
+        computedPixels[p].resize((size_t)pg.width * pg.height, false);
+    }
+    
     for (SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
         ApexLegends::LightmapPage_t &page = ApexLegends::Bsp::lightmapPages[surf.rect.pageIndex];
         
@@ -1180,28 +1184,31 @@ void ApexLegends::EmitLightmaps()
                 int offset = (py * page.width + px) * 8;
                 
                 EncodeHDRTexelPair(directColor, indirectColor, &page.pixels[offset]);
+                computedPixels[surf.rect.pageIndex][(size_t)py * page.width + px] = true;
             }
         }
     }
     
     // Dilate (pad) lightmap edges to prevent bilinear filtering from
-    // sampling black unallocated pixels at surface boundaries.
-    // 2 passes of 4-neighbor dilation.
-    for (auto &page : ApexLegends::Bsp::lightmapPages) {
+    // sampling neutral unallocated pixels at surface boundaries.
+    // 2 passes of 4-neighbor dilation using computed-pixel bitmap.
+    for (size_t pi = 0; pi < ApexLegends::Bsp::lightmapPages.size(); pi++) {
+        auto &page = ApexLegends::Bsp::lightmapPages[pi];
+        auto &computed = computedPixels[pi];
         int w = page.width;
         int h = page.height;
         
         for (int pass = 0; pass < 2; pass++) {
             std::vector<uint8_t> dilated = page.pixels;
+            std::vector<bool> newComputed = computed;
             
             for (int y = 0; y < h; y++) {
                 for (int x = 0; x < w; x++) {
+                    if (computed[(size_t)y * w + x]) continue;  // Already has computed data
+                    
                     int off = (y * w + x) * 8;
                     
-                    // Skip pixels that already have data (either channel has non-zero exponent)
-                    if (page.pixels[off + 3] != 0 || page.pixels[off + 7] != 0) continue;
-                    
-                    // Check 4 neighbors for a non-empty pixel to copy from
+                    // Check 4 neighbors for a computed pixel to copy from
                     const int dx[] = {-1, 1, 0, 0};
                     const int dy[] = {0, 0, -1, 1};
                     for (int d = 0; d < 4; d++) {
@@ -1209,9 +1216,10 @@ void ApexLegends::EmitLightmaps()
                         int ny = y + dy[d];
                         if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
                         
-                        int noff = (ny * w + nx) * 8;
-                        if (page.pixels[noff + 3] != 0 || page.pixels[noff + 7] != 0) {
+                        if (computed[(size_t)ny * w + nx]) {
+                            int noff = (ny * w + nx) * 8;
                             memcpy(&dilated[off], &page.pixels[noff], 8);
+                            newComputed[(size_t)y * w + x] = true;
                             break;
                         }
                     }
@@ -1219,6 +1227,7 @@ void ApexLegends::EmitLightmaps()
             }
             
             page.pixels = dilated;
+            computed = newComputed;
         }
     }
     
@@ -1379,9 +1388,10 @@ static bool ParseLightKey(const char *value, Vector3 &outColor, float &outBright
 static SkyEnvironment GetSkyEnvironment() {
     SkyEnvironment sky;
     sky.ambientColor = Vector3(0.65f, 0.55f, 0.45f);  // Default warm outdoor
+    sky.ambientIntensity = 10.5f;                       // Default ambient HDR intensity
     sky.sunDir = Vector3(0.5f, 0.5f, -0.707f);        // Default: sun from upper-right
     sky.sunColor = Vector3(1.0f, 0.95f, 0.85f);       // Default warm sunlight
-    sky.sunIntensity = 1.5f;
+    sky.sunIntensity = 10.5f;                         // Default HDR sun intensity
     sky.valid = false;
     
     bool foundSkyAmbient = false;
@@ -1398,12 +1408,11 @@ static SkyEnvironment GetSkyEnvironment() {
             float brightness;
             if (ParseLightKey(lightValue, lightColor, brightness)) {
                 sky.sunColor = lightColor;
-                // Scale intensity - typical _light brightness ~200-1000
-                // We want sunIntensity to be around 2-4 for good contrast
-                sky.sunIntensity = brightness / 50.0f;
-                sky.sunIntensity = std::min(5.0f, std::max(1.0f, sky.sunIntensity));
+                // Use raw brightness to produce realistic HDR intensity
+                // Official data shows direct sun exponents of 10-20 (linear values 1K-1M)
+                //sky.sunIntensity = brightness;
                 foundSkyLight = true;
-                Sys_Printf("     Found light_environment _light: %s\n", lightValue);
+                Sys_Printf("     Found light_environment _light: %s (intensity=%.1f)\n", lightValue, brightness);
             }
             
             // Get ambient color from _ambient key
@@ -1412,8 +1421,9 @@ static SkyEnvironment GetSkyEnvironment() {
             float ambientBrightness;
             if (ParseLightKey(ambientValue, ambientColor, ambientBrightness)) {
                 sky.ambientColor = ambientColor;
+                //sky.ambientIntensity = ambientBrightness;
                 foundSkyAmbient = true;
-                Sys_Printf("     Found light_environment _ambient: %s\n", ambientValue);
+                Sys_Printf("     Found light_environment _ambient: %s (intensity=%.1f)\n", ambientValue, ambientBrightness);
             }
             
             // Get sun direction from angles or pitch/SunSpreadAngle
@@ -1443,6 +1453,7 @@ static SkyEnvironment GetSkyEnvironment() {
                 sky.ambientColor[0] = light.intensity[0] / maxIntensity;
                 sky.ambientColor[1] = light.intensity[1] / maxIntensity;
                 sky.ambientColor[2] = light.intensity[2] / maxIntensity;
+                sky.ambientIntensity = maxIntensity;
                 foundSkyAmbient = true;
             }
             if (light.type == 3 && !foundSkyLight) {  // emit_skylight (sun)
@@ -1455,15 +1466,14 @@ static SkyEnvironment GetSkyEnvironment() {
                 sky.sunColor[0] = light.intensity[0] / maxIntensity;
                 sky.sunColor[1] = light.intensity[1] / maxIntensity;
                 sky.sunColor[2] = light.intensity[2] / maxIntensity;
-                // Scale intensity - typical emit_skylight has intensity ~200-1000
-                sky.sunIntensity = maxIntensity / 50.0f;
-                sky.sunIntensity = std::min(5.0f, std::max(1.0f, sky.sunIntensity));
+                // Use raw intensity for realistic HDR values
+                sky.sunIntensity = maxIntensity;
                 foundSkyLight = true;
             }
         }
     }
     
-    sky.valid = foundSkyAmbient || foundSkyLight;
+    sky.valid = true;
     
     if (!foundSkyAmbient) {
         Sys_Printf("     Warning: No emit_skyambient found, using default\n");
