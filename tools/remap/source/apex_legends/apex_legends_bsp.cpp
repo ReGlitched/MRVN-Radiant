@@ -265,6 +265,17 @@ void CompileR5BSPFile() {
             Titanfall::EmitOcclusionMeshes(entity);
             continue; // Don't emit as entity
         } else {
+            /* Brush entities (func_brush, etc.) - compile their geometry into a submodel */
+            if (!entity.brushes.empty()) {
+                ApexLegends::BeginModel(entity);
+
+                Shared::MakeMeshes(entity);
+                ApexLegends::EmitMeshes(entity);
+
+                ApexLegends::EmitBVHNode();
+
+                ApexLegends::EndModel();
+            }
         }
 
         ApexLegends::EmitEntity(entity);

@@ -62,6 +62,13 @@ void ApexLegends::BeginModel(entity_t &entity) {
     model.bvhFlags = 0;      // Will be set by EmitBVHNode
     model.origin[0] = model.origin[1] = model.origin[2] = 0.0f;
     model.scale = 1.0f / 65536.0f;  // Default scale
+
+    // Assign "model" "*N" key for non-worldspawn brush entities
+    if (entity.mapEntityNum != 0) {
+        char modelValue[16];
+        sprintf(modelValue, "*%d", (int)(ApexLegends::Bsp::models.size() - 1));
+        entity.setKeyValue("model", modelValue);
+    }
 }
 
 /*
