@@ -283,6 +283,11 @@ void CompileR5BSPFile() {
         #undef ENT_IS
     }
 
+    /* Regenerate worldspawn meshes for vis/lighting passes
+       (Shared::MakeMeshes clears Shared::meshes each call, so the last
+        brush entity's meshes would be left over instead of worldspawn's) */
+    Shared::MakeMeshes(entities[0]);
+
     Shared::MakeVisReferences();
     Shared::visRoot = Shared::MakeVisTree(Shared::visRefs, 1e30f);
     Shared::MergeVisTree(Shared::visRoot);
