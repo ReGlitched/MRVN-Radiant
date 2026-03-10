@@ -283,6 +283,18 @@ void CompileR5BSPFile() {
         #undef ENT_IS
     }
 
+    /* Fix up model.vertexIndex for all models.
+       EmitBVHNode() stored only the collision vertex base; now that all
+       entities have been processed we know the final render vertex count
+       and can compute the correct offset into the combined vertex buffer
+       (render verts followed by collision verts in lump 3). */
+    {
+        uint32_t totalRenderVerts = static_cast<uint32_t>(Titanfall::Bsp::vertices.size());
+        for (ApexLegends::Model_t &model : ApexLegends::Bsp::models) {
+            model.vertexIndex += totalRenderVerts;
+        }
+    }
+
     /* Regenerate worldspawn meshes for vis/lighting passes
        (Shared::MakeMeshes clears Shared::meshes each call, so the last
         brush entity's meshes would be left over instead of worldspawn's) */

@@ -1128,7 +1128,6 @@ void ApexLegends::EmitBVHNode() {
     g_bvhOrigin = center;
     g_bvhScale = bvhScale;
 
-    uint32_t renderVertexCount = static_cast<uint32_t>(Titanfall::Bsp::vertices.size());
     g_modelCollisionVertexBase = static_cast<uint32_t>(ApexLegends::Bsp::collisionVertices.size());
     g_modelPackedVertexBase = static_cast<uint32_t>(ApexLegends::Bsp::packedVertices.size());
 
@@ -1136,7 +1135,9 @@ void ApexLegends::EmitBVHNode() {
     model.origin[1] = center.y();
     model.origin[2] = center.z();
     model.scale = bvhScale;
-    model.vertexIndex = renderVertexCount + g_modelCollisionVertexBase;
+    /* Store collision vertex base only; the final render vertex count
+       is added in CompileR5BSPFile() once all entities are processed. */
+    model.vertexIndex = g_modelCollisionVertexBase;
     model.bvhFlags = 0;
 
     g_bvhBuildNodes.clear();
