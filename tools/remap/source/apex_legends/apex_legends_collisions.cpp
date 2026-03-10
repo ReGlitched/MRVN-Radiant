@@ -139,6 +139,8 @@ namespace {
     float g_bvhScale = 1.0f / 65536.0f;
     uint32_t g_modelPackedVertexBase = 0;
     uint32_t g_modelCollisionVertexBase = 0;
+    uint32_t g_modelBVHNodeBase = 0;
+    uint32_t g_modelBVHLeafBase = 0;
 
     // Map from (surfaceFlags, contentFlags, surfaceName) to surface property index
     // This ensures we don't emit duplicate surface property entries
@@ -924,7 +926,7 @@ namespace {
                 for (size_t i = 0; i < buildNode.staticPropIndices.size() && i < 4; i++) {
                     int spIdx = buildNode.staticPropIndices[i];
                     childTypes[i] = BVH4_TYPE_STATICPROP;
-                    childIndexes[i] = EmitStaticPropLeaf(g_collisionStaticProps[spIdx].propIndex);
+                    childIndexes[i] = EmitStaticPropLeaf(g_collisionStaticProps[spIdx].propIndex) - g_modelBVHLeafBase;
                     childBounds[i] = g_collisionStaticProps[spIdx].bounds;
                 }
 
@@ -947,7 +949,7 @@ namespace {
                 ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType2 = BVH4_TYPE_NONE;
                 ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType3 = BVH4_TYPE_NONE;
 
-                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index0 = EmitLeafDataForType(leafType, buildNode.triangleIndices);
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index0 = EmitLeafDataForType(leafType, buildNode.triangleIndices) - g_modelBVHLeafBase;
                 ApexLegends::Bsp::bvhNodes[bspNodeIndex].index1 = 0;
                 ApexLegends::Bsp::bvhNodes[bspNodeIndex].index2 = 0;
                 ApexLegends::Bsp::bvhNodes[bspNodeIndex].index3 = 0;
@@ -983,10 +985,10 @@ namespace {
 
                 if (buildNode.childIndices[i] >= 0) {
                     if (childType == BVH4_TYPE_NODE) {
-                        childIndex = EmitBVH4Nodes(buildNode.childIndices[i], leafDataOffset);
+                        childIndex = EmitBVH4Nodes(buildNode.childIndices[i], leafDataOffset) - g_modelBVHNodeBase;
                     } else if (childType != BVH4_TYPE_NONE && childType != BVH4_TYPE_EMPTY) {
                         const BVHBuildNode_t& childBuild = g_bvhBuildNodes[buildNode.childIndices[i]];
-                        childIndex = EmitLeafDataForType(childType, childBuild.triangleIndices);
+                        childIndex = EmitLeafDataForType(childType, childBuild.triangleIndices) - g_modelBVHLeafBase;
                     }
                 }
 
@@ -1076,6 +1078,9 @@ void ApexLegends::EmitBVHNode() {
 
     model.bvhNodeIndex = ApexLegends::Bsp::bvhNodes.size();
     model.bvhLeafIndex = ApexLegends::Bsp::bvhLeafDatas.size();
+
+    g_modelBVHNodeBase = static_cast<uint32_t>(model.bvhNodeIndex);
+    g_modelBVHLeafBase = static_cast<uint32_t>(model.bvhLeafIndex);
 
     CollectTrianglesFromMeshes();
 
