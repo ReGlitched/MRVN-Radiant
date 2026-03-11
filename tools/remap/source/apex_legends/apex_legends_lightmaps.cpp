@@ -272,14 +272,14 @@ static void InitLightmapAtlas() {
     page.pixels.resize(dataSize);
     for (size_t i = 0; i < dataSize; i += 8) {
         // Direct light: neutral gray, signed exp=0 (byte 0, multiplier 1.0x)
-        page.pixels[i + 0] = 200;
-        page.pixels[i + 1] = 200;
-        page.pixels[i + 2] = 200;
+        page.pixels[i + 0] = 128;
+        page.pixels[i + 1] = 128;
+        page.pixels[i + 2] = 128;
         page.pixels[i + 3] = 128;   // signed exp 0 -> 2^0 = 1.0
         // Indirect light: neutral tinted gray, signed exp=0
-        page.pixels[i + 4] = 130;
-        page.pixels[i + 5] = 130;
-        page.pixels[i + 6] = 150;
+        page.pixels[i + 4] = 128;
+        page.pixels[i + 5] = 128;
+        page.pixels[i + 6] = 128;
         page.pixels[i + 7] = 128;   // signed exp 0 -> 2^0 = 1.0
     }
     ApexLegends::Bsp::lightmapPages.push_back(page);
