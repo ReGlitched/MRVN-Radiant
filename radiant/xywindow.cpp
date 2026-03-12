@@ -1863,6 +1863,8 @@ void XYWnd::XY_Draw(){
 	gl().glClear( GL_COLOR_BUFFER_BIT );
 
 	extern void Renderer_ResetStats();
+	extern void Renderer_SetStatsEnabled( bool );
+	Renderer_SetStatsEnabled( g_camwindow_globals.m_showStats );
 	Renderer_ResetStats();
 
 	//

@@ -70,6 +70,8 @@
 #include <QOpenGLWidget>
 
 #include <QApplication>
+#include <QElapsedTimer>
+#include <QTimer>
 #include <set>
 
 // https://stackoverflow.com/questions/42566421/how-to-queue-lambda-function-into-qts-event-loop/42566867#42566867
@@ -94,6 +96,7 @@ class IdleDraw2 : public QObject
 	bool m_running{};
 	bool m_queued{};
 	bool m_redrawDo{};
+	QElapsedTimer m_frameTimer;
 
 	void invoke(){
 		if( !m_running ){
@@ -112,6 +115,7 @@ class IdleDraw2 : public QObject
 		m_queued = false;
 		m_redrawDo = false;
 
+		m_frameTimer.start();
 		doLoop();
 	}
 public:
@@ -136,8 +140,19 @@ public:
 		doLoop();
 	}
 	void doLoop(){
-		if( m_loopFunc != Callback() )
-			queueDraw( Callback(), true );
+		if( m_loopFunc != Callback() ){
+			const int elapsed = m_frameTimer.isValid() ? m_frameTimer.elapsed() : 16;
+			const int delay = 16 - elapsed; // ~60 FPS cap
+			if( delay <= 0 ){
+				queueDraw( Callback(), true );
+			}
+			else{
+				QTimer::singleShot( delay, this, [this](){
+					if( m_loopFunc != Callback() )
+						queueDraw( Callback(), true );
+				} );
+			}
+		}
 	}
 	void breakLoop(){
 		m_loopFunc = {};
@@ -1964,20 +1979,22 @@ public:
 		m_state_stack.back().m_lights = &lights;
 	}
 	void addRenderable( const OpenGLRenderable& renderable, const Matrix4& world ){
-		if ( m_state_stack.back().m_highlight & ePrimitive ) {
-			m_state_select0->addRenderable( renderable, world, m_state_stack.back().m_lights );
+		const auto& state = m_state_stack.back();
+		if ( state.m_highlight ) {
+			if ( state.m_highlight & ePrimitive ) {
+				m_state_select0->addRenderable( renderable, world, state.m_lights );
+			}
+			else if ( m_state_wire && state.m_highlight & ePrimitiveWire ) {
+				m_state_wire->addRenderable( renderable, world, state.m_lights );
+			}
+			if ( m_state_select1 && state.m_highlight & eFace ) {
+				m_state_select1->addRenderable( renderable, world, state.m_lights );
+			}
+			if ( m_state_facewire && state.m_highlight & eFaceWire ) {
+				m_state_facewire->addRenderable( renderable, world, state.m_lights );
+			}
 		}
-		else if ( m_state_wire && m_state_stack.back().m_highlight & ePrimitiveWire ) {
-			m_state_wire->addRenderable( renderable, world, m_state_stack.back().m_lights );
-		}
-		if ( m_state_select1 && m_state_stack.back().m_highlight & eFace ) {
-			m_state_select1->addRenderable( renderable, world, m_state_stack.back().m_lights );
-		}
-		if ( m_state_facewire && m_state_stack.back().m_highlight & eFaceWire ) {
-			m_state_facewire->addRenderable( renderable, world, m_state_stack.back().m_lights );
-		}
-
-		m_state_stack.back().m_state->addRenderable( renderable, world, m_state_stack.back().m_lights );
+		state.m_state->addRenderable( renderable, world, state.m_lights );
 	}
 
 	void render( const Matrix4& modelview, const Matrix4& projection ){
@@ -2107,6 +2124,8 @@ void CamWnd::Cam_Draw(){
 	gl().glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 
 	extern void Renderer_ResetStats();
+	extern void Renderer_SetStatsEnabled( bool );
+	Renderer_SetStatsEnabled( g_camwindow_globals.m_showStats );
 	Renderer_ResetStats();
 	extern void Cull_ResetStats();
 	Cull_ResetStats();

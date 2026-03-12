@@ -2246,21 +2246,12 @@ public:
 	}
 
 
-	void update_faces_wireframe( Array<PointVertex>& wire, const bool* faces_visible ) const {
-		std::size_t count = 0;
+	void update_faces_wireframe( RenderablePointVector& wire, const bool* faces_visible ) const {
+		wire.clear();
 		for ( std::size_t i = 0; i < m_faceCentroidPoints.size(); ++i )
 		{
 			if ( faces_visible[i] ) {
-				++count;
-			}
-		}
-
-		wire.resize( count );
-		Array<PointVertex>::iterator p = wire.begin();
-		for ( std::size_t i = 0; i < m_faceCentroidPoints.size(); ++i )
-		{
-			if ( faces_visible[i] ) {
-				*p++ = m_faceCentroidPoints[i];
+				wire.push_back( m_faceCentroidPoints[i] );
 			}
 		}
 	}
@@ -3419,8 +3410,7 @@ class BrushInstance :
 	mutable RenderableWireframe m_render_wireframe;
 	mutable RenderablePointVector m_render_selected;
 	mutable AABB m_aabb_component;
-	mutable Array<PointVertex> m_faceCentroidPointsCulled;
-	RenderablePointArray<PointVertex> m_render_faces_wireframe;
+	mutable RenderablePointVector m_render_faces_wireframe;
 	mutable bool m_viewChanged;   // requires re-evaluation of view-dependent cached data
 
 	BrushClipPlane m_clipPlane;
@@ -3450,7 +3440,7 @@ public:
 		m_brush( brush ),
 		m_selectable( SelectedChangedCaller( *this ) ),
 		m_render_selected( GL_POINTS ),
-		m_render_faces_wireframe( m_faceCentroidPointsCulled, GL_POINTS ),
+		m_render_faces_wireframe( GL_POINTS ),
 		m_viewChanged( false ),
 		m_transform( Brush::TransformChangedCaller( m_brush ), ApplyTransformCaller( *this ) ){
 		m_brush.instanceAttach( Instance::path() );
@@ -3618,7 +3608,11 @@ public:
 			m_viewChanged = false;
 
 			bool faces_visible[c_brush_maxFaces];
-			{
+
+			if ( volume.TestAABB( m_brush.localAABB(), localToWorld ) == c_volumeInside ) {
+				std::fill_n( faces_visible, m_faceInstances.size(), true );
+			}
+			else {
 				bool* j = faces_visible;
 				for ( FaceInstances::const_iterator i = m_faceInstances.begin(); i != m_faceInstances.end(); ++i, ++j )
 				{
@@ -3627,7 +3621,7 @@ public:
 			}
 
 			m_brush.update_wireframe( m_render_wireframe, faces_visible );
-			m_brush.update_faces_wireframe( m_faceCentroidPointsCulled, faces_visible );
+			m_brush.update_faces_wireframe( m_render_faces_wireframe, faces_visible );
 		}
 	}
 
@@ -3653,7 +3647,8 @@ public:
 
 		if ( volume.fill() && GlobalSelectionSystem().ComponentMode() == SelectionSystem::eFace ) {
 			evaluateViewDependent( volume, localToWorld );
-			renderer.addRenderable( m_render_faces_wireframe, localToWorld );
+			if ( !m_render_faces_wireframe.empty() )
+				renderer.addRenderable( m_render_faces_wireframe, localToWorld );
 		}
 		else
 		{
