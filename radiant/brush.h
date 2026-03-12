@@ -89,45 +89,39 @@ inline void Winding_DrawWireframe( const Winding& winding ){
 inline void Winding_Draw( const Winding& winding, const Vector3& normal, RenderStateFlags state ){
 	gl().glVertexPointer( 3, GL_DOUBLE, sizeof( WindingVertex ), &winding.points.data()->vertex );
 
-	Vector3 normals[c_brush_maxFaces];
-
 	if ( ( state & RENDER_BUMP ) != 0 ) {
-		typedef Vector3* Vector3Iter;
-		for ( Vector3Iter i = normals, end = normals + winding.numpoints; i != end; ++i )
+		Vector3 normals[64]; // faces rarely exceed 64 vertices
+		const std::size_t n = std::min( winding.numpoints, std::size_t( 64 ) );
+		for ( std::size_t i = 0; i < n; ++i )
 		{
-			*i = normal;
+			normals[i] = normal;
 		}
 		gl().glNormalPointer( GL_FLOAT, sizeof( Vector3 ), normals );
 		gl().glVertexAttribPointer( c_attr_TexCoord0, 2, GL_FLOAT, 0, sizeof( WindingVertex ), &winding.points.data()->texcoord );
 		gl().glVertexAttribPointer( c_attr_Tangent, 3, GL_FLOAT, 0, sizeof( WindingVertex ), &winding.points.data()->tangent );
 		gl().glVertexAttribPointer( c_attr_Binormal, 3, GL_FLOAT, 0, sizeof( WindingVertex ), &winding.points.data()->bitangent );
+		gl().glDrawArrays( GL_TRIANGLE_FAN, 0, GLsizei( n ) );
 	}
-	else
-	{
-		if ( state & RENDER_LIGHTING ) {
-			typedef Vector3* Vector3Iter;
-			for ( Vector3Iter i = normals, last = normals + winding.numpoints; i != last; ++i )
-			{
-				*i = normal;
-			}
-			gl().glNormalPointer( GL_FLOAT, sizeof( Vector3 ), normals );
+	else if ( state & RENDER_LIGHTING ) {
+		Vector3 normals[64];
+		const std::size_t n = std::min( winding.numpoints, std::size_t( 64 ) );
+		for ( std::size_t i = 0; i < n; ++i )
+		{
+			normals[i] = normal;
 		}
+		gl().glNormalPointer( GL_FLOAT, sizeof( Vector3 ), normals );
 
 		if ( state & RENDER_TEXTURE ) {
 			gl().glTexCoordPointer( 2, GL_FLOAT, sizeof( WindingVertex ), &winding.points.data()->texcoord );
 		}
-	}
-#if 0
-	if ( state & RENDER_FILL ) {
 		gl().glDrawArrays( GL_TRIANGLE_FAN, 0, GLsizei( winding.numpoints ) );
 	}
-	else
-	{
-		gl().glDrawArrays( GL_LINE_LOOP, 0, GLsizei( winding.numpoints ) );
+	else {
+		if ( state & RENDER_TEXTURE ) {
+			gl().glTexCoordPointer( 2, GL_FLOAT, sizeof( WindingVertex ), &winding.points.data()->texcoord );
+		}
+		gl().glDrawArrays( GL_TRIANGLE_FAN, 0, GLsizei( winding.numpoints ) );
 	}
-#else
-	gl().glDrawArrays( GL_POLYGON, 0, GLsizei( winding.numpoints ) );
-#endif
 
 #if 0
 	const Winding& winding = winding;
@@ -2855,15 +2849,21 @@ public:
 		return m_face->intersectVolume( volume, localToWorld );
 	}
 
-	void render( Renderer& renderer, const VolumeTest& volume, const Matrix4& localToWorld ) const {
-		if ( !m_face->isFiltered() && m_face->contributes() && intersectVolume( volume, localToWorld ) ) {
-			renderer.PushState();
-			renderer.Highlight( Renderer::ePrimitiveWire );
+	void render( Renderer& renderer, const VolumeTest& volume, const Matrix4& localToWorld, bool skipIntersectTest = false ) const {
+		if ( !m_face->isFiltered() && m_face->contributes() && ( skipIntersectTest || intersectVolume( volume, localToWorld ) ) ) {
 			if ( selectedComponents() ) {
+				renderer.PushState();
+				renderer.Highlight( Renderer::ePrimitiveWire );
 				renderer.Highlight( Renderer::EHighlightMode( Renderer::eFace | Renderer::eFaceWire ) );
+				m_face->render( renderer, localToWorld );
+				renderer.PopState();
 			}
-			m_face->render( renderer, localToWorld );
-			renderer.PopState();
+			else {
+				renderer.PushState();
+				renderer.Highlight( Renderer::ePrimitiveWire );
+				m_face->render( renderer, localToWorld );
+				renderer.PopState();
+			}
 		}
 	}
 
@@ -3687,10 +3687,13 @@ public:
 
 		m_lightList->evaluateLights();
 
+		// If the brush AABB is fully inside the view frustum, skip per-face plane tests
+		const bool brushFullyVisible = ( volume.TestAABB( m_brush.localAABB(), localToWorld ) == c_volumeInside );
+
 		for ( FaceInstances::const_iterator i = m_faceInstances.begin(); i != m_faceInstances.end(); ++i )
 		{
 			renderer.setLights( ( *i ).m_lights );
-			( *i ).render( renderer, volume, localToWorld );
+			( *i ).render( renderer, volume, localToWorld, brushFullyVisible );
 		}
 
 		renderComponentsSelected( renderer, volume, localToWorld );

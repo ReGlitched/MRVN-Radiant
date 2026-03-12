@@ -1935,6 +1935,7 @@ public:
 		m_viewer( viewer ){
 		ASSERT_NOTNULL( select0 );
 	//	ASSERT_NOTNULL( select1 );
+		m_state_stack.reserve( 8 );
 		m_state_stack.push_back( state_type() );
 	}
 
