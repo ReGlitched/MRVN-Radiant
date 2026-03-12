@@ -253,7 +253,6 @@ void Shared::MakeVisReferences() {
         ref.index = i;
     }
 
-    /* Props */
     Sys_Printf("%9zu shared vis references\n", Shared::visRefs.size());
 }
 

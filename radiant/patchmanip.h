@@ -65,3 +65,15 @@ void Patch_FlipTextureX();
 void Patch_FlipTextureY();
 
 extern class PatchCreator* g_patchCreator;
+
+bool Patch_TerrainTool_IsActive();
+int Patch_TerrainTool_GetBrushRadius();
+void Patch_TerrainTool_Disable();
+bool Patch_TerrainTool_XYMouseDown( int viewType, const Vector3& point );
+bool Patch_TerrainTool_XYMouseMove( int viewType, const Vector3& point, bool leftButtonDown );
+bool Patch_TerrainTool_XYMouseUp();
+bool Patch_TerrainTool_CamMouseDown( const Vector3& rayOrigin, const Vector3& rayDirection );
+bool Patch_TerrainTool_CamMouseMove( const Vector3& rayOrigin, const Vector3& rayDirection, bool leftButtonDown );
+bool Patch_TerrainTool_CamMouseUp();
+void Patch_TerrainTool_CamHover( const Vector3& rayOrigin, const Vector3& rayDirection );
+bool Patch_TerrainTool_GetPreviewPoint( Vector3& point );

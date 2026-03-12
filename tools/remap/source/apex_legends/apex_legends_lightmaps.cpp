@@ -42,6 +42,7 @@
 #include "apex_legends.h"
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -60,28 +61,27 @@ constexpr float LIGHTMAP_SAMPLE_SIZE = 16.0f;
 constexpr int MIN_LIGHTMAP_WIDTH = 4;
 constexpr int MIN_LIGHTMAP_HEIGHT = 4;
 
-// =============================================================================
-// ENHANCED LIGHTING FEATURES (adapted from Source SDK VRAD concepts)
-// =============================================================================
-
-// Supersampling settings
-constexpr int SUPERSAMPLE_LEVEL = 2;        // 2x2 = 4 samples per texel (set to 1 to disable)
-constexpr float SUPERSAMPLE_JITTER = 0.25f; // Jitter amount for AA samples
-
 // Radiosity settings
-constexpr int RADIOSITY_BOUNCES = 2;        // Number of light bounces (0 = direct only)
+constexpr int RADIOSITY_BOUNCES = 0;        // Number of light bounces (0 = direct only)
 constexpr float RADIOSITY_SCALE = 0.5f;     // Energy retention per bounce
 constexpr int RADIOSITY_SAMPLES = 32;       // Hemisphere samples for indirect lighting
 
-// Phong shading settings (smooth normal interpolation)
-constexpr float PHONG_ANGLE_THRESHOLD = 45.0f;  // Degrees - edges sharper than this won't smooth
-constexpr float SMOOTHING_GROUP_HARD_EDGE = 0.707f;  // cos(45 degrees)
+// Adaptive supersampling settings (from Source SDK vrad2 ComputeLightmapGradients/BuildSupersampleFaceLights)
+constexpr int SUPERSAMPLE_PASSES = 2;                       // Max iterative refinement passes
+constexpr float SUPERSAMPLE_GRADIENT_THRESHOLD = 0.0625f;   // Gradient threshold to trigger supersampling
+constexpr int SUPERSAMPLE_GRID = 4;                         // 4x4 sub-sample grid per texel
+
+// Ambient occlusion settings for indirect lightmap channel
+constexpr int AO_HEMISPHERE_RAYS = 48;            // Hemisphere ray count for sky AO per texel
+constexpr float AO_TRACE_DISTANCE = 2048.0f;     // Max trace distance for AO rays
+constexpr float INDIRECT_AMBIENT_SCALE = 0.5f;   // Scale factor for sky ambient in indirect channel
 
 // Light probe settings (adapted from Source SDK leaf_ambient_lighting.cpp)
 constexpr int LIGHT_PROBE_GRID_SPACING = 256;   // Units between probes on grid
 constexpr int LIGHT_PROBE_MIN_SPACING = 128;    // Minimum spacing between probes
 constexpr int LIGHT_PROBE_MAX_PER_AXIS = 64;    // Max probes per axis (prevent explosion)
-constexpr float LIGHT_PROBE_TRACE_DIST = 16384.0f;  // Ray trace distance
+constexpr int LIGHT_PROBE_MAX_COUNT = -1;       // Maximum total light probes (-1 = unlimited)
+constexpr float LIGHT_PROBE_TRACE_DIST = 64000.0f;  // Ray trace distance
 
 
 // =============================================================================
@@ -189,62 +189,7 @@ static const Vector3 g_BoxDirections[6] = {
 };
 
 
-/*
-    EdgeKey_t
-    Hash key for edge lookup (vertex pair, order-independent)
-*/
-struct EdgeKey_t {
-    uint64_t v0, v1;  // Sorted vertex indices
-    
-    EdgeKey_t(size_t a, size_t b) {
-        if (a < b) { v0 = a; v1 = b; }
-        else { v0 = b; v1 = a; }
-    }
-    
-    bool operator==(const EdgeKey_t &other) const {
-        return v0 == other.v0 && v1 == other.v1;
-    }
-};
 
-struct EdgeKeyHash {
-    size_t operator()(const EdgeKey_t &k) const {
-        return std::hash<uint64_t>()(k.v0) ^ (std::hash<uint64_t>()(k.v1) << 1);
-    }
-};
-
-
-/*
-    EdgeShare_t
-    Tracks faces that share an edge (for smooth normal interpolation)
-    Adapted from Source SDK's edgeshare_t
-*/
-struct EdgeShare_t {
-    int meshIndex[2];           // Indices of meshes sharing this edge
-    int triangleIndex[2];       // Triangle indices within each mesh
-    Vector3 interfaceNormal;    // Blended normal at the edge
-    bool coplanar;              // Are the faces coplanar?
-    int numFaces;               // How many faces share this edge (1 or 2)
-};
-
-
-/*
-    FaceNeighbor_t
-    Per-mesh neighbor information for smooth shading
-    Adapted from Source SDK's faceneighbor_t
-*/
-struct FaceNeighbor_t {
-    std::vector<int> neighborMeshes;    // Neighboring meshes that share vertices
-    std::vector<Vector3> vertexNormals; // Smoothed normal per vertex
-    Vector3 faceNormal;                 // Flat face normal
-};
-
-
-// Global edge sharing data for phong shading
-namespace PhongData {
-    std::unordered_map<EdgeKey_t, EdgeShare_t, EdgeKeyHash> edgeShare;
-    std::vector<FaceNeighbor_t> faceNeighbors;
-    bool initialized = false;
-}
 
 
 // Global radiosity patch data
@@ -289,8 +234,8 @@ struct SurfaceLightmap_t {
     Vector3 bitangent;          // V direction in world space
     float uMin, uMax;           // Tangent-space U bounds (for proper UV normalization)
     float vMin, vMax;           // Tangent-space V bounds (for proper UV normalization)
-    std::vector<Vector3> luxels; // Per-texel lighting values (RGB HDR)
-    std::vector<Vector3> luxelNormals;  // Per-texel interpolated normals (for phong shading)
+    std::vector<Vector3> luxels;         // Per-texel direct lighting (RGB HDR)
+    std::vector<Vector3> indirectLuxels;  // Per-texel indirect/ambient lighting (RGB HDR)
 };
 
 
@@ -319,22 +264,23 @@ static void InitLightmapAtlas() {
     page.width = MAX_LIGHTMAP_WIDTH;
     page.height = MAX_LIGHTMAP_HEIGHT;
     
-    // Use neutral gray - engine adds dynamic ambient/sun on top
-    // This is the base that indirect/bounced lighting would add to
-    uint8_t neutralValue = 128;  // Neutral gray (0.5 after gamma)
-    
+    // Initialize unallocated texels with neutral ambient values.
+    // Official lightmaps use signed exponent byte 0 (multiplier 1.0x) for shadow/ambient.
+    // Computed texels overwrite these; unallocated texels stay at neutral.
+    // Engine requires non-zero lightmap data to enable lightmap rendering.
     size_t dataSize = page.width * page.height * 8;
     page.pixels.resize(dataSize);
     for (size_t i = 0; i < dataSize; i += 8) {
-        // Neutral base - dynamic lighting adds on top
-        page.pixels[i + 0] = neutralValue;
-        page.pixels[i + 1] = neutralValue;
-        page.pixels[i + 2] = neutralValue;
-        page.pixels[i + 3] = 255;  // A
-        page.pixels[i + 4] = neutralValue;
-        page.pixels[i + 5] = neutralValue;
-        page.pixels[i + 6] = neutralValue;
-        page.pixels[i + 7] = 128;  // Neutral multiplier
+        // Direct light: neutral gray, signed exp=0 (byte 0, multiplier 1.0x)
+        page.pixels[i + 0] = 128;
+        page.pixels[i + 1] = 128;
+        page.pixels[i + 2] = 128;
+        page.pixels[i + 3] = 128;   // signed exp 0 -> 2^0 = 1.0
+        // Indirect light: neutral tinted gray, signed exp=0
+        page.pixels[i + 4] = 128;
+        page.pixels[i + 5] = 128;
+        page.pixels[i + 6] = 128;
+        page.pixels[i + 7] = 128;   // signed exp 0 -> 2^0 = 1.0
     }
     ApexLegends::Bsp::lightmapPages.push_back(page);
     
@@ -346,7 +292,6 @@ static void InitLightmapAtlas() {
     LightmapBuild::pageCursorY = 0;
     LightmapBuild::pageRowHeight = 0;
 }
-
 
 /*
     AllocateLightmapRect
@@ -531,7 +476,7 @@ void ApexLegends::SetupSurfaceLightmaps() {
         surfLM.vMin = vMin;
         surfLM.vMax = vMax;
         surfLM.luxels.resize(rect.width * rect.height, Vector3(0, 0, 0));
-        surfLM.luxelNormals.resize(rect.width * rect.height, plane.normal());
+        surfLM.indirectLuxels.resize(rect.width * rect.height, Vector3(0, 0, 0));
         
         LightmapBuild::surfaces.push_back(surfLM);
         litSurfaces++;
@@ -544,229 +489,14 @@ void ApexLegends::SetupSurfaceLightmaps() {
 
 
 // =============================================================================
-// PHONG SHADING / SMOOTH NORMAL INTERPOLATION
-// Adapted from Source SDK VRAD's PairEdges() and GetPhongNormal()
-// =============================================================================
-
-/*
-    BuildEdgeSharing
-    Build edge-to-face mapping for smooth normal interpolation across mesh edges.
-    This allows lighting to smoothly transition across connected surfaces.
-*/
-static void BuildEdgeSharing() {
-    if (PhongData::initialized) return;
-    
-    Sys_Printf("     Building edge sharing for smooth normals...\n");
-    
-    PhongData::edgeShare.clear();
-    PhongData::faceNeighbors.clear();
-    PhongData::faceNeighbors.resize(Shared::meshes.size());
-    
-    // Build edge map: for each edge, track which meshes/triangles use it
-    for (size_t meshIdx = 0; meshIdx < Shared::meshes.size(); meshIdx++) {
-        const Shared::Mesh_t &mesh = Shared::meshes[meshIdx];
-        
-        // Skip non-lit surfaces
-        if (!CHECK_FLAG(mesh.shaderInfo->surfaceFlags, S_VERTEX_LIT_BUMP)) {
-            continue;
-        }
-        
-        // Compute face normal
-        Vector3 faceNormal(0, 0, 1);
-        if (mesh.triangles.size() >= 3) {
-            const Vector3 &v0 = mesh.vertices[mesh.triangles[0]].xyz;
-            const Vector3 &v1 = mesh.vertices[mesh.triangles[1]].xyz;
-            const Vector3 &v2 = mesh.vertices[mesh.triangles[2]].xyz;
-            faceNormal = vector3_normalised(vector3_cross(v1 - v0, v2 - v0));
-        }
-        PhongData::faceNeighbors[meshIdx].faceNormal = faceNormal;
-        PhongData::faceNeighbors[meshIdx].vertexNormals.resize(mesh.vertices.size(), faceNormal);
-        
-        // Process each triangle's edges
-        for (size_t i = 0; i + 2 < mesh.triangles.size(); i += 3) {
-            int triIdx = static_cast<int>(i / 3);
-            
-            // Three edges per triangle
-            for (int e = 0; e < 3; e++) {
-                size_t idx0 = mesh.triangles[i + e];
-                size_t idx1 = mesh.triangles[i + ((e + 1) % 3)];
-                
-                // Create a unique key based on vertex positions (quantized)
-                const Vector3 &p0 = mesh.vertices[idx0].xyz;
-                const Vector3 &p1 = mesh.vertices[idx1].xyz;
-                
-                // Quantize positions to handle floating point imprecision
-                auto quantize = [](const Vector3 &v) -> uint64_t {
-                    int32_t x = static_cast<int32_t>(v.x() * 8.0f);
-                    int32_t y = static_cast<int32_t>(v.y() * 8.0f);
-                    int32_t z = static_cast<int32_t>(v.z() * 8.0f);
-                    return (static_cast<uint64_t>(x & 0xFFFFF) << 40) |
-                           (static_cast<uint64_t>(y & 0xFFFFF) << 20) |
-                           (static_cast<uint64_t>(z & 0xFFFFF));
-                };
-                
-                EdgeKey_t key(quantize(p0), quantize(p1));
-                
-                auto it = PhongData::edgeShare.find(key);
-                if (it == PhongData::edgeShare.end()) {
-                    // New edge
-                    EdgeShare_t share;
-                    share.meshIndex[0] = static_cast<int>(meshIdx);
-                    share.meshIndex[1] = -1;
-                    share.triangleIndex[0] = triIdx;
-                    share.triangleIndex[1] = -1;
-                    share.interfaceNormal = faceNormal;
-                    share.coplanar = false;
-                    share.numFaces = 1;
-                    PhongData::edgeShare[key] = share;
-                } else {
-                    // Existing edge - add second face
-                    EdgeShare_t &share = it->second;
-                    if (share.numFaces == 1 && share.meshIndex[0] != static_cast<int>(meshIdx)) {
-                        share.meshIndex[1] = static_cast<int>(meshIdx);
-                        share.triangleIndex[1] = triIdx;
-                        share.numFaces = 2;
-                        
-                        // Check if faces are smooth (angle less than threshold)
-                        Vector3 otherNormal = PhongData::faceNeighbors[share.meshIndex[0]].faceNormal;
-                        float dot = vector3_dot(faceNormal, otherNormal);
-                        
-                        if (dot > SMOOTHING_GROUP_HARD_EDGE) {
-                            // Smooth edge - blend normals
-                            share.interfaceNormal = vector3_normalised(faceNormal + otherNormal);
-                            share.coplanar = (dot > 0.999f);
-                            
-                            // Track as neighbors
-                            PhongData::faceNeighbors[meshIdx].neighborMeshes.push_back(share.meshIndex[0]);
-                            PhongData::faceNeighbors[share.meshIndex[0]].neighborMeshes.push_back(static_cast<int>(meshIdx));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Now compute smoothed vertex normals by averaging neighbor contributions
-    for (size_t meshIdx = 0; meshIdx < Shared::meshes.size(); meshIdx++) {
-        FaceNeighbor_t &fn = PhongData::faceNeighbors[meshIdx];
-        if (fn.neighborMeshes.empty()) continue;
-        
-        const Shared::Mesh_t &mesh = Shared::meshes[meshIdx];
-        
-        for (size_t vIdx = 0; vIdx < mesh.vertices.size(); vIdx++) {
-            const Vector3 &pos = mesh.vertices[vIdx].xyz;
-            Vector3 smoothNormal = fn.faceNormal;
-            float totalWeight = 1.0f;
-            
-            // Check neighbor meshes for shared vertices
-            for (int neighborIdx : fn.neighborMeshes) {
-                const Shared::Mesh_t &neighbor = Shared::meshes[neighborIdx];
-                const FaceNeighbor_t &neighborFN = PhongData::faceNeighbors[neighborIdx];
-                
-                // Find vertices at the same position
-                for (size_t nv = 0; nv < neighbor.vertices.size(); nv++) {
-                    Vector3 diff = neighbor.vertices[nv].xyz - pos;
-                    if (vector3_length(diff) < 0.5f) {
-                        // Same vertex - blend normals
-                        float weight = 1.0f;
-                        smoothNormal = smoothNormal + neighborFN.faceNormal * weight;
-                        totalWeight += weight;
-                        break;
-                    }
-                }
-            }
-            
-            fn.vertexNormals[vIdx] = vector3_normalised(smoothNormal);
-        }
-    }
-    
-    PhongData::initialized = true;
-    Sys_Printf("     Built %zu shared edges\n", PhongData::edgeShare.size());
-}
-
-
-/*
-    GetPhongNormal
-    Get interpolated (phong) normal at a world position on a surface.
-    Adapted from Source SDK's GetPhongNormal().
-*/
-static Vector3 GetPhongNormal(int meshIndex, const Vector3 &worldPos, const Vector3 &flatNormal) {
-    if (!PhongData::initialized || meshIndex < 0 || meshIndex >= static_cast<int>(PhongData::faceNeighbors.size())) {
-        return flatNormal;
-    }
-    
-    const FaceNeighbor_t &fn = PhongData::faceNeighbors[meshIndex];
-    if (fn.neighborMeshes.empty()) {
-        return flatNormal;  // No neighbors - use flat normal
-    }
-    
-    const Shared::Mesh_t &mesh = Shared::meshes[meshIndex];
-    if (mesh.vertices.empty() || mesh.triangles.size() < 3) {
-        return flatNormal;
-    }
-    
-    // Find the triangle containing this point and interpolate vertex normals
-    for (size_t i = 0; i + 2 < mesh.triangles.size(); i += 3) {
-        const Vector3 &v0 = mesh.vertices[mesh.triangles[i]].xyz;
-        const Vector3 &v1 = mesh.vertices[mesh.triangles[i + 1]].xyz;
-        const Vector3 &v2 = mesh.vertices[mesh.triangles[i + 2]].xyz;
-        
-        // Compute barycentric coordinates
-        Vector3 edge0 = v1 - v0;
-        Vector3 edge1 = v2 - v0;
-        Vector3 vp = worldPos - v0;
-        
-        float d00 = vector3_dot(edge0, edge0);
-        float d01 = vector3_dot(edge0, edge1);
-        float d11 = vector3_dot(edge1, edge1);
-        float d20 = vector3_dot(vp, edge0);
-        float d21 = vector3_dot(vp, edge1);
-        
-        float denom = d00 * d11 - d01 * d01;
-        if (std::abs(denom) < 0.0001f) continue;
-        
-        float v = (d11 * d20 - d01 * d21) / denom;
-        float w = (d00 * d21 - d01 * d20) / denom;
-        float u = 1.0f - v - w;
-        
-        // Check if point is in this triangle (with some tolerance)
-        if (u >= -0.1f && v >= -0.1f && w >= -0.1f && u <= 1.1f && v <= 1.1f && w <= 1.1f) {
-            // Interpolate vertex normals
-            const Vector3 &n0 = fn.vertexNormals[mesh.triangles[i]];
-            const Vector3 &n1 = fn.vertexNormals[mesh.triangles[i + 1]];
-            const Vector3 &n2 = fn.vertexNormals[mesh.triangles[i + 2]];
-            
-            Vector3 interpNormal = n0 * u + n1 * v + n2 * w;
-            return vector3_normalised(interpNormal);
-        }
-    }
-    
-    return flatNormal;
-}
-
-
-// =============================================================================
-// SUPERSAMPLING
-// Take multiple samples per texel and average for anti-aliased lighting
-// =============================================================================
-
-// Jitter offsets for 2x2 supersampling (rotated grid pattern)
-static const float supersampleOffsets[4][2] = {
-    { -0.25f, -0.125f },
-    {  0.25f, -0.375f },
-    { -0.125f, 0.375f },
-    {  0.375f, 0.125f }
-};
-
-
-// =============================================================================
 // RADIOSITY / BOUNCE LIGHTING
 // Compute indirect illumination from light bouncing off surfaces
 // =============================================================================
 
 /*
     InitRadiosityPatches
-    Create patches from all lightmap luxels for radiosity computation
+    Create patches from all lightmap luxels for radiosity computation.
+    Now uses actual texture colors for surface reflectivity to enable color bleeding.
 */
 static void InitRadiosityPatches() {
     if (RadiosityData::initialized) return;
@@ -776,12 +506,27 @@ static void InitRadiosityPatches() {
     for (const SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
         const Shared::Mesh_t &mesh = Shared::meshes[surf.meshIndex];
         
-        // Get surface reflectivity from shader (approximate from texture name)
-        Vector3 reflectivity(0.5f, 0.5f, 0.5f);  // Default 50% reflectance
+        // Get surface reflectivity from texture colors for accurate color bleeding
+        Vector3 reflectivity(0.5f, 0.5f, 0.5f);  // Default 50% neutral reflectance
         if (mesh.shaderInfo) {
-            // Could parse actual texture colors here for better results
-            // For now, use neutral reflectivity
-            reflectivity = Vector3(0.4f, 0.4f, 0.4f);
+            // Try to get average color from the shader's texture image
+            if (mesh.shaderInfo->averageColor[0] > 0 || 
+                mesh.shaderInfo->averageColor[1] > 0 || 
+                mesh.shaderInfo->averageColor[2] > 0) {
+                // Convert from 0-255 to 0-1 range, clamp to reasonable reflectivity
+                reflectivity[0] = std::min(0.9f, mesh.shaderInfo->averageColor[0] / 255.0f);
+                reflectivity[1] = std::min(0.9f, mesh.shaderInfo->averageColor[1] / 255.0f);
+                reflectivity[2] = std::min(0.9f, mesh.shaderInfo->averageColor[2] / 255.0f);
+            } else if (mesh.shaderInfo->color[0] > 0 || 
+                       mesh.shaderInfo->color[1] > 0 || 
+                       mesh.shaderInfo->color[2] > 0) {
+                // Use shader's explicit color as fallback
+                reflectivity = mesh.shaderInfo->color;
+                // Clamp to valid reflectivity range
+                reflectivity[0] = std::min(0.9f, std::max(0.1f, reflectivity[0]));
+                reflectivity[1] = std::min(0.9f, std::max(0.1f, reflectivity[1]));
+                reflectivity[2] = std::min(0.9f, std::max(0.1f, reflectivity[2]));
+            }
         }
         
         for (int y = 0; y < surf.rect.height; y++) {
@@ -806,6 +551,32 @@ static void InitRadiosityPatches() {
                 patch.area = LIGHTMAP_SAMPLE_SIZE * LIGHTMAP_SAMPLE_SIZE;
                 patch.meshIndex = surf.meshIndex;
                 patch.luxelIndex = y * surf.rect.width + x;
+                
+                // For more accurate results, sample texture at this specific luxel position
+                // This allows per-texel color variation for detailed color bleeding
+                if (mesh.shaderInfo && mesh.shaderInfo->shaderImage && 
+                    mesh.shaderInfo->shaderImage->pixels &&
+                    mesh.shaderInfo->shaderImage->width > 0 && 
+                    mesh.shaderInfo->shaderImage->height > 0) {
+                    
+                    // Calculate UV at this patch position
+                    // Use mesh vertices to find approximate UV for this world position
+                    // For now, sample at a normalized UV based on surface position
+                    Vector2 texelUV;
+                    texelUV[0] = normalizedU;
+                    texelUV[1] = normalizedV;
+                    
+                    Color4f texColor;
+                    if (RadSampleImage(mesh.shaderInfo->shaderImage->pixels,
+                                      mesh.shaderInfo->shaderImage->width,
+                                      mesh.shaderInfo->shaderImage->height,
+                                      texelUV, texColor)) {
+                        // Use texture color as reflectivity
+                        patch.reflectivity[0] = std::min(0.9f, texColor[0] / 255.0f);
+                        patch.reflectivity[1] = std::min(0.9f, texColor[1] / 255.0f);
+                        patch.reflectivity[2] = std::min(0.9f, texColor[2] / 255.0f);
+                    }
+                }
                 
                 RadiosityData::patches.push_back(patch);
             }
@@ -910,36 +681,271 @@ static void GatherRadiosityLight(int bounceNum) {
 }
 
 
+// Forward declarations for sky environment (defined later with light probe code)
+struct SkyEnvironment {
+    Vector3 ambientColor;     // Normalized ambient color (0-1)
+    float ambientIntensity;   // Ambient brightness (HDR scale)
+    Vector3 sunDir;
+    Vector3 sunColor;
+    float sunIntensity;
+    bool valid;
+};
+static SkyEnvironment GetSkyEnvironment();
+static void LogSkyEnvironment(const SkyEnvironment &sky);
+
+
+// =============================================================================
+// ADAPTIVE SUPERSAMPLING (adapted from Source SDK vrad2/lightmap.cpp)
+// ComputeLightmapGradients / BuildSupersampleFaceLights
+// =============================================================================
+
+/*
+    TexelLighting_t
+    Result of lighting computation at a single point.
+*/
+struct TexelLighting_t {
+    Vector3 direct;
+    Vector3 indirect;
+};
+
+/*
+    ComputeLightingAtPoint
+    Compute direct and indirect lighting at an arbitrary world position.
+    Extracted from the per-texel loop to enable reuse during supersampling.
+*/
+static TexelLighting_t ComputeLightingAtPoint(const Vector3 &worldPos, const Vector3 &sampleNormal,
+                                              const SkyEnvironment &sky) {
+    TexelLighting_t result;
+    result.direct = Vector3(0, 0, 0);
+    result.indirect = Vector3(1, 1, 1);  // Default: full ambient (1.0 = no occlusion)
+
+    Vector3 directLight(0, 0, 0);
+    float aoFactor = 1.0f;
+
+    // Sun: trace shadow ray
+    if (sky.valid) {
+        Vector3 sunDir = sky.sunDir * -1.0f;
+        float sunNdotL = vector3_dot(sampleNormal, sunDir);
+        if (sunNdotL > 0) {
+            if (!TraceRayAgainstMeshes(worldPos, sunDir, 65536.0f)) {
+                directLight = directLight + sky.sunColor * (sunNdotL * sky.sunIntensity);
+            }
+        }
+    }
+
+    // Static point/spot lights with shadow rays
+    for (const WorldLight_t &light : ApexLegends::Bsp::worldLights) {
+        if (light.type == emit_skyambient || light.type == emit_skylight) continue;
+        if (light.flags & WORLDLIGHT_FLAG_REALTIME) continue;
+
+        Vector3 lightPos(light.origin[0], light.origin[1], light.origin[2]);
+
+        if (light.type == emit_point) {
+            Vector3 toLight = lightPos - worldPos;
+            float dist = vector3_length(toLight);
+            if (dist < 0.001f) continue;
+
+            Vector3 lightDir = toLight / dist;
+            float NdotL = vector3_dot(sampleNormal, lightDir);
+            if (NdotL > 0) {
+                if (TraceRayAgainstMeshes(worldPos, lightDir, dist - 1.0f)) continue;
+
+                float atten = 1.0f;
+                if (light.quadratic_attn > 0 || light.linear_attn > 0) {
+                    atten = 1.0f / (light.constant_attn +
+                                   light.linear_attn * dist +
+                                   light.quadratic_attn * dist * dist);
+                } else {
+                    atten = 1.0f / (1.0f + dist * dist * 0.0001f);
+                }
+                directLight = directLight + light.intensity * NdotL * atten * 100.0f;
+            }
+        } else if (light.type == emit_spotlight) {
+            Vector3 toLight = lightPos - worldPos;
+            float dist = vector3_length(toLight);
+            if (dist < 0.001f) continue;
+
+            Vector3 lightDir = toLight / dist;
+            float NdotL = vector3_dot(sampleNormal, lightDir);
+            if (NdotL > 0) {
+                float spotDot = vector3_dot(-lightDir, light.normal);
+                if (spotDot > light.stopdot2) {
+                    if (TraceRayAgainstMeshes(worldPos, lightDir, dist - 1.0f)) continue;
+
+                    float spotAtten = 1.0f;
+                    if (spotDot < light.stopdot) {
+                        spotAtten = (spotDot - light.stopdot2) / (light.stopdot - light.stopdot2);
+                    }
+                    float distAtten = 1.0f / (1.0f + dist * dist * 0.0001f);
+                    directLight = directLight + light.intensity * NdotL * spotAtten * distAtten * 100.0f;
+                }
+            }
+        }
+    }
+
+    // AO: hemisphere ray tracing for ambient occlusion
+    if (sky.valid) {
+        int hemiRays = 0;
+        int unoccluded = 0;
+        int step = std::max(1, NUM_SPHERE_NORMALS / AO_HEMISPHERE_RAYS);
+        for (int i = 0; i < NUM_SPHERE_NORMALS; i += step) {
+            float cosTheta = vector3_dot(g_SphereNormals[i], sampleNormal);
+            if (cosTheta <= 0) continue;
+            hemiRays++;
+            if (!TraceRayAgainstMeshes(worldPos, g_SphereNormals[i], AO_TRACE_DISTANCE)) {
+                unoccluded++;
+            }
+        }
+        aoFactor = (hemiRays > 0) ? (float)unoccluded / hemiRays : 1.0f;
+        aoFactor = std::pow(aoFactor, 1.5f);
+    }
+
+    // Direct channel: sun + point/spot lights + ambient fill (AO-modulated)
+    // Official data shows shadow direct ~200-250 linear, sunlit ~4M linear
+    Vector3 ambientFill = sky.ambientColor * (sky.ambientIntensity * aoFactor);
+    result.direct = directLight + ambientFill;
+
+    // Indirect channel: ambient/bounce lighting modulated by AO
+    // Official data shows indirect ~130 linear at exp=0
+    result.indirect = sky.ambientColor * (sky.ambientIntensity * aoFactor * INDIRECT_AMBIENT_SCALE);
+
+    return result;
+}
+
+/*
+    ComputeTexelWorldPos
+    Compute world-space position for a (potentially sub-texel) coordinate.
+*/
+static Vector3 ComputeTexelWorldPos(const SurfaceLightmap_t &surf, float texelX, float texelY) {
+    float normalizedU = (surf.rect.width > 1) ? texelX / (surf.rect.width - 1) : 0.5f;
+    float normalizedV = (surf.rect.height > 1) ? texelY / (surf.rect.height - 1) : 0.5f;
+    normalizedU = std::max(0.0f, std::min(1.0f, normalizedU));
+    normalizedV = std::max(0.0f, std::min(1.0f, normalizedV));
+    float localU = surf.uMin + normalizedU * (surf.uMax - surf.uMin);
+    float localV = surf.vMin + normalizedV * (surf.vMax - surf.vMin);
+    return surf.worldBounds.mins
+        + surf.tangent * localU
+        + surf.bitangent * localV
+        + surf.plane.normal() * 0.1f;
+}
+
+/*
+    ComputeTexelIntensity
+    Convert HDR color to perceptual intensity for gradient computation.
+    Same formula as Source SDK ComputeLuxelIntensity.
+*/
+static float ComputeTexelIntensity(const Vector3 &color) {
+    float intensity = std::max({color.x(), color.y(), color.z()});
+    return std::pow(std::max(0.0f, intensity / 256.0f), 1.0f / 2.2f);
+}
+
+/*
+    ComputeLightmapGradients
+    Compute maximum intensity gradient at each texel from its 8 neighbors.
+    Adapted directly from Source SDK vrad2/lightmap.cpp ComputeLightmapGradients.
+    High gradients indicate shadow edges or lighting discontinuities that need supersampling.
+*/
+static void ComputeLightmapGradients(const SurfaceLightmap_t &surf,
+                                      const std::vector<float> &intensity,
+                                      const std::vector<bool> &processed,
+                                      std::vector<float> &gradient) {
+    int w = surf.rect.width;
+    int h = surf.rect.height;
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int idx = y * w + x;
+            if (processed[idx]) continue;
+
+            gradient[idx] = 0.0f;
+            float val = intensity[idx];
+
+            // Check all 8 neighbors (same as Source SDK)
+            if (y > 0) {
+                if (x > 0)   gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y-1)*w + (x-1)]));
+                             gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y-1)*w + x]));
+                if (x < w-1) gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y-1)*w + (x+1)]));
+            }
+            if (y < h-1) {
+                if (x > 0)   gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y+1)*w + (x-1)]));
+                             gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y+1)*w + x]));
+                if (x < w-1) gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[(y+1)*w + (x+1)]));
+            }
+            if (x > 0)   gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[y*w + (x-1)]));
+            if (x < w-1) gradient[idx] = std::max(gradient[idx], std::abs(val - intensity[y*w + (x+1)]));
+        }
+    }
+}
+
+/*
+    SupersampleTexel
+    Resample lighting at a texel using an NxN sub-sample grid.
+    Adapted from Source SDK SupersampleLightAtPoint.
+    Returns averaged lighting from all valid sub-samples.
+*/
+static TexelLighting_t SupersampleTexel(const SurfaceLightmap_t &surf, int texelX, int texelY,
+                                        const SkyEnvironment &sky) {
+    TexelLighting_t total;
+    total.direct = Vector3(0, 0, 0);
+    total.indirect = Vector3(0, 0, 0);
+    int validSamples = 0;
+
+    Vector3 sampleNormal = surf.plane.normal();
+
+    for (int sy = 0; sy < SUPERSAMPLE_GRID; sy++) {
+        for (int sx = 0; sx < SUPERSAMPLE_GRID; sx++) {
+            // Sub-texel position centered within each grid cell
+            float subX = texelX + (sx + 0.5f) / SUPERSAMPLE_GRID;
+            float subY = texelY + (sy + 0.5f) / SUPERSAMPLE_GRID;
+
+            Vector3 worldPos = ComputeTexelWorldPos(surf, subX, subY);
+            TexelLighting_t sample = ComputeLightingAtPoint(worldPos, sampleNormal, sky);
+
+            total.direct = total.direct + sample.direct;
+            total.indirect = total.indirect + sample.indirect;
+            validSamples++;
+        }
+    }
+
+    if (validSamples > 0) {
+        float inv = 1.0f / validSamples;
+        total.direct = total.direct * inv;
+        total.indirect = total.indirect * inv;
+    }
+
+    return total;
+}
+
+
 /*
     ComputeLightmapLighting
     Compute lighting for each texel.
     
-    IMPORTANT: emit_skyambient and emit_skylight are applied DYNAMICALLY by the engine
-    from the worldLights lump (0x36). Changing _ambient/_light in the .ent file updates
-    the map in real-time because the engine reads these values at runtime.
+    The direct lightmap channel bakes sun (emit_skylight) WITH shadow rays,
+    creating proper shadow contrast. The indirect channel stores ambient-only
+    so shadowed areas appear dark.
     
-    Lightmaps should only contain:
-    - Indirect/bounced lighting (radiosity)
-    - Static point/spot light contributions that aren't realtime
+    Static point/spot lights are baked into both channels with shadow tracing.
     
     Enhanced with:
-    - Phong shading (smooth normal interpolation across edges)
-    - Supersampling (anti-aliased lighting)
+    - Sun shadow baking (direct channel only)
+    - Shadow ray tracing for all static lights
     - Radiosity (bounced indirect lighting)
 */
 void ApexLegends::ComputeLightmapLighting() {
     Sys_Printf("--- ComputeLightmapLighting ---\n");
     
-    // Build edge sharing data for phong shading
-    BuildEdgeSharing();
-    
-    // NOTE: We do NOT bake emit_skyambient or emit_skylight here!
-    // The engine applies these dynamically from worldLights lump.
-    // This is why changing _ambient/_light in .ent files works on official maps.
+    // We bake emit_skylight (sun) WITH shadow rays into the direct lightmap channel.
+    // The indirect channel gets only ambient/bounce (no sun), so shadowed areas are dark.
+    // emit_skyambient brightness is still dynamic from worldLights lump.
     
     if (ApexLegends::Bsp::worldLights.empty()) {
         Sys_Printf("  No worldlights found\n");
     }
+    
+    // Get sky environment for sun shadow baking
+    SkyEnvironment sky = GetSkyEnvironment();
+    LogSkyEnvironment(sky);
     
     // Initialize radiosity patches for bounce lighting
     if (RADIOSITY_BOUNCES > 0) {
@@ -949,126 +955,25 @@ void ApexLegends::ComputeLightmapLighting() {
     int totalTexels = 0;
     int patchIndex = 0;  // Track patch index for radiosity
     
-    Sys_Printf("     Computing direct lighting");
-    if (SUPERSAMPLE_LEVEL > 1) {
-        Sys_Printf(" with %dx%d supersampling", SUPERSAMPLE_LEVEL, SUPERSAMPLE_LEVEL);
-    }
-    Sys_Printf("...\n");
+    Sys_Printf("     Computing direct lighting...\n");
     
     for (SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
+        Vector3 sampleNormal = surf.plane.normal();
+        
         // For each texel
         for (int y = 0; y < surf.rect.height; y++) {
             for (int x = 0; x < surf.rect.width; x++) {
-                // =====================================================
-                // SUPERSAMPLING: Take multiple samples and average
-                // =====================================================
-                Vector3 accumColor(0, 0, 0);
-                int numSamples = (SUPERSAMPLE_LEVEL > 1) ? 4 : 1;
+                Vector3 worldPos = ComputeTexelWorldPos(surf, (float)x, (float)y);
+                TexelLighting_t lighting = ComputeLightingAtPoint(worldPos, sampleNormal, sky);
                 
-                for (int sampleIdx = 0; sampleIdx < numSamples; sampleIdx++) {
-                    // Get sample offset (jittered for anti-aliasing)
-                    float offsetU = (numSamples > 1) ? supersampleOffsets[sampleIdx][0] : 0.0f;
-                    float offsetV = (numSamples > 1) ? supersampleOffsets[sampleIdx][1] : 0.0f;
-                    
-                    // Compute world position for this sample
-                    // Normalize texel to [0,1] within the rect, then map to tangent-space bounds
-                    float normalizedU = (surf.rect.width > 1) ? (x + 0.5f + offsetU) / (surf.rect.width - 1) : 0.5f;
-                    float normalizedV = (surf.rect.height > 1) ? (y + 0.5f + offsetV) / (surf.rect.height - 1) : 0.5f;
-                    normalizedU = std::max(0.0f, std::min(1.0f, normalizedU));
-                    normalizedV = std::max(0.0f, std::min(1.0f, normalizedV));
-                    float localU = surf.uMin + normalizedU * (surf.uMax - surf.uMin);
-                    float localV = surf.vMin + normalizedV * (surf.vMax - surf.vMin);
-                    
-                    Vector3 worldPos = surf.worldBounds.mins 
-                        + surf.tangent * localU 
-                        + surf.bitangent * localV;
-                    
-                    // Offset slightly along normal to avoid self-intersection
-                    worldPos = worldPos + surf.plane.normal() * 0.1f;
-                    
-                    // =====================================================
-                    // PHONG SHADING: Get interpolated normal at this position
-                    // =====================================================
-                    Vector3 sampleNormal = GetPhongNormal(surf.meshIndex, worldPos, surf.plane.normal());
-                    
-                    // Start with neutral base - engine adds dynamic ambient/sun on top
-                    // A small base value prevents completely black areas
-                    Vector3 sampleColor(0.1f, 0.1f, 0.1f);
-                    
-                    // Only bake NON-realtime static lights (point lights, spotlights)
-                    // Skip emit_skyambient and emit_skylight - they're dynamic!
-                    for (const WorldLight_t &light : ApexLegends::Bsp::worldLights) {
-                        // Skip sky lighting - applied dynamically by engine
-                        if (light.type == emit_skyambient || light.type == emit_skylight) {
-                            continue;
-                        }
-                        
-                        // Skip realtime lights - they're computed per-frame
-                        if (light.flags & WORLDLIGHT_FLAG_REALTIME) {
-                            continue;
-                        }
-                        
-                        Vector3 lightPos(light.origin[0], light.origin[1], light.origin[2]);
-                        Vector3 lightColor = light.intensity;
-                        
-                        if (light.type == emit_point) {
-                            // Static point light
-                            Vector3 toLight = lightPos - worldPos;
-                            float dist = vector3_length(toLight);
-                            if (dist < 0.001f) continue;
-                            
-                            Vector3 lightDir = toLight / dist;
-                            // Use phong normal for smoother lighting across edges
-                            float NdotL = vector3_dot(sampleNormal, lightDir);
-                            
-                            if (NdotL > 0) {
-                                float atten = 1.0f;
-                                if (light.quadratic_attn > 0 || light.linear_attn > 0) {
-                                    atten = 1.0f / (light.constant_attn + 
-                                                   light.linear_attn * dist + 
-                                                   light.quadratic_attn * dist * dist);
-                                } else {
-                                    atten = 1.0f / (1.0f + dist * dist * 0.0001f);
-                                }
-                                sampleColor = sampleColor + lightColor * NdotL * atten * 100.0f;
-                            }
-                        } else if (light.type == emit_spotlight) {
-                            // Static spotlight
-                            Vector3 toLight = lightPos - worldPos;
-                            float dist = vector3_length(toLight);
-                            if (dist < 0.001f) continue;
-                            
-                            Vector3 lightDir = toLight / dist;
-                            // Use phong normal for smoother lighting across edges
-                            float NdotL = vector3_dot(sampleNormal, lightDir);
-                            
-                            if (NdotL > 0) {
-                                float spotDot = vector3_dot(-lightDir, light.normal);
-                                if (spotDot > light.stopdot2) {
-                                    float spotAtten = 1.0f;
-                                    if (spotDot < light.stopdot) {
-                                        spotAtten = (spotDot - light.stopdot2) / (light.stopdot - light.stopdot2);
-                                    }
-                                    float distAtten = 1.0f / (1.0f + dist * dist * 0.0001f);
-                                    sampleColor = sampleColor + lightColor * NdotL * spotAtten * distAtten * 100.0f;
-                                }
-                            }
-                        }
-                    }
-                    
-                    accumColor = accumColor + sampleColor;
-                }
-                
-                // Average the supersamples
-                Vector3 finalColor = accumColor * (1.0f / static_cast<float>(numSamples));
-                
-                // Store in luxel array
-                surf.luxels[y * surf.rect.width + x] = finalColor;
+                // Store in luxel arrays (direct and indirect separately)
+                surf.luxels[y * surf.rect.width + x] = lighting.direct;
+                surf.indirectLuxels[y * surf.rect.width + x] = lighting.indirect;
                 
                 // Store direct light for radiosity if enabled
                 if (RADIOSITY_BOUNCES > 0 && patchIndex < static_cast<int>(RadiosityData::patches.size())) {
-                    RadiosityData::patches[patchIndex].directLight = finalColor;
-                    RadiosityData::patches[patchIndex].totalLight = finalColor;
+                    RadiosityData::patches[patchIndex].directLight = lighting.direct;
+                    RadiosityData::patches[patchIndex].totalLight = lighting.direct;
                     patchIndex++;
                 }
                 
@@ -1078,6 +983,63 @@ void ApexLegends::ComputeLightmapLighting() {
     }
     
     Sys_Printf("     %9d texels computed (direct)\n", totalTexels);
+    
+    // =====================================================
+    // ADAPTIVE SUPERSAMPLING (Source SDK style)
+    // Detect high-gradient areas and supersample them to
+    // smooth shadow edges and lighting discontinuities.
+    // =====================================================
+    if (SUPERSAMPLE_PASSES > 0) {
+        Sys_Printf("     Computing adaptive supersampling (%d passes, %dx%d grid)...\n",
+                   SUPERSAMPLE_PASSES, SUPERSAMPLE_GRID, SUPERSAMPLE_GRID);
+        int totalSupersampled = 0;
+        
+        for (SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
+            int w = surf.rect.width;
+            int h = surf.rect.height;
+            int numTexels = w * h;
+            
+            // Compute intensity at each texel for gradient detection
+            std::vector<float> intensity(numTexels);
+            for (int i = 0; i < numTexels; i++) {
+                intensity[i] = ComputeTexelIntensity(surf.luxels[i]);
+            }
+            
+            std::vector<bool> processed(numTexels, false);
+            std::vector<float> gradient(numTexels, 0.0f);
+            
+            // Iterative refinement: recheck gradients after each pass
+            // because supersampling one texel can change the gradient of neighbors
+            for (int pass = 0; pass < SUPERSAMPLE_PASSES; pass++) {
+                ComputeLightmapGradients(surf, intensity, processed, gradient);
+                
+                bool didWork = false;
+                for (int i = 0; i < numTexels; i++) {
+                    if (processed[i]) continue;
+                    if (gradient[i] < SUPERSAMPLE_GRADIENT_THRESHOLD) continue;
+                    
+                    // High gradient - supersample this texel
+                    processed[i] = true;
+                    didWork = true;
+                    
+                    int x = i % w;
+                    int y = i / w;
+                    
+                    TexelLighting_t ss = SupersampleTexel(surf, x, y, sky);
+                    surf.luxels[i] = ss.direct;
+                    surf.indirectLuxels[i] = ss.indirect;
+                    
+                    // Update intensity for next gradient pass
+                    intensity[i] = ComputeTexelIntensity(surf.luxels[i]);
+                    totalSupersampled++;
+                }
+                
+                if (!didWork) break;  // No more high-gradient texels
+            }
+        }
+        
+        Sys_Printf("     %9d texels supersampled\n", totalSupersampled);
+    }
     
     // =====================================================
     // RADIOSITY: Compute bounce lighting
@@ -1113,67 +1075,52 @@ void ApexLegends::ComputeLightmapLighting() {
 
 /*
     EncodeHDRTexel
-    Encode a floating-point RGB color to the 8-byte RGBE-style HDR format
+    Encode a floating-point linear RGB color to ColorRGBExp32 format.
     
-    Based on analysis of official Apex Legends lightmaps:
-    - Bytes 0-2: Direct light RGB mantissa (0-255, sRGB gamma)
-    - Byte 3: Direct light exponent (0-255, typical range 0-60)
-    - Bytes 4-6: Indirect/bounce light RGB mantissa (0-255, sRGB gamma)
-    - Byte 7: Indirect light exponent (0-255, typical range 0-60)
+    Format (4 bytes): R, G, B mantissa (0-255, linear) + exponent byte.
+    Engine decode: linear = (mantissa / 255) * 2^(byte - 128)
     
-    Format is RGBE-style where:
-      finalColor = (RGB / 255) * 2^(exponent / 8)
+    Uses unsigned bias-128 exponent stored in the 4th byte:
+      byte 128 = 2^0   = 1.0x  (neutral)
+      byte 129 = 2^1   = 2.0x  (bright)
+      byte 136 = 2^8   = 256x  (sun direct)
+      byte 127 = 2^-1  = 0.5x  (dim)
+      byte 0   = 2^-128 ≈ 0    (black)
     
-    Examples from official maps:
-    - exp=0: multiplier 1.0x (normal/shadow areas)
-    - exp=8: multiplier 2.0x
-    - exp=16: multiplier 4.0x
-    - exp=50-60: very bright sunlit areas (80-150x)
-    
-    For simple maps without bounce lighting, direct and indirect are the same.
+    Mantissa is kept in 128..255 range for precision.
 */
 static void EncodeHDRTexel(const Vector3 &color, uint8_t *out) {
-    // Input is in linear HDR space (0.0 to potentially >1.0 for HDR)
-    // Find the maximum component to determine exponent
-    float maxComponent = std::max({color.x(), color.y(), color.z()});
+    float r = std::max(0.0f, color.x());
+    float g = std::max(0.0f, color.y());
+    float b = std::max(0.0f, color.z());
+    float maxComponent = std::max({r, g, b});
     
-    uint8_t exponent;
-    float scale;
-    
-    if (maxComponent <= 0.001f) {
-        // Near-black - use exp=0 with dark RGB
-        exponent = 0;
-        scale = 1.0f;
-    } else if (maxComponent <= 1.0f) {
-        // LDR range - exp=0 gives 1.0x multiplier
-        exponent = 0;
-        scale = 1.0f;
-    } else {
-        // HDR range - need positive exponent
-        // exp = 8 * log2(maxComponent) rounded up
-        int exp = (int)std::ceil(8.0f * std::log2(maxComponent));
-        exponent = (uint8_t)std::min(255, std::max(0, exp));
-        
-        // Scale factor: divide by 2^(exp/8) to get mantissa in 0-1 range
-        scale = 1.0f / std::pow(2.0f, exponent / 8.0f);
+    if (maxComponent < 1e-12f) {
+        // Near-black: exponent 0 = 2^-128 ≈ 0
+        out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+        return;
     }
     
-    // Scale color and apply gamma correction (linear to sRGB)
-    float r = std::pow(std::min(1.0f, std::max(0.0f, color.x() * scale)), 1.0f / 2.2f);
-    float g = std::pow(std::min(1.0f, std::max(0.0f, color.y() * scale)), 1.0f / 2.2f);
-    float b = std::pow(std::min(1.0f, std::max(0.0f, color.z() * scale)), 1.0f / 2.2f);
+    // Find exponent such that mantissa = color / 2^(exp-128) falls in 0-255 range
+    // We want mantissa in 128-255 for precision
+    int exp = 128 + (int)std::ceil(std::log2(maxComponent));
+    exp = std::max(0, std::min(255, exp));
     
-    // Direct light (bytes 0-3)
-    out[0] = (uint8_t)(r * 255.0f);
-    out[1] = (uint8_t)(g * 255.0f);
-    out[2] = (uint8_t)(b * 255.0f);
-    out[3] = exponent;
+    // Scale: mantissa = color * 255 / 2^(exp-128)
+    // Equivalent: mantissa = color * 255 * 2^(128-exp)
+    float scale = 255.0f / std::pow(2.0f, (float)(exp - 128));
     
-    // Indirect light (bytes 4-7) - same as direct for now
-    out[4] = out[0];
-    out[5] = out[1];
-    out[6] = out[2];
-    out[7] = exponent;
+    out[0] = (uint8_t)std::min(255, std::max(0, (int)(r * scale + 0.5f)));
+    out[1] = (uint8_t)std::min(255, std::max(0, (int)(g * scale + 0.5f)));
+    out[2] = (uint8_t)std::min(255, std::max(0, (int)(b * scale + 0.5f)));
+    out[3] = (uint8_t)exp;
+}
+
+// Encode both direct and indirect channels into 8-byte output
+// Both channels use the same bias-128 RGBE format
+static void EncodeHDRTexelPair(const Vector3 &directColor, const Vector3 &indirectColor, uint8_t *out) {
+    EncodeHDRTexel(directColor, out);      // bytes 0-3: direct
+    EncodeHDRTexel(indirectColor, out + 4); // bytes 4-7: indirect
 }
 
 
@@ -1206,47 +1153,87 @@ void ApexLegends::EmitLightmaps()
         header.height = 256;
         ApexLegends::Bsp::lightmapHeaders.push_back(header);
         
-        // Neutral stub lightmap - engine applies dynamic ambient/sun from worldLights
-        // This allows _ambient/_light changes in .ent files to work immediately
-        // Format: RGB (sRGB gamma) + exponent where finalColor = RGB * 2^(exp/8)
-        // exp=0 means 2^0 = 1.0x multiplier (neutral)
-        // RGB=180 gives a mid-gray tone in sRGB (linear ~0.45)
-        uint8_t neutralGray = 180;  // Mid-gray mantissa in sRGB
-        uint8_t exponent = 0;       // Neutral exposure (2^0 = 1.0x)
-        size_t dataSize = 256 * 256 * 8;
-        ApexLegends::Bsp::lightmapDataSky.resize(dataSize);
-        for (size_t i = 0; i < dataSize; i += 8) {
-            ApexLegends::Bsp::lightmapDataSky[i + 0] = neutralGray;  // R
-            ApexLegends::Bsp::lightmapDataSky[i + 1] = neutralGray;  // G
-            ApexLegends::Bsp::lightmapDataSky[i + 2] = neutralGray;  // B
-            ApexLegends::Bsp::lightmapDataSky[i + 3] = exponent;     // Direct exp
-            ApexLegends::Bsp::lightmapDataSky[i + 4] = neutralGray;  // R indirect
-            ApexLegends::Bsp::lightmapDataSky[i + 5] = neutralGray;  // G indirect
-            ApexLegends::Bsp::lightmapDataSky[i + 6] = neutralGray;  // B indirect
-            ApexLegends::Bsp::lightmapDataSky[i + 7] = exponent;     // Indirect exp
-        }
+        // Black stub lightmap - engine applies dynamic ambient/sun from worldLights
+        // Engine expects PLANAR format: all direct texels first, then all indirect texels
+        // Black (all zeros) prevents bright bleed and lets engine handle dynamic lighting
+        size_t numTexels = 256 * 256;
+        size_t dataSize = numTexels * 8;  // 4 bytes direct + 4 bytes indirect per texel
+        ApexLegends::Bsp::lightmapDataSky.resize(dataSize, 0);
         
         return;
     }
     
-    // Encode luxels to lightmap pages
+    // Encode luxels to lightmap pages, tracking which pixels were computed
+    std::vector<std::vector<bool>> computedPixels(ApexLegends::Bsp::lightmapPages.size());
+    for (size_t p = 0; p < ApexLegends::Bsp::lightmapPages.size(); p++) {
+        const auto &pg = ApexLegends::Bsp::lightmapPages[p];
+        computedPixels[p].resize((size_t)pg.width * pg.height, false);
+    }
+    
     for (SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
         ApexLegends::LightmapPage_t &page = ApexLegends::Bsp::lightmapPages[surf.rect.pageIndex];
         
         for (int y = 0; y < surf.rect.height; y++) {
             for (int x = 0; x < surf.rect.width; x++) {
-                const Vector3 &color = surf.luxels[y * surf.rect.width + x];
+                int idx = y * surf.rect.width + x;
+                const Vector3 &directColor = surf.luxels[idx];
+                const Vector3 &indirectColor = surf.indirectLuxels[idx];
                 
                 int px = surf.rect.x + x;
                 int py = surf.rect.y + y;
                 int offset = (py * page.width + px) * 8;
                 
-                EncodeHDRTexel(color, &page.pixels[offset]);
+                EncodeHDRTexelPair(directColor, indirectColor, &page.pixels[offset]);
+                computedPixels[surf.rect.pageIndex][(size_t)py * page.width + px] = true;
             }
         }
     }
     
-    // Create headers and concatenate pixel data
+    // Dilate (pad) lightmap edges to prevent bilinear filtering from
+    // sampling neutral unallocated pixels at surface boundaries.
+    // 2 passes of 4-neighbor dilation using computed-pixel bitmap.
+    for (size_t pi = 0; pi < ApexLegends::Bsp::lightmapPages.size(); pi++) {
+        auto &page = ApexLegends::Bsp::lightmapPages[pi];
+        auto &computed = computedPixels[pi];
+        int w = page.width;
+        int h = page.height;
+        
+        for (int pass = 0; pass < 2; pass++) {
+            std::vector<uint8_t> dilated = page.pixels;
+            std::vector<bool> newComputed = computed;
+            
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    if (computed[(size_t)y * w + x]) continue;  // Already has computed data
+                    
+                    int off = (y * w + x) * 8;
+                    
+                    // Check 4 neighbors for a computed pixel to copy from
+                    const int dx[] = {-1, 1, 0, 0};
+                    const int dy[] = {0, 0, -1, 1};
+                    for (int d = 0; d < 4; d++) {
+                        int nx = x + dx[d];
+                        int ny = y + dy[d];
+                        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+                        
+                        if (computed[(size_t)ny * w + nx]) {
+                            int noff = (ny * w + nx) * 8;
+                            memcpy(&dilated[off], &page.pixels[noff], 8);
+                            newComputed[(size_t)y * w + x] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            page.pixels = dilated;
+            computed = newComputed;
+        }
+    }
+    
+    // Create headers and concatenate pixel data in PLANAR format
+    // Engine expects: [all direct texels (4 bytes each)] [all indirect texels (4 bytes each)]
+    // NOT interleaved per-texel as stored in page.pixels during building
     for (size_t i = 0; i < ApexLegends::Bsp::lightmapPages.size(); i++) {
         const ApexLegends::LightmapPage_t &page = ApexLegends::Bsp::lightmapPages[i];
         
@@ -1259,10 +1246,30 @@ void ApexLegends::EmitLightmaps()
         header.height = page.height;
         ApexLegends::Bsp::lightmapHeaders.push_back(header);
         
-        // Append pixel data
-        ApexLegends::Bsp::lightmapDataSky.insert(
-            ApexLegends::Bsp::lightmapDataSky.end(),
-            page.pixels.begin(), page.pixels.end());
+        // Write planar: all direct texels first, then all indirect texels
+        size_t numTexels = (size_t)page.width * page.height;
+        size_t baseOffset = ApexLegends::Bsp::lightmapDataSky.size();
+        ApexLegends::Bsp::lightmapDataSky.resize(baseOffset + numTexels * 8);
+        uint8_t *dst = &ApexLegends::Bsp::lightmapDataSky[baseOffset];
+        
+        // Sub-texture 0 (direct light): bytes 0-3 of each interleaved texel
+        for (size_t t = 0; t < numTexels; t++) {
+            size_t srcOff = t * 8;
+            dst[t * 4 + 0] = page.pixels[srcOff + 0];
+            dst[t * 4 + 1] = page.pixels[srcOff + 1];
+            dst[t * 4 + 2] = page.pixels[srcOff + 2];
+            dst[t * 4 + 3] = page.pixels[srcOff + 3];
+        }
+        
+        // Sub-texture 1 (indirect light): bytes 4-7 of each interleaved texel
+        uint8_t *dst2 = dst + numTexels * 4;
+        for (size_t t = 0; t < numTexels; t++) {
+            size_t srcOff = t * 8;
+            dst2[t * 4 + 0] = page.pixels[srcOff + 4];
+            dst2[t * 4 + 1] = page.pixels[srcOff + 5];
+            dst2[t * 4 + 2] = page.pixels[srcOff + 6];
+            dst2[t * 4 + 3] = page.pixels[srcOff + 7];
+        }
     }
 
     Sys_Printf("     %9zu lightmap pages\n", ApexLegends::Bsp::lightmapHeaders.size());
@@ -1352,15 +1359,6 @@ int16_t ApexLegends::GetLightmapPageIndex(int meshIndex) {
     - LightProbe: Actual ambient data (SH coefficients + static light refs)
 */
 
-// Sky environment data extracted from worldlights
-struct SkyEnvironment {
-    Vector3 ambientColor;      // Base ambient color (from emit_skyambient)
-    Vector3 sunDir;            // Sun direction (from emit_skylight)
-    Vector3 sunColor;          // Sun color (normalized)
-    float sunIntensity;        // Sun brightness multiplier
-    bool valid;                // Whether sky data was found
-};
-
 // Parse "_light" key format: "R G B brightness" (e.g., "255 252 242 510")
 // Returns normalized RGB color (0-1) and brightness multiplier
 static bool ParseLightKey(const char *value, Vector3 &outColor, float &outBrightness) {
@@ -1368,18 +1366,18 @@ static bool ParseLightKey(const char *value, Vector3 &outColor, float &outBright
     
     float r, g, b, brightness;
     if (sscanf(value, "%f %f %f %f", &r, &g, &b, &brightness) == 4) {
-        // Normalize RGB from 0-255 to 0-1
-        outColor[0] = r;
-        outColor[1] = g;
-        outColor[2] = b;
+        // Normalize RGB from 0-255 to 0-1 range
+        outColor[0] = r / 255.0f;
+        outColor[1] = g / 255.0f;
+        outColor[2] = b / 255.0f;
         outBrightness = brightness;
         return true;
     }
     // Try 3-component format (no brightness)
     if (sscanf(value, "%f %f %f", &r, &g, &b) == 3) {
-        outColor[0] = r;
-        outColor[1] = g;
-        outColor[2] = b;
+        outColor[0] = r / 255.0f;
+        outColor[1] = g / 255.0f;
+        outColor[2] = b / 255.0f;
         outBrightness = 1.0f;
         return true;
     }
@@ -1390,9 +1388,10 @@ static bool ParseLightKey(const char *value, Vector3 &outColor, float &outBright
 static SkyEnvironment GetSkyEnvironment() {
     SkyEnvironment sky;
     sky.ambientColor = Vector3(0.65f, 0.55f, 0.45f);  // Default warm outdoor
+    sky.ambientIntensity = 10.5f;                       // Default ambient HDR intensity
     sky.sunDir = Vector3(0.5f, 0.5f, -0.707f);        // Default: sun from upper-right
     sky.sunColor = Vector3(1.0f, 0.95f, 0.85f);       // Default warm sunlight
-    sky.sunIntensity = 1.5f;
+    sky.sunIntensity = 10.5f;                         // Default HDR sun intensity
     sky.valid = false;
     
     bool foundSkyAmbient = false;
@@ -1409,12 +1408,11 @@ static SkyEnvironment GetSkyEnvironment() {
             float brightness;
             if (ParseLightKey(lightValue, lightColor, brightness)) {
                 sky.sunColor = lightColor;
-                // Scale intensity - typical _light brightness ~200-1000
-                // We want sunIntensity to be around 2-4 for good contrast
-                sky.sunIntensity = brightness / 50.0f;
-                sky.sunIntensity = std::min(5.0f, std::max(1.0f, sky.sunIntensity));
+                // Use raw brightness to produce realistic HDR intensity
+                // Official data shows direct sun exponents of 10-20 (linear values 1K-1M)
+                //sky.sunIntensity = brightness;
                 foundSkyLight = true;
-                Sys_Printf("     Found light_environment _light: %s\n", lightValue);
+                Sys_Printf("     Found light_environment _light: %s (intensity=%.1f)\n", lightValue, brightness);
             }
             
             // Get ambient color from _ambient key
@@ -1423,8 +1421,9 @@ static SkyEnvironment GetSkyEnvironment() {
             float ambientBrightness;
             if (ParseLightKey(ambientValue, ambientColor, ambientBrightness)) {
                 sky.ambientColor = ambientColor;
+                //sky.ambientIntensity = ambientBrightness;
                 foundSkyAmbient = true;
-                Sys_Printf("     Found light_environment _ambient: %s\n", ambientValue);
+                Sys_Printf("     Found light_environment _ambient: %s (intensity=%.1f)\n", ambientValue, ambientBrightness);
             }
             
             // Get sun direction from angles or pitch/SunSpreadAngle
@@ -1454,6 +1453,7 @@ static SkyEnvironment GetSkyEnvironment() {
                 sky.ambientColor[0] = light.intensity[0] / maxIntensity;
                 sky.ambientColor[1] = light.intensity[1] / maxIntensity;
                 sky.ambientColor[2] = light.intensity[2] / maxIntensity;
+                sky.ambientIntensity = maxIntensity;
                 foundSkyAmbient = true;
             }
             if (light.type == 3 && !foundSkyLight) {  // emit_skylight (sun)
@@ -1466,15 +1466,14 @@ static SkyEnvironment GetSkyEnvironment() {
                 sky.sunColor[0] = light.intensity[0] / maxIntensity;
                 sky.sunColor[1] = light.intensity[1] / maxIntensity;
                 sky.sunColor[2] = light.intensity[2] / maxIntensity;
-                // Scale intensity - typical emit_skylight has intensity ~200-1000
-                sky.sunIntensity = maxIntensity / 50.0f;
-                sky.sunIntensity = std::min(5.0f, std::max(1.0f, sky.sunIntensity));
+                // Use raw intensity for realistic HDR values
+                sky.sunIntensity = maxIntensity;
                 foundSkyLight = true;
             }
         }
     }
     
-    sky.valid = foundSkyAmbient || foundSkyLight;
+    sky.valid = true;
     
     if (!foundSkyAmbient) {
         Sys_Printf("     Warning: No emit_skyambient found, using default\n");
@@ -1574,6 +1573,89 @@ static bool TraceRayAgainstMeshes(const Vector3 &origin, const Vector3 &dir, flo
     return TraceRayAgainstMeshes_Fallback(origin, dir, maxDist);
 }
 
+
+/*
+    TraceRayGetSurfaceColor
+    Trace a ray and return the color of the hit surface.
+    Uses texture sampling when available for accurate color bleeding.
+    
+    Returns true if a surface was hit, with outColor set to the surface color.
+    The color is normalized to 0-1 range for use in radiosity calculations.
+*/
+static bool TraceRayGetSurfaceColor(const Vector3 &origin, const Vector3 &dir, 
+                                    float maxDist, Vector3 &outColor, float &outDist) {
+    // Default neutral gray if we can't sample
+    outColor = Vector3(0.5f, 0.5f, 0.5f);
+    outDist = maxDist;
+    
+    // Try Embree extended trace for UV coordinates
+    if (EmbreeTrace::IsSceneReady()) {
+        float hitDist;
+        Vector3 hitNormal;
+        int meshIndex;
+        Vector2 hitUV;
+        int primID;
+        
+        if (EmbreeTrace::TraceRayExtended(origin, dir, maxDist, hitDist, hitNormal, 
+                                          meshIndex, hitUV, primID)) {
+            outDist = hitDist;
+            
+            // Get the mesh and its shader
+            if (meshIndex >= 0 && meshIndex < static_cast<int>(Shared::meshes.size())) {
+                const Shared::Mesh_t &mesh = Shared::meshes[meshIndex];
+                
+                if (mesh.shaderInfo) {
+                    // Try to sample the actual texture
+                    if (mesh.shaderInfo->shaderImage && 
+                        mesh.shaderInfo->shaderImage->pixels &&
+                        mesh.shaderInfo->shaderImage->width > 0 && 
+                        mesh.shaderInfo->shaderImage->height > 0) {
+                        
+                        Color4f texColor;
+                        if (RadSampleImage(mesh.shaderInfo->shaderImage->pixels,
+                                          mesh.shaderInfo->shaderImage->width,
+                                          mesh.shaderInfo->shaderImage->height,
+                                          hitUV, texColor)) {
+                            // Convert from 0-255 to 0-1 range
+                            outColor[0] = texColor[0] / 255.0f;
+                            outColor[1] = texColor[1] / 255.0f;
+                            outColor[2] = texColor[2] / 255.0f;
+                            return true;
+                        }
+                    }
+                    
+                    // Fall back to shader average color if available
+                    if (mesh.shaderInfo->averageColor[0] > 0 || 
+                        mesh.shaderInfo->averageColor[1] > 0 || 
+                        mesh.shaderInfo->averageColor[2] > 0) {
+                        outColor[0] = mesh.shaderInfo->averageColor[0] / 255.0f;
+                        outColor[1] = mesh.shaderInfo->averageColor[1] / 255.0f;
+                        outColor[2] = mesh.shaderInfo->averageColor[2] / 255.0f;
+                        return true;
+                    }
+                    
+                    // Fall back to shader color if set
+                    if (mesh.shaderInfo->color[0] > 0 || 
+                        mesh.shaderInfo->color[1] > 0 || 
+                        mesh.shaderInfo->color[2] > 0) {
+                        outColor = mesh.shaderInfo->color;
+                        return true;
+                    }
+                }
+            }
+            return true;  // Hit something, even if we couldn't get color
+        }
+        return false;  // No hit
+    }
+    
+    // Fallback: just do visibility check, use neutral color
+    if (TraceRayAgainstMeshes_Fallback(origin, dir, maxDist)) {
+        return true;
+    }
+    return false;
+}
+
+
 // =============================================================================
 // SOURCE SDK STYLE LIGHT PROBE COMPUTATION
 // Adapted from leaf_ambient_lighting.cpp
@@ -1588,6 +1670,8 @@ static bool TraceRayAgainstMeshes(const Vector3 &origin, const Vector3 &dir, flo
     - cube[0] = +X, cube[1] = -X
     - cube[2] = +Y, cube[3] = -Y  
     - cube[4] = +Z, cube[5] = -Z
+    
+    Enhanced with texture color sampling for accurate color bleeding.
 */
 static void ComputeAmbientFromSphericalSamples(const Vector3 &position, 
                                                 const SkyEnvironment &sky,
@@ -1606,7 +1690,10 @@ static void ComputeAmbientFromSphericalSamples(const Vector3 &position,
         
         // Trace ray in this direction with offset to avoid self-intersection
         Vector3 rayOrigin = position + dir * 2.0f;
-        if (!TraceRayAgainstMeshes(rayOrigin, dir, LIGHT_PROBE_TRACE_DIST)) {
+        
+        Vector3 surfaceColor;
+        float hitDist;
+        if (!TraceRayGetSurfaceColor(rayOrigin, dir, LIGHT_PROBE_TRACE_DIST, surfaceColor, hitDist)) {
             // Ray reached sky - add sky contribution based on direction
             
             // Sky ambient contribution (uniform from all directions)
@@ -1626,10 +1713,24 @@ static void ComputeAmbientFromSphericalSamples(const Vector3 &position,
                 radcolor[i] = radcolor[i] + sky.ambientColor * (upDot * 0.3f);
             }
         } else {
-            // Ray hit geometry - use moderate ambient for occluded directions
-            // This represents indirect lighting from nearby surfaces
-            // Use higher value to prevent entities from being too dark in corners
-            radcolor[i] = sky.ambientColor * 0.35f;
+            // Ray hit geometry - use surface color for bounce lighting
+            // This creates color bleeding (e.g., red walls tint nearby areas red)
+            
+            // Base ambient contribution modulated by surface color (reflectivity)
+            Vector3 bounceColor;
+            bounceColor[0] = sky.ambientColor[0] * surfaceColor[0];
+            bounceColor[1] = sky.ambientColor[1] * surfaceColor[1];
+            bounceColor[2] = sky.ambientColor[2] * surfaceColor[2];
+            
+            // Distance falloff - closer surfaces contribute more
+            float distFactor = 1.0f;
+            if (hitDist < 512.0f) {
+                // Nearby surfaces get stronger contribution
+                distFactor = 1.0f + (512.0f - hitDist) / 512.0f * 0.5f;
+            }
+            
+            // Scale for indirect lighting (typical reflectance ~0.35-0.5)
+            radcolor[i] = bounceColor * (0.4f * distFactor);
         }
     }
     
@@ -1707,12 +1808,15 @@ static int16_t ClampToInt16(float value) {
     - [1] = Y gradient (difference between +Y and -Y)
     - [2] = Z gradient (difference between +Z and -Z)
     - [3] = DC (average/constant term)
+    
+    Based on official map analysis:
+    - DC values typically range from 0 to 3500 for normally lit areas
+    - Gradient values range from -3500 to +3500
+    - Input cube colors should be in 0-1 normalized range
 */
-static void ConvertCubeToSphericalHarmonics(const Vector3 lightBoxColor[6], 
-                                             LightProbe_v50_t &probe) {
-    // SH scale factor - based on analysis of official maps
-    // DC values typically 2000-4000 for well-lit areas
-    const float shScale = 8000.0f;
+static void ConvertCubeToSphericalHarmonics(const Vector3 lightBoxColor[6], LightProbe_t &probe) {
+
+    const float shScale = 8192.0f;
     
     for (int channel = 0; channel < 3; channel++) {
         // Extract color components for this channel from each cube side
@@ -1924,12 +2028,17 @@ static void GenerateProbePositionsVoronoi(const MinMax &worldBounds,
     float avgDimension = std::cbrt(worldVolume);
     
     // Aim for roughly GRID_SPACING spacing, but let geometry density influence
-    int targetProbes = std::max(8, std::min(2048, 
-        (int)(worldVolume / (LIGHT_PROBE_GRID_SPACING * LIGHT_PROBE_GRID_SPACING * LIGHT_PROBE_GRID_SPACING))));
+    int targetProbes = std::max(8, 
+        (int)(worldVolume / (LIGHT_PROBE_GRID_SPACING * LIGHT_PROBE_GRID_SPACING * LIGHT_PROBE_GRID_SPACING)));
     
     // Increase target if we have dense geometry
     float densityFactor = std::min(4.0f, (float)candidatePositions.size() / 1000.0f);
-    targetProbes = std::min(2048, (int)(targetProbes * (1.0f + densityFactor)));
+    targetProbes = (int)(targetProbes * (1.0f + densityFactor));
+    
+    // Apply max count limit if not unlimited (-1)
+    if (LIGHT_PROBE_MAX_COUNT >= 0) {
+        targetProbes = std::min(LIGHT_PROBE_MAX_COUNT, targetProbes);
+    }
     
     Sys_Printf("     Target probe count: %d (world avg dimension: %.0f)\n", targetProbes, avgDimension);
     
@@ -2144,8 +2253,245 @@ static void GenerateProbePositionsVoronoi(const MinMax &worldBounds,
         Sys_Printf("     Added %zu shadow boundary probes\n", shadowBoundaryProbes.size());
     }
     
+    // =========================================================================
+    // Step 7: Gap-filling - add probes on a regular grid across all floors
+    // The Voronoi approach is geometry-driven and misses open floor areas.
+    // This ensures every walkable floor area has probe coverage.
+    // =========================================================================
+    Sys_Printf("     Gap-filling floor areas with grid...\n");
+    
+    constexpr float FLOOR_GRID_SPACING = 128.0f;  // Dense grid for good floor coverage
+    constexpr float PROBE_HEIGHT_ABOVE_FLOOR = 64.0f;  // Player height above floor
+    constexpr float MIN_PROBE_SPACING = 64.0f;  // Don't place if another probe is closer than this
+    
+    std::vector<Vector3> gapFillProbes;
+    
+    // Compute tighter bounds from actual mesh geometry (worldBounds might include skybox)
+    MinMax meshBounds;
+    for (const Shared::Mesh_t &mesh : Shared::meshes) {
+        // Skip sky surfaces
+        if (mesh.shaderInfo && (mesh.shaderInfo->compileFlags & C_SKY))
+            continue;
+        meshBounds.extend(mesh.minmax.mins);
+        meshBounds.extend(mesh.minmax.maxs);
+    }
+    
+    if (!meshBounds.valid()) {
+        meshBounds = worldBounds;
+    }
+    
+    Vector3 meshSize = meshBounds.maxs - meshBounds.mins;
+    Sys_Printf("     Mesh bounds: (%.0f,%.0f,%.0f) to (%.0f,%.0f,%.0f)\n",
+               meshBounds.mins[0], meshBounds.mins[1], meshBounds.mins[2],
+               meshBounds.maxs[0], meshBounds.maxs[1], meshBounds.maxs[2]);
+    
+    // Use 2D grid based on mesh bounds (not world bounds which may be huge)
+    int gridX = std::max(1, (int)std::ceil(meshSize[0] / FLOOR_GRID_SPACING));
+    int gridY = std::max(1, (int)std::ceil(meshSize[1] / FLOOR_GRID_SPACING));
+    
+    gridX = std::min(gridX, 256);
+    gridY = std::min(gridY, 256);
+    
+    Sys_Printf("     Floor grid: %d x %d (%d cells)\n", gridX, gridY, gridX * gridY);
+    
+    int floorsFound = 0;
+    int probesAdded = 0;
+    
+    for (int iy = 0; iy < gridY; iy++) {
+        for (int ix = 0; ix < gridX; ix++) {
+            float posX = meshBounds.mins[0] + (ix + 0.5f) * (meshSize[0] / gridX);
+            float posY = meshBounds.mins[1] + (iy + 0.5f) * (meshSize[1] / gridY);
+            
+            // Try multiple trace start heights to handle different scenarios
+            // Start from reasonable heights within the mesh bounds
+            float floorZ = meshBounds.mins[2];
+            bool foundFloor = false;
+            
+            // Try tracing from several heights (top of mesh, middle, etc.)
+            float traceHeights[] = {
+                meshBounds.maxs[2] - 8.0f,
+                meshBounds.mins[2] + meshSize[2] * 0.75f,
+                meshBounds.mins[2] + meshSize[2] * 0.5f,
+                meshBounds.mins[2] + meshSize[2] * 0.25f
+            };
+            
+            for (float startZ : traceHeights) {
+                if (foundFloor) break;
+                
+                Vector3 rayStart(posX, posY, startZ);
+                Vector3 rayDir(0, 0, -1);
+                float maxTrace = startZ - meshBounds.mins[2] + 16.0f;
+                
+                if (EmbreeTrace::IsSceneReady()) {
+                    float hitDist;
+                    Vector3 hitNormal;
+                    int meshIndex;
+                    if (EmbreeTrace::TraceRay(rayStart, rayDir, maxTrace, hitDist, hitNormal, meshIndex)) {
+                        // Accept any upward-facing surface as floor
+                        if (hitNormal[2] > 0.1f) {
+                            floorZ = rayStart[2] - hitDist;
+                            foundFloor = true;
+                        }
+                    }
+                } else {
+                    // Fallback without Embree
+                    if (TraceRayAgainstMeshes(rayStart, rayDir, maxTrace)) {
+                        floorZ = meshBounds.mins[2] + 16.0f;
+                        foundFloor = true;
+                    }
+                }
+            }
+            
+            if (foundFloor) floorsFound++;
+            
+            if (!foundFloor) continue;
+            
+            Vector3 probePos(posX, posY, floorZ + PROBE_HEIGHT_ABOVE_FLOOR);
+            
+            // Quick solid check - very relaxed
+            if (IsPositionInsideSolid(probePos, 4.0f)) {
+                continue;
+            }
+            
+            // Only skip if VERY close to an existing probe (avoid duplicates)
+            bool tooClose = false;
+            for (const Vector3 &existing : finalPositions) {
+                Vector3 delta = probePos - existing;
+                if (vector3_dot(delta, delta) < MIN_PROBE_SPACING * MIN_PROBE_SPACING) {
+                    tooClose = true;
+                    break;
+                }
+            }
+            if (!tooClose) {
+                for (const Vector3 &existing : gapFillProbes) {
+                    Vector3 delta = probePos - existing;
+                    if (vector3_dot(delta, delta) < MIN_PROBE_SPACING * MIN_PROBE_SPACING) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (!tooClose) {
+                gapFillProbes.push_back(probePos);
+                probesAdded++;
+            }
+        }
+    }
+    
+    Sys_Printf("     Found %d floor cells, added %d gap-fill probes\n", floorsFound, probesAdded);
+    
+    // Add gap-fill probes
+    for (const Vector3 &gfp : gapFillProbes) {
+        finalPositions.push_back(gfp);
+    }
+    
+    if (!gapFillProbes.empty()) {
+        Sys_Printf("     Added %zu gap-fill probes in empty areas\n", gapFillProbes.size());
+    }
+    
     probePositions = std::move(finalPositions);
     Sys_Printf("     Generated %zu Voronoi-based probe positions\n", probePositions.size());
+}
+
+/*
+    AssignStaticLightsToProbe
+    Finds the most influential worldlights for a probe at the given position.
+    Assigns up to 4 light indices to the probe's staticLightIndexes array.
+    Sets staticLightFlags[0] based on how many valid lights were found.
+    
+    The algorithm:
+    1. Skip sky lights (emit_skyambient, emit_skylight) - they don't use indices
+    2. For each point/spot light, calculate influence based on distance and intensity
+    3. Sort by influence and take the top 4
+    4. Assign indices, using 0xFFFF for empty slots
+*/
+static void AssignStaticLightsToProbe(const Vector3 &probePos, LightProbe_t &probe) {
+    // Structure to hold light influence data
+    struct LightInfluence {
+        uint16_t index;
+        float influence;
+    };
+    
+    std::vector<LightInfluence> influences;
+    influences.reserve(ApexLegends::Bsp::worldLights.size());
+    
+    // Calculate influence for each non-sky worldlight
+    for (size_t i = 0; i < ApexLegends::Bsp::worldLights.size(); i++) {
+        const WorldLight_t &light = ApexLegends::Bsp::worldLights[i];
+        
+        // Skip sky lights - they're handled separately via SH ambient
+        if (light.type == emit_skyambient || light.type == emit_skylight) {
+            continue;
+        }
+        
+        // Calculate distance to light
+        Vector3 delta = light.origin - probePos;
+        float distSq = vector3_dot(delta, delta);
+        float dist = std::sqrt(distSq);
+        
+        // Calculate light intensity magnitude
+        float intensityMag = vector3_length(light.intensity);
+        if (intensityMag < 0.001f) {
+            continue;
+        }
+        
+        // Calculate influence based on intensity and distance falloff
+        // Use quadratic falloff as a reasonable approximation
+        float influence = intensityMag / (1.0f + distSq * 0.0001f);
+        
+        // For spotlights, reduce influence if probe is outside the cone
+        if (light.type == emit_spotlight) {
+            Vector3 dirToProbe = vector3_normalised(delta);
+            float dot = -vector3_dot(dirToProbe, light.normal);  // Negative because delta points from light to probe
+            
+            // If outside outer cone, skip this light
+            if (dot < light.stopdot2) {
+                continue;
+            }
+            
+            // Attenuate based on cone falloff
+            if (dot < light.stopdot) {
+                float t = (dot - light.stopdot2) / (light.stopdot - light.stopdot2);
+                influence *= t * t;  // Quadratic falloff in penumbra
+            }
+        }
+        
+        if (influence > 0.001f) {
+            influences.push_back({static_cast<uint16_t>(i), influence});
+        }
+    }
+    
+    // Sort by influence (highest first)
+    std::sort(influences.begin(), influences.end(), 
+              [](const LightInfluence &a, const LightInfluence &b) {
+                  return a.influence > b.influence;
+              });
+    
+    // Assign up to 4 lights
+    // Store raw 0-based worldlight indices in the BSP.
+    // Engine's Mod_LoadLightProbes adds +32 at load time to convert to
+    // global light handles (0-31 = shadow envs, 32+ = worldlights).
+    int validLightCount = 0;
+    for (int slot = 0; slot < 4; slot++) {
+        if (slot < static_cast<int>(influences.size())) {
+            probe.staticLightIndexes[slot] = influences[slot].index;
+            validLightCount++;
+        } else {
+            probe.staticLightIndexes[slot] = 0xFFFF;  // No light in this slot
+        }
+    }
+    
+    // Set staticLightFlags - each VALID light slot needs 0xFF!
+    // CRITICAL: Game breaks the loop when flag == 0, so each valid slot must have 0xFF
+    // Pattern from official maps:
+    //   1 light:  (255, 0, 0, 0)
+    //   2 lights: (255, 255, 0, 0)
+    //   3 lights: (255, 255, 255, 0)
+    //   4 lights: (255, 255, 255, 255)
+    for (int slot = 0; slot < 4; slot++) {
+        probe.staticLightFlags[slot] = (slot < validLightCount) ? 0xFF : 0x00;
+    }
 }
 
 /*
@@ -2238,6 +2584,246 @@ static void LogSkyEnvironment(const SkyEnvironment &sky) {
     Sys_Printf("     Ambient color: (%.2f, %.2f, %.2f)\n", sky.ambientColor[0], sky.ambientColor[1], sky.ambientColor[2]);
 }
 
+
+/*
+    BuildLightProbeTreeRecursive
+    Recursively builds a KD-tree for spatial lightprobe lookup.
+    
+    The tree uses axis-aligned splits to partition probes into leaves.
+    Each leaf can contain up to MAX_PROBES_PER_LEAF probes.
+    The split axis cycles through X(0), Y(1), Z(2).
+    
+    Tree node format:
+    - tag: (index << 2) | type
+      - type 0/1/2: internal node, split on X/Y/Z axis, index = child node index
+      - type 3: leaf node, index = first probe ref index
+    - value: split coordinate (float) for internal, ref count (uint32) for leaf
+*/
+constexpr int MAX_PROBES_PER_LEAF = 4;  // Max probes per leaf node (official maps use 1-4)
+
+struct ProbeRefRange {
+    uint32_t start;
+    uint32_t count;
+};
+
+// Forward declaration for recursive building
+static void BuildLightProbeTreeRecursiveFill(
+    std::vector<uint32_t> &refIndices,
+    uint32_t start, uint32_t count,
+    int depth,
+    uint32_t nodeIndex);
+
+static uint32_t BuildLightProbeTreeRecursive(
+    std::vector<uint32_t> &refIndices,  // Indices into lightprobeReferences (will be reordered)
+    uint32_t start, uint32_t count,      // Range in refIndices to process
+    int depth)
+{
+    // Get references for bounds calculation
+    const auto &refs = ApexLegends::Bsp::lightprobeReferences;
+    
+    // If few enough probes, create a leaf
+    if (count <= MAX_PROBES_PER_LEAF || depth > 20) {
+        LightProbeTree_t leaf;
+        leaf.tag = (start << 2) | 3;  // type 3 = leaf
+        leaf.refCount = count;
+        
+        uint32_t nodeIndex = static_cast<uint32_t>(ApexLegends::Bsp::lightprobeTree.size());
+        ApexLegends::Bsp::lightprobeTree.push_back(leaf);
+        return nodeIndex;
+    }
+    
+    // Calculate bounds of probes in this range
+    Vector3 mins(FLT_MAX, FLT_MAX, FLT_MAX);
+    Vector3 maxs(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    
+    for (uint32_t i = start; i < start + count; i++) {
+        const Vector3 &pos = refs[refIndices[i]].origin;
+        mins[0] = std::min(mins[0], pos[0]);
+        mins[1] = std::min(mins[1], pos[1]);
+        mins[2] = std::min(mins[2], pos[2]);
+        maxs[0] = std::max(maxs[0], pos[0]);
+        maxs[1] = std::max(maxs[1], pos[1]);
+        maxs[2] = std::max(maxs[2], pos[2]);
+    }
+    
+    // Choose split axis - use the longest axis for best balance
+    Vector3 extents = maxs - mins;
+    int splitAxis = 0;
+    if (extents[1] > extents[0] && extents[1] >= extents[2]) splitAxis = 1;
+    else if (extents[2] > extents[0] && extents[2] > extents[1]) splitAxis = 2;
+    
+    // Choose split position - median of probe positions on this axis
+    std::vector<float> axisValues;
+    axisValues.reserve(count);
+    for (uint32_t i = start; i < start + count; i++) {
+        axisValues.push_back(refs[refIndices[i]].origin[splitAxis]);
+    }
+    std::sort(axisValues.begin(), axisValues.end());
+    float splitValue = axisValues[count / 2];
+    
+    // Partition probes around split plane
+    // Move all probes <= splitValue to left side
+    uint32_t leftCount = 0;
+    for (uint32_t i = start; i < start + count; i++) {
+        if (refs[refIndices[i]].origin[splitAxis] <= splitValue) {
+            std::swap(refIndices[start + leftCount], refIndices[i]);
+            leftCount++;
+        }
+    }
+    
+    // Handle edge case where all probes are on one side
+    if (leftCount == 0) leftCount = 1;
+    if (leftCount == count) leftCount = count - 1;
+    
+    uint32_t rightCount = count - leftCount;
+    
+    // Reserve this internal node
+    uint32_t nodeIndex = static_cast<uint32_t>(ApexLegends::Bsp::lightprobeTree.size());
+    ApexLegends::Bsp::lightprobeTree.push_back(LightProbeTree_t{});  // Placeholder
+    
+    // CRITICAL: Children must be consecutive in the array!
+    // Left child at index childIdx, right child at childIdx+1
+    // Reserve both slots NOW before recursing
+    uint32_t childIdx = static_cast<uint32_t>(ApexLegends::Bsp::lightprobeTree.size());
+    ApexLegends::Bsp::lightprobeTree.push_back(LightProbeTree_t{});  // Left child placeholder
+    ApexLegends::Bsp::lightprobeTree.push_back(LightProbeTree_t{});  // Right child placeholder
+    
+    // Fill in this node first (we know child indices now)
+    LightProbeTree_t &node = ApexLegends::Bsp::lightprobeTree[nodeIndex];
+    node.tag = (childIdx << 2) | splitAxis;  // type 0/1/2 = X/Y/Z split
+    
+    // Store split value as float
+    union {
+        float f;
+        uint32_t i;
+    } conv;
+    conv.f = splitValue;
+    node.refCount = conv.i;  // refCount field holds splitValue for internal nodes
+    
+    // Now recursively fill the children
+    BuildLightProbeTreeRecursiveFill(refIndices, start, leftCount, depth + 1, childIdx);
+    BuildLightProbeTreeRecursiveFill(refIndices, start + leftCount, rightCount, depth + 1, childIdx + 1);
+    
+    return nodeIndex;
+}
+
+// Version that fills a pre-allocated node slot
+static void BuildLightProbeTreeRecursiveFill(
+    std::vector<uint32_t> &refIndices,
+    uint32_t start, uint32_t count,
+    int depth,
+    uint32_t nodeIndex)
+{
+    const auto &refs = ApexLegends::Bsp::lightprobeReferences;
+    
+    // If few enough probes, create a leaf
+    if (count <= MAX_PROBES_PER_LEAF || depth > 20) {
+        LightProbeTree_t &leaf = ApexLegends::Bsp::lightprobeTree[nodeIndex];
+        leaf.tag = (start << 2) | 3;  // type 3 = leaf
+        leaf.refCount = count;
+        return;
+    }
+    
+    // Calculate bounds
+    Vector3 mins(FLT_MAX, FLT_MAX, FLT_MAX);
+    Vector3 maxs(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    
+    for (uint32_t i = start; i < start + count; i++) {
+        const Vector3 &pos = refs[refIndices[i]].origin;
+        mins[0] = std::min(mins[0], pos[0]);
+        mins[1] = std::min(mins[1], pos[1]);
+        mins[2] = std::min(mins[2], pos[2]);
+        maxs[0] = std::max(maxs[0], pos[0]);
+        maxs[1] = std::max(maxs[1], pos[1]);
+        maxs[2] = std::max(maxs[2], pos[2]);
+    }
+    
+    // Choose split axis
+    Vector3 extents = maxs - mins;
+    int splitAxis = 0;
+    if (extents[1] > extents[0] && extents[1] >= extents[2]) splitAxis = 1;
+    else if (extents[2] > extents[0] && extents[2] > extents[1]) splitAxis = 2;
+    
+    // Choose split position (median)
+    std::vector<float> axisValues;
+    axisValues.reserve(count);
+    for (uint32_t i = start; i < start + count; i++) {
+        axisValues.push_back(refs[refIndices[i]].origin[splitAxis]);
+    }
+    std::sort(axisValues.begin(), axisValues.end());
+    float splitValue = axisValues[count / 2];
+    
+    // Partition probes
+    uint32_t leftCount = 0;
+    for (uint32_t i = start; i < start + count; i++) {
+        if (refs[refIndices[i]].origin[splitAxis] <= splitValue) {
+            std::swap(refIndices[start + leftCount], refIndices[i]);
+            leftCount++;
+        }
+    }
+    
+    if (leftCount == 0) leftCount = 1;
+    if (leftCount == count) leftCount = count - 1;
+    uint32_t rightCount = count - leftCount;
+    
+    // Reserve child slots (consecutive pair)
+    uint32_t childIdx = static_cast<uint32_t>(ApexLegends::Bsp::lightprobeTree.size());
+    ApexLegends::Bsp::lightprobeTree.push_back(LightProbeTree_t{});  // Left
+    ApexLegends::Bsp::lightprobeTree.push_back(LightProbeTree_t{});  // Right
+    
+    // Fill this node
+    LightProbeTree_t &node = ApexLegends::Bsp::lightprobeTree[nodeIndex];
+    node.tag = (childIdx << 2) | splitAxis;
+    
+    union { float f; uint32_t i; } conv;
+    conv.f = splitValue;
+    node.refCount = conv.i;
+    
+    // Recurse
+    BuildLightProbeTreeRecursiveFill(refIndices, start, leftCount, depth + 1, childIdx);
+    BuildLightProbeTreeRecursiveFill(refIndices, start + leftCount, rightCount, depth + 1, childIdx + 1);
+}
+
+/*
+    BuildLightProbeTree
+    Builds the spatial lookup tree for lightprobes.
+    This is a KD-tree that allows efficient nearest-probe lookup.
+*/
+static void BuildLightProbeTree() {
+    ApexLegends::Bsp::lightprobeTree.clear();
+    
+    uint32_t numRefs = static_cast<uint32_t>(ApexLegends::Bsp::lightprobeReferences.size());
+    
+    if (numRefs == 0) {
+        // No probes - create empty leaf
+        LightProbeTree_t leaf;
+        leaf.tag = (0 << 2) | 3;
+        leaf.refCount = 0;
+        ApexLegends::Bsp::lightprobeTree.push_back(leaf);
+        return;
+    }
+    
+    // Create index array for sorting
+    std::vector<uint32_t> refIndices(numRefs);
+    for (uint32_t i = 0; i < numRefs; i++) {
+        refIndices[i] = i;
+    }
+    
+    // Build tree recursively
+    BuildLightProbeTreeRecursive(refIndices, 0, numRefs, 0);
+    
+    // Reorder lightprobeReferences to match the tree's expected order
+    std::vector<LightProbeRef_t> reorderedRefs(numRefs);
+    for (uint32_t i = 0; i < numRefs; i++) {
+        reorderedRefs[i] = ApexLegends::Bsp::lightprobeReferences[refIndices[i]];
+    }
+    ApexLegends::Bsp::lightprobeReferences = std::move(reorderedRefs);
+    
+    Sys_Printf("     Built KD-tree with %zu nodes for %u probes\n", 
+               ApexLegends::Bsp::lightprobeTree.size(), numRefs);
+}
+
+
 void ApexLegends::EmitLightProbes() {
     Sys_Printf("--- EmitLightProbes ---\n");
     
@@ -2276,12 +2862,38 @@ void ApexLegends::EmitLightProbes() {
         }
     }
     
-    if (!probePositions.empty()) {
-        Sys_Printf("     Found %zu info_lightprobe entities\n", probePositions.size());
-    } else {
-        // No manual probes - generate Voronoi-based adaptive placement
-        Sys_Printf("     No info_lightprobe entities, generating Voronoi-based placement...\n");
-        GenerateProbePositionsVoronoi(worldBounds, probePositions);
+    size_t manualProbeCount = probePositions.size();
+    if (manualProbeCount > 0) {
+        Sys_Printf("     Found %zu info_lightprobe entities\n", manualProbeCount);
+    }
+    
+    // Always generate Voronoi-based probes, combining with any manual ones
+    Sys_Printf("     Generating Voronoi-based placement...\n");
+    std::vector<Vector3> generatedPositions;
+    GenerateProbePositionsVoronoi(worldBounds, generatedPositions);
+    
+    // Add generated probes, but skip any too close to manual probes
+    constexpr float MANUAL_PROBE_EXCLUSION_RADIUS = 48.0f;
+    size_t skippedNearManual = 0;
+    
+    for (const Vector3 &genPos : generatedPositions) {
+        bool tooCloseToManual = false;
+        for (size_t i = 0; i < manualProbeCount; i++) {
+            Vector3 delta = genPos - probePositions[i];
+            if (vector3_dot(delta, delta) < MANUAL_PROBE_EXCLUSION_RADIUS * MANUAL_PROBE_EXCLUSION_RADIUS) {
+                tooCloseToManual = true;
+                skippedNearManual++;
+                break;
+            }
+        }
+        if (!tooCloseToManual) {
+            probePositions.push_back(genPos);
+        }
+    }
+    
+    if (manualProbeCount > 0) {
+        Sys_Printf("     Combined %zu manual + %zu generated probes (%zu skipped near manual)\n", 
+                   manualProbeCount, generatedPositions.size() - skippedNearManual, skippedNearManual);
     }
     
     // Ensure we have at least one probe
@@ -2291,13 +2903,24 @@ void ApexLegends::EmitLightProbes() {
         Sys_Printf("     Using single probe at world center\n");
     }
     
-    // Create base probe template
-    LightProbe_v50_t baseProbe;
+    // Create base probe template with correct default values
+    // Based on analysis of official Apex Legends BSP files
+    LightProbe_t baseProbe;
     memset(&baseProbe, 0, sizeof(baseProbe));
     baseProbe.staticLightIndexes[0] = 0xFFFF;
     baseProbe.staticLightIndexes[1] = 0xFFFF;
     baseProbe.staticLightIndexes[2] = 0xFFFF;
     baseProbe.staticLightIndexes[3] = 0xFFFF;
+    // staticLightFlags: 0xFF for each valid light slot, 0x00 for unused
+    // Template starts with no valid lights - AssignNearestLights will set these
+    baseProbe.staticLightFlags[0] = 0x00;
+    baseProbe.staticLightFlags[1] = 0x00;
+    baseProbe.staticLightFlags[2] = 0x00;
+    baseProbe.staticLightFlags[3] = 0x00;
+    baseProbe.lightingFlags = 0x0096;      // Usually 150 (0x96) in official maps
+    baseProbe.reserved = 0xFFFF;           // Usually 0xFFFF in official maps
+    baseProbe.padding0 = 0xFFFFFFFF;       // Usually 0xFFFFFFFF in official maps  
+    baseProbe.padding1 = 0x00000000;       // Always 0 in official maps
     
     // Compute per-probe lighting using spherical sampling
     Sys_Printf("     Computing probe lighting using 162-direction spherical sampling...\n");
@@ -2328,14 +2951,18 @@ void ApexLegends::EmitLightProbes() {
     
     // Compress probe list if we have too many (Source SDK style optimization)
     // Remove redundant probes that can be reconstructed from neighbors
-    CompressProbeList(candidates, 2048);
+    //CompressProbeList(candidates, LIGHT_PROBE_MAX_COUNT);
     
     // Convert candidates to final probe data
     for (const ProbeCandidate &candidate : candidates) {
-        LightProbe_v50_t probe = baseProbe;
+        LightProbe_t probe = baseProbe;
         
         // Convert 6-sided cube to spherical harmonics
         ConvertCubeToSphericalHarmonics(candidate.cube, probe);
+        
+        // Assign static worldlight indices for entity lighting
+        // This finds the most influential lights at this probe's position
+        AssignStaticLightsToProbe(candidate.pos, probe);
         
         ApexLegends::Bsp::lightprobes.push_back(probe);
         
@@ -2348,14 +2975,10 @@ void ApexLegends::EmitLightProbes() {
         ApexLegends::Bsp::lightprobeReferences.push_back(ref);
     }
     
-    // Build spatial lookup tree
-    // For simplicity, create a single leaf node containing all probes
-    // This works correctly - engine iterates through all refs
-    // A proper BSP tree would be faster for large counts but this is valid
-    LightProbeTree_t leaf;
-    leaf.tag = (0 << 2) | 3;  // refStart=0, type=3 (leaf)
-    leaf.refCount = static_cast<uint32_t>(ApexLegends::Bsp::lightprobeReferences.size());
-    ApexLegends::Bsp::lightprobeTree.push_back(leaf);
+    // Build spatial lookup tree (KD-tree)
+    // This is required for proper probe lookup - a single leaf doesn't work
+    // for maps with probes spread over large distances
+    BuildLightProbeTree();
     
     // Create parent info for worldspawn
     LightProbeParentInfo_t info;
@@ -2371,6 +2994,41 @@ void ApexLegends::EmitLightProbes() {
     Sys_Printf("     %9zu light probes\n", ApexLegends::Bsp::lightprobes.size());
     Sys_Printf("     %9zu probe references\n", ApexLegends::Bsp::lightprobeReferences.size());
     Sys_Printf("     %9zu tree nodes\n", ApexLegends::Bsp::lightprobeTree.size());
+    
+    // Count probes with static lights assigned
+    size_t probesWithLights = 0;
+    for (const auto &probe : ApexLegends::Bsp::lightprobes) {
+        if (probe.staticLightIndexes[0] != 0xFFFF) {
+            probesWithLights++;
+        }
+    }
+    Sys_Printf("     %9zu probes with static lights\n", probesWithLights);
+
+    // Populate static prop lightprobe indices (lump 0x66)
+    // One entry per static prop, pointing to the nearest light probe
+    const uint32_t numStaticProps = ApexLegends::Bsp::gameLumpPropHeader.numStaticProps;
+    if (numStaticProps > 0 && !ApexLegends::Bsp::lightprobeReferences.empty()) {
+        ApexLegends::Bsp::staticPropLightprobeIndices.resize(numStaticProps);
+        for (uint32_t i = 0; i < numStaticProps; i++) {
+            const ApexLegends::GameLumpProp_t &prop = ApexLegends::Bsp::gameLumpProps[i];
+            // Find nearest light probe reference by distance
+            float bestDistSq = FLT_MAX;
+            uint32_t bestIdx = 0;
+            for (uint32_t j = 0; j < ApexLegends::Bsp::lightprobeReferences.size(); j++) {
+                const LightProbeRef_t &ref = ApexLegends::Bsp::lightprobeReferences[j];
+                float dx = ref.origin[0] - prop.origin[0];
+                float dy = ref.origin[1] - prop.origin[1];
+                float dz = ref.origin[2] - prop.origin[2];
+                float distSq = dx*dx + dy*dy + dz*dz;
+                if (distSq < bestDistSq) {
+                    bestDistSq = distSq;
+                    bestIdx = ref.lightProbeIndex;
+                }
+            }
+            ApexLegends::Bsp::staticPropLightprobeIndices[i] = bestIdx;
+        }
+        Sys_Printf("     %9u static prop lightprobe indices\n", numStaticProps);
+    }
     
     // Export probe positions for visualization in Radiant
     if (!ApexLegends::Bsp::lightprobeReferences.empty()) {
@@ -2391,13 +3049,14 @@ void ApexLegends::EmitLightProbes() {
                 // Get the probe's ambient color from spherical harmonics (DC term)
                 float r = 0.5f, g = 0.5f, b = 0.5f;  // default gray
                 if (ref.lightProbeIndex < ApexLegends::Bsp::lightprobes.size()) {
-                    const LightProbe_v50_t &probe = ApexLegends::Bsp::lightprobes[ref.lightProbeIndex];
-                    // SH DC term is the average ambient - extract from coefficient 0
+                    const LightProbe_t &probe = ApexLegends::Bsp::lightprobes[ref.lightProbeIndex];
+                    // SH DC term is the average ambient - extract from coefficient 3 (not 0!)
                     // ambientSH[channel][coefficient] where channel 0=R, 1=G, 2=B
-                    // The DC coefficient (index 0) represents average irradiance
-                    r = std::min(1.0f, std::max(0.0f, (float)probe.ambientSH[0][0] / 32767.0f));
-                    g = std::min(1.0f, std::max(0.0f, (float)probe.ambientSH[1][0] / 32767.0f));
-                    b = std::min(1.0f, std::max(0.0f, (float)probe.ambientSH[2][0] / 32767.0f));
+                    // Coefficients: [0]=X gradient, [1]=Y gradient, [2]=Z gradient, [3]=DC
+                    // Scale back from int16 range using the same scale factor (8192)
+                    r = std::min(1.0f, std::max(0.0f, (float)probe.ambientSH[0][3] / 8192.0f));
+                    g = std::min(1.0f, std::max(0.0f, (float)probe.ambientSH[1][3] / 8192.0f));
+                    b = std::min(1.0f, std::max(0.0f, (float)probe.ambientSH[2][3] / 8192.0f));
                 }
                 
                 fprintf(probesFile, "%.2f %.2f %.2f %.3f %.3f %.3f\n", 

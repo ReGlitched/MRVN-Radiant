@@ -31,6 +31,8 @@
 #include <cstring>
 #include <map>
 #include <tuple>
+#include <string>
+#include <cctype>
 
 // BVH4 Collision System
 //
@@ -91,6 +93,7 @@ namespace {
         Vector3 normal;
         int contentFlags;
         int surfaceFlags;
+        int surfPropIdx;      // Index into Surface Properties lump
     };
 
     struct CollisionHull_t {
@@ -136,6 +139,98 @@ namespace {
     float g_bvhScale = 1.0f / 65536.0f;
     uint32_t g_modelPackedVertexBase = 0;
     uint32_t g_modelCollisionVertexBase = 0;
+    uint32_t g_modelBVHNodeBase = 0;
+    uint32_t g_modelBVHLeafBase = 0;
+
+    // Map from (surfaceFlags, contentFlags, surfaceName) to surface property index
+    // This ensures we don't emit duplicate surface property entries
+    std::map<std::tuple<uint16_t, int, std::string>, int> g_surfacePropertyMap;
+
+    // Emits a surface property and returns its index (0-2047 range, 11-bit)
+    // Surface properties link collision surfaces to material names, content masks, and surface flags
+    int EmitSurfaceProperty(int surfaceFlags, int contentFlags, const char* surfaceName) {
+        // Get or create contents mask index
+        int contentsIdx = ApexLegends::EmitContentsMask(contentFlags);
+        if (contentsIdx > 255) {
+            Sys_FPrintf(SYS_WRN, "Warning: Contents mask index %d exceeds uint8_t max, clamping\n", contentsIdx);
+            contentsIdx = 255;
+        }
+
+        // Sanitize surface name for the BSP (strip 'textures/' prefix, convert slashes)
+        std::string name = surfaceName ? surfaceName : "concrete";
+        if (name.rfind("textures/", 0) == 0) {
+            name.erase(0, 9);  // Remove 'textures/' prefix
+        }
+        std::replace(name.begin(), name.end(), '/', '\\');
+        // Convert to uppercase to match official maps
+        for (char& c : name) {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+
+        // Clamp surfaceFlags to uint16
+        uint16_t surfFlags = static_cast<uint16_t>(surfaceFlags & 0xFFFF);
+
+        // Check if we already have this surface property
+        auto key = std::make_tuple(surfFlags, contentFlags, name);
+        auto it = g_surfacePropertyMap.find(key);
+        if (it != g_surfacePropertyMap.end()) {
+            return it->second;
+        }
+
+        // Find or add the surface name to the Surface Names lump (textureDataData)
+        // Search for exact null-terminated string match
+        size_t nameOffset = std::string::npos;
+        std::string searchName = name + '\0';
+        const char* tableData = Titanfall::Bsp::textureDataData.data();
+        size_t tableSize = Titanfall::Bsp::textureDataData.size();
+        
+        for (size_t pos = 0; pos < tableSize; ) {
+            // Find the end of current string
+            size_t strEnd = pos;
+            while (strEnd < tableSize && tableData[strEnd] != '\0') {
+                strEnd++;
+            }
+            
+            // Compare string at this position
+            size_t strLen = strEnd - pos;
+            if (strLen == name.size() && std::memcmp(tableData + pos, name.c_str(), strLen) == 0) {
+                nameOffset = pos;
+                break;
+            }
+            
+            // Move to next string (skip the null terminator)
+            pos = strEnd + 1;
+        }
+        
+        if (nameOffset == std::string::npos) {
+            // Not found, append it
+            nameOffset = Titanfall::Bsp::textureDataData.size();
+            Titanfall::Bsp::textureDataData.insert(
+                Titanfall::Bsp::textureDataData.end(),
+                name.begin(), name.end());
+            Titanfall::Bsp::textureDataData.push_back('\0');
+        }
+
+        // Create the surface property entry
+        ApexLegends::CollSurfProps_t prop;
+        prop.surfFlags = surfFlags;
+        prop.surfTypeID = 0;  // Default surface type (could be extended to parse from surfaceproperties.txt)
+        prop.contentsIdx = static_cast<uint8_t>(contentsIdx);
+        prop.nameOffset = static_cast<uint32_t>(nameOffset);
+
+        int propIdx = static_cast<int>(ApexLegends::Bsp::surfaceProperties.size());
+        
+        // Check if we exceed the 12-bit limit (0-4095, but bit 11 is a flag so 0-2047 safe)
+        if (propIdx >= 2048) {
+            Sys_FPrintf(SYS_WRN, "Warning: Surface property index %d exceeds 11-bit limit, clamping\n", propIdx);
+            return 2047;
+        }
+
+        ApexLegends::Bsp::surfaceProperties.push_back(prop);
+        g_surfacePropertyMap[key] = propIdx;
+
+        return propIdx;
+    }
 
     // Snaps vertex to grid to prevent floating point precision issues
     Vector3 SnapVertexToGrid(const Vector3& vert) {
@@ -526,6 +621,17 @@ namespace {
         return leafIndex;
     }
 
+    // Get the most common surface property index from a set of triangles
+    // Returns 0 if no triangles provided
+    int GetLeafSurfPropIdx(const std::vector<int>& triIndices) {
+        if (triIndices.empty()) {
+            return 0;
+        }
+        // Use the first triangle's surface property (they should all be the same material in a leaf)
+        // Could be extended to track per-poly surface properties if needed
+        return g_collisionTris[triIndices[0]].surfPropIdx;
+    }
+
     int SelectBestLeafType(const std::vector<int>& triIndices, int preferredType = BVH4_TYPE_TRISTRIP) {
         if (triIndices.empty()) {
             return BVH4_TYPE_EMPTY;
@@ -534,10 +640,12 @@ namespace {
         return BVH4_TYPE_TRISTRIP;
     }
 
-    int EmitLeafDataForType(int leafType, const std::vector<int>& triIndices, int surfPropIdx = 0) {
+    int EmitLeafDataForType(int leafType, const std::vector<int>& triIndices) {
         if (triIndices.empty()) {
             return 0;
         }
+
+        int surfPropIdx = GetLeafSurfPropIdx(triIndices);
 
         switch (leafType) {
             case BVH4_TYPE_TRISTRIP:
@@ -729,6 +837,72 @@ namespace {
         return nodeIndex;
     }
 
+    // Builds a BVH4 tree over static props (each prop becomes a type-9 leaf)
+    int BuildStaticPropBVH(const std::vector<int>& propIndices, int depth) {
+        if (propIndices.empty()) return -1;
+
+        int nodeIndex = g_bvhBuildNodes.size();
+        g_bvhBuildNodes.emplace_back();
+
+        // Compute bounds from all props
+        MinMax bounds;
+        bounds.mins = Vector3(std::numeric_limits<float>::max());
+        bounds.maxs = Vector3(std::numeric_limits<float>::lowest());
+        for (int idx : propIndices) {
+            bounds.mins = Vec3Min(bounds.mins, g_collisionStaticProps[idx].bounds.mins);
+            bounds.maxs = Vec3Max(bounds.maxs, g_collisionStaticProps[idx].bounds.maxs);
+        }
+        g_bvhBuildNodes[nodeIndex].bounds = bounds;
+        g_bvhBuildNodes[nodeIndex].contentFlags = CONTENTS_SOLID;
+
+        // Up to 4 props can be direct children of one node (each as a STATICPROP leaf)
+        if (propIndices.size() <= 4 || depth >= MAX_BVH_DEPTH) {
+            g_bvhBuildNodes[nodeIndex].isLeaf = true;
+            g_bvhBuildNodes[nodeIndex].staticPropIndices.assign(propIndices.begin(), propIndices.end());
+            return nodeIndex;
+        }
+
+        // Partition spatially along longest axis
+        Vector3 size = bounds.maxs - bounds.mins;
+        int axis = 0;
+        if (size.y() > size.x()) axis = 1;
+        if (size.z() > size[axis]) axis = 2;
+
+        std::vector<int> sorted = propIndices;
+        std::sort(sorted.begin(), sorted.end(), [axis](int a, int b) {
+            Vector3 centA = (g_collisionStaticProps[a].bounds.mins + g_collisionStaticProps[a].bounds.maxs) * 0.5f;
+            Vector3 centB = (g_collisionStaticProps[b].bounds.mins + g_collisionStaticProps[b].bounds.maxs) * 0.5f;
+            return centA[axis] < centB[axis];
+        });
+
+        int numPartitions = (sorted.size() >= 8) ? 4 : 2;
+        std::vector<int> partitions[4];
+        size_t perPart = (sorted.size() + numPartitions - 1) / numPartitions;
+        for (size_t i = 0; i < sorted.size(); i++) {
+            int p = std::min((int)(i / perPart), numPartitions - 1);
+            partitions[p].push_back(sorted[i]);
+        }
+
+        g_bvhBuildNodes[nodeIndex].isLeaf = false;
+        for (int i = 0; i < 4; i++) {
+            if (i < numPartitions && !partitions[i].empty()) {
+                int childIdx = BuildStaticPropBVH(partitions[i], depth + 1);
+                g_bvhBuildNodes[nodeIndex].childIndices[i] = childIdx;
+                if (childIdx >= 0 && g_bvhBuildNodes[childIdx].isLeaf) {
+                    // Will be handled specially in EmitBVH4Nodes
+                    g_bvhBuildNodes[nodeIndex].childTypes[i] = BVH4_TYPE_NODE;
+                } else {
+                    g_bvhBuildNodes[nodeIndex].childTypes[i] = BVH4_TYPE_NODE;
+                }
+            } else {
+                g_bvhBuildNodes[nodeIndex].childIndices[i] = -1;
+                g_bvhBuildNodes[nodeIndex].childTypes[i] = BVH4_TYPE_NONE;
+            }
+        }
+
+        return nodeIndex;
+    }
+
     int EmitBVH4Nodes(int buildNodeIndex, int& leafDataOffset) {
         if (buildNodeIndex < 0 || buildNodeIndex >= (int)g_bvhBuildNodes.size()) {
             return -1;
@@ -742,21 +916,49 @@ namespace {
         ApexLegends::Bsp::bvhNodes[bspNodeIndex].cmIndex = ApexLegends::EmitContentsMask(buildNode.contentFlags);
 
         if (buildNode.isLeaf) {
-            int leafType = SelectBestLeafType(buildNode.triangleIndices, buildNode.preferredLeafType);
-            ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType0 = leafType;
-            ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType1 = BVH4_TYPE_NONE;
-            ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType2 = BVH4_TYPE_NONE;
-            ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType3 = BVH4_TYPE_NONE;
+            if (!buildNode.staticPropIndices.empty()) {
+                // Static prop leaf: each prop becomes a STATICPROP child of this node
+                int childTypes[4] = { BVH4_TYPE_NONE, BVH4_TYPE_NONE, BVH4_TYPE_NONE, BVH4_TYPE_NONE };
+                int childIndexes[4] = { 0, 0, 0, 0 };
+                MinMax childBounds[4];
+                childBounds[0] = childBounds[1] = childBounds[2] = childBounds[3] = buildNode.bounds;
 
-            ApexLegends::Bsp::bvhNodes[bspNodeIndex].index0 = EmitLeafDataForType(leafType, buildNode.triangleIndices);
-            ApexLegends::Bsp::bvhNodes[bspNodeIndex].index1 = 0;
-            ApexLegends::Bsp::bvhNodes[bspNodeIndex].index2 = 0;
-            ApexLegends::Bsp::bvhNodes[bspNodeIndex].index3 = 0;
+                for (size_t i = 0; i < buildNode.staticPropIndices.size() && i < 4; i++) {
+                    int spIdx = buildNode.staticPropIndices[i];
+                    childTypes[i] = BVH4_TYPE_STATICPROP;
+                    childIndexes[i] = EmitStaticPropLeaf(g_collisionStaticProps[spIdx].propIndex) - g_modelBVHLeafBase;
+                    childBounds[i] = g_collisionStaticProps[spIdx].bounds;
+                }
 
-            MinMax childBounds[4];
-            childBounds[0] = buildNode.bounds;
-            childBounds[1] = childBounds[2] = childBounds[3] = buildNode.bounds;
-            PackBoundsToInt16(childBounds, ApexLegends::Bsp::bvhNodes[bspNodeIndex].bounds);
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType0 = childTypes[0];
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType1 = childTypes[1];
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType2 = childTypes[2];
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType3 = childTypes[3];
+
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index0 = childIndexes[0];
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index1 = childIndexes[1];
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index2 = childIndexes[2];
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index3 = childIndexes[3];
+
+                PackBoundsToInt16(childBounds, ApexLegends::Bsp::bvhNodes[bspNodeIndex].bounds);
+            } else {
+                // Triangle leaf (existing logic)
+                int leafType = SelectBestLeafType(buildNode.triangleIndices, buildNode.preferredLeafType);
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType0 = leafType;
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType1 = BVH4_TYPE_NONE;
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType2 = BVH4_TYPE_NONE;
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].childType3 = BVH4_TYPE_NONE;
+
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index0 = EmitLeafDataForType(leafType, buildNode.triangleIndices) - g_modelBVHLeafBase;
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index1 = 0;
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index2 = 0;
+                ApexLegends::Bsp::bvhNodes[bspNodeIndex].index3 = 0;
+
+                MinMax childBounds[4];
+                childBounds[0] = buildNode.bounds;
+                childBounds[1] = childBounds[2] = childBounds[3] = buildNode.bounds;
+                PackBoundsToInt16(childBounds, ApexLegends::Bsp::bvhNodes[bspNodeIndex].bounds);
+            }
 
         } else {
             MinMax childBounds[4];
@@ -783,10 +985,10 @@ namespace {
 
                 if (buildNode.childIndices[i] >= 0) {
                     if (childType == BVH4_TYPE_NODE) {
-                        childIndex = EmitBVH4Nodes(buildNode.childIndices[i], leafDataOffset);
+                        childIndex = EmitBVH4Nodes(buildNode.childIndices[i], leafDataOffset) - g_modelBVHNodeBase;
                     } else if (childType != BVH4_TYPE_NONE && childType != BVH4_TYPE_EMPTY) {
                         const BVHBuildNode_t& childBuild = g_bvhBuildNodes[buildNode.childIndices[i]];
-                        childIndex = EmitLeafDataForType(childType, childBuild.triangleIndices);
+                        childIndex = EmitLeafDataForType(childType, childBuild.triangleIndices) - g_modelBVHLeafBase;
                     }
                 }
 
@@ -804,14 +1006,20 @@ namespace {
 
     void CollectTrianglesFromMeshes() {
         g_collisionTris.clear();
+        g_surfacePropertyMap.clear();
 
         int skippedDegenerate = 0;
         int totalTris = 0;
 
         for (const Shared::Mesh_t& mesh : Shared::meshes) {
             int contentFlags = CONTENTS_SOLID;
+            int surfaceFlags = 0;
+            const char* surfaceName = "concrete";
+            
             if (mesh.shaderInfo) {
                 contentFlags = mesh.shaderInfo->contentFlags;
+                surfaceFlags = mesh.shaderInfo->surfaceFlags;
+                surfaceName = mesh.shaderInfo->shader.c_str();
 
                 if (!(contentFlags & CONTENTS_SOLID) &&
                     !(contentFlags & CONTENTS_PLAYERCLIP) &&
@@ -819,6 +1027,9 @@ namespace {
                     continue;
                 }
             }
+
+            // Get or create surface property for this mesh
+            int surfPropIdx = EmitSurfaceProperty(surfaceFlags, contentFlags, surfaceName);
 
             const std::vector<Shared::Vertex_t>& verts = mesh.vertices;
             const std::vector<uint16_t>& indices = mesh.triangles;
@@ -845,7 +1056,8 @@ namespace {
                 }
 
                 tri.contentFlags = contentFlags;
-                tri.surfaceFlags = mesh.shaderInfo ? mesh.shaderInfo->surfaceFlags : 0;
+                tri.surfaceFlags = surfaceFlags;
+                tri.surfPropIdx = surfPropIdx;
 
                 g_collisionTris.push_back(tri);
             }
@@ -867,10 +1079,16 @@ void ApexLegends::EmitBVHNode() {
     model.bvhNodeIndex = ApexLegends::Bsp::bvhNodes.size();
     model.bvhLeafIndex = ApexLegends::Bsp::bvhLeafDatas.size();
 
+    g_modelBVHNodeBase = static_cast<uint32_t>(model.bvhNodeIndex);
+    g_modelBVHLeafBase = static_cast<uint32_t>(model.bvhLeafIndex);
+
     CollectTrianglesFromMeshes();
 
-    if (g_collisionTris.empty()) {
-        Sys_FPrintf(SYS_WRN, "Warning: No collision triangles, emitting empty BVH node\n");
+    bool hasTris = !g_collisionTris.empty();
+    bool hasProps = !g_collisionStaticProps.empty();
+
+    if (!hasTris && !hasProps) {
+        Sys_FPrintf(SYS_WRN, "Warning: No collision geometry, emitting empty BVH node\n");
 
         model.origin[0] = model.origin[1] = model.origin[2] = 0.0f;
         model.scale = 1.0f / 65536.0f;
@@ -886,6 +1104,7 @@ void ApexLegends::EmitBVHNode() {
         return;
     }
 
+    // Compute overall bounds from triangles AND static props
     MinMax overallBounds;
     overallBounds.mins = Vector3(std::numeric_limits<float>::max());
     overallBounds.maxs = Vector3(std::numeric_limits<float>::lowest());
@@ -893,6 +1112,11 @@ void ApexLegends::EmitBVHNode() {
     for (const CollisionTri_t& tri : g_collisionTris) {
         overallBounds.mins = Vec3Min(overallBounds.mins, Vec3Min(Vec3Min(tri.v0, tri.v1), tri.v2));
         overallBounds.maxs = Vec3Max(overallBounds.maxs, Vec3Max(Vec3Max(tri.v0, tri.v1), tri.v2));
+    }
+
+    for (const CollisionStaticProp_t& sp : g_collisionStaticProps) {
+        overallBounds.mins = Vec3Min(overallBounds.mins, sp.bounds.mins);
+        overallBounds.maxs = Vec3Max(overallBounds.maxs, sp.bounds.maxs);
     }
 
     Vector3 center = (overallBounds.mins + overallBounds.maxs) * 0.5f;
@@ -909,7 +1133,6 @@ void ApexLegends::EmitBVHNode() {
     g_bvhOrigin = center;
     g_bvhScale = bvhScale;
 
-    uint32_t renderVertexCount = static_cast<uint32_t>(Titanfall::Bsp::vertices.size());
     g_modelCollisionVertexBase = static_cast<uint32_t>(ApexLegends::Bsp::collisionVertices.size());
     g_modelPackedVertexBase = static_cast<uint32_t>(ApexLegends::Bsp::packedVertices.size());
 
@@ -917,14 +1140,48 @@ void ApexLegends::EmitBVHNode() {
     model.origin[1] = center.y();
     model.origin[2] = center.z();
     model.scale = bvhScale;
-    model.vertexIndex = renderVertexCount + g_modelCollisionVertexBase;
+    /* Store collision vertex base only; the final render vertex count
+       is added in CompileR5BSPFile() once all entities are processed. */
+    model.vertexIndex = g_modelCollisionVertexBase;
     model.bvhFlags = 0;
 
-    std::vector<int> allTriIndices(g_collisionTris.size());
-    std::iota(allTriIndices.begin(), allTriIndices.end(), 0);
-
     g_bvhBuildNodes.clear();
-    int rootBuildIndex = BuildBVH4Node(allTriIndices, 0);
+
+    // Build triangle BVH
+    int triRootIndex = -1;
+    if (hasTris) {
+        std::vector<int> allTriIndices(g_collisionTris.size());
+        std::iota(allTriIndices.begin(), allTriIndices.end(), 0);
+        triRootIndex = BuildBVH4Node(allTriIndices, 0);
+    }
+
+    // Build static prop BVH
+    int propRootIndex = -1;
+    if (hasProps) {
+        std::vector<int> allPropIndices(g_collisionStaticProps.size());
+        std::iota(allPropIndices.begin(), allPropIndices.end(), 0);
+        propRootIndex = BuildStaticPropBVH(allPropIndices, 0);
+        Sys_FPrintf(SYS_VRB, "  Built static prop collision BVH for %zu props\n", g_collisionStaticProps.size());
+    }
+
+    // Determine final root
+    int rootBuildIndex;
+    if (triRootIndex >= 0 && propRootIndex >= 0) {
+        // Create wrapper root combining triangle BVH and static prop BVH
+        rootBuildIndex = g_bvhBuildNodes.size();
+        g_bvhBuildNodes.emplace_back();
+        g_bvhBuildNodes[rootBuildIndex].bounds = overallBounds;
+        g_bvhBuildNodes[rootBuildIndex].isLeaf = false;
+        g_bvhBuildNodes[rootBuildIndex].contentFlags = CONTENTS_SOLID;
+        g_bvhBuildNodes[rootBuildIndex].childIndices[0] = triRootIndex;
+        g_bvhBuildNodes[rootBuildIndex].childTypes[0] = BVH4_TYPE_NODE;
+        g_bvhBuildNodes[rootBuildIndex].childIndices[1] = propRootIndex;
+        g_bvhBuildNodes[rootBuildIndex].childTypes[1] = BVH4_TYPE_NODE;
+    } else if (triRootIndex >= 0) {
+        rootBuildIndex = triRootIndex;
+    } else {
+        rootBuildIndex = propRootIndex;
+    }
 
     if (rootBuildIndex < 0) {
         Sys_FPrintf(SYS_WRN, "Warning: BVH build failed, emitting empty node\n");
@@ -945,9 +1202,14 @@ void ApexLegends::EmitBVHNode() {
     Sys_FPrintf(SYS_VRB, "  Emitted %zu BVH nodes\n", ApexLegends::Bsp::bvhNodes.size() - model.bvhNodeIndex);
     Sys_FPrintf(SYS_VRB, "  Emitted %zu BVH leaf data entries\n", ApexLegends::Bsp::bvhLeafDatas.size() - model.bvhLeafIndex);
     Sys_FPrintf(SYS_VRB, "  Emitted %zu collision vertices\n", ApexLegends::Bsp::collisionVertices.size() - g_modelCollisionVertexBase);
+    Sys_FPrintf(SYS_VRB, "  Emitted %zu surface properties\n", ApexLegends::Bsp::surfaceProperties.size());
+    if (hasProps) {
+        Sys_FPrintf(SYS_VRB, "  Emitted %zu static prop collision entries\n", g_collisionStaticProps.size());
+    }
 
     g_bvhBuildNodes.clear();
     g_collisionTris.clear();
+    g_collisionStaticProps.clear();
 }
 
 int ApexLegends::EmitBVHDataleaf() {
@@ -965,4 +1227,11 @@ int ApexLegends::EmitContentsMask(int mask) {
 
     ApexLegends::Bsp::contentsMasks.emplace_back(mask);
     return static_cast<int>(ApexLegends::Bsp::contentsMasks.size() - 1);
+}
+
+void ApexLegends::AddCollisionStaticProp(uint32_t propIndex, const MinMax& worldBounds) {
+    CollisionStaticProp_t sp;
+    sp.propIndex = propIndex;
+    sp.bounds = worldBounds;
+    g_collisionStaticProps.push_back(sp);
 }

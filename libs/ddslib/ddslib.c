@@ -40,6 +40,11 @@
 /* dependencies */
 #include "ddslib.h"
 
+#define BCDEC_IMPLEMENTATION
+#include "bcdec/bcdec.h"
+
+#include <math.h>
+
 
 
 /* endian tomfoolery */
@@ -154,11 +159,82 @@ static void DDSDecodePixelFormat( ddsBuffer_t *dds, ddsPF_t *pf ){
 	else if ( fourCC == *( (unsigned int*) "DXT5" ) ) {
 		*pf = DDS_PF_DXT5;
 	}
+	else if ( fourCC == *( (unsigned int*) "ATI1" ) ) {
+		*pf = DDS_PF_BC4;
+	}
+	else if ( fourCC == *( (unsigned int*) "ATI2" ) ) {
+		*pf = DDS_PF_BC5;
+	}
+	else if ( fourCC == *( (unsigned int*) "BC4U" ) ) {
+		*pf = DDS_PF_BC4;
+	}
+	else if ( fourCC == *( (unsigned int*) "BC5U" ) ) {
+		*pf = DDS_PF_BC5;
+	}
+	else if ( fourCC == *( (unsigned int*) "DX10" ) ) {
+		/* DX10 extended header follows the standard DDS header */
+		ddsDX10Header_t *dx10 = (ddsDX10Header_t *)( &dds->data[0] );
+		unsigned int dxgiFormat = dx10->dxgiFormat;
+
+		if ( dxgiFormat == DXGI_FORMAT_BC1_TYPELESS
+		  || dxgiFormat == DXGI_FORMAT_BC1_UNORM
+		  || dxgiFormat == DXGI_FORMAT_BC1_UNORM_SRGB ) {
+			*pf = DDS_PF_DXT1;
+		}
+		else if ( dxgiFormat == DXGI_FORMAT_BC2_TYPELESS
+		       || dxgiFormat == DXGI_FORMAT_BC2_UNORM
+		       || dxgiFormat == DXGI_FORMAT_BC2_UNORM_SRGB ) {
+			*pf = DDS_PF_DXT3;
+		}
+		else if ( dxgiFormat == DXGI_FORMAT_BC3_TYPELESS
+		       || dxgiFormat == DXGI_FORMAT_BC3_UNORM
+		       || dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ) {
+			*pf = DDS_PF_DXT5;
+		}
+		else if ( dxgiFormat == DXGI_FORMAT_BC4_TYPELESS
+		       || dxgiFormat == DXGI_FORMAT_BC4_UNORM
+		       || dxgiFormat == DXGI_FORMAT_BC4_SNORM ) {
+			*pf = DDS_PF_BC4;
+		}
+		else if ( dxgiFormat == DXGI_FORMAT_BC5_TYPELESS
+		       || dxgiFormat == DXGI_FORMAT_BC5_UNORM
+		       || dxgiFormat == DXGI_FORMAT_BC5_SNORM ) {
+			*pf = DDS_PF_BC5;
+		}
+		else if ( dxgiFormat == DXGI_FORMAT_BC6H_TYPELESS
+		       || dxgiFormat == DXGI_FORMAT_BC6H_UF16
+		       || dxgiFormat == DXGI_FORMAT_BC6H_SF16 ) {
+			*pf = DDS_PF_BC6H;
+		}
+		else if ( dxgiFormat == DXGI_FORMAT_BC7_TYPELESS
+		       || dxgiFormat == DXGI_FORMAT_BC7_UNORM
+		       || dxgiFormat == DXGI_FORMAT_BC7_UNORM_SRGB ) {
+			*pf = DDS_PF_BC7;
+		}
+		else {
+			*pf = DDS_PF_UNKNOWN;
+		}
+	}
 	else{
 		*pf = DDS_PF_UNKNOWN;
 	}
 }
 
+
+
+/*
+   DDSGetDataOffset()
+   returns the offset to pixel data, accounting for DX10 extended header
+ */
+
+static unsigned char* DDSGetDataPtr( ddsBuffer_t *dds ){
+	unsigned int fourCC = dds->pixelFormat.fourCC;
+	if ( fourCC == *( (unsigned int*) "DX10" ) ) {
+		/* skip the 20-byte DX10 extended header */
+		return dds->data + sizeof( ddsDX10Header_t );
+	}
+	return dds->data;
+}
 
 
 /*
@@ -198,485 +274,135 @@ int DDSGetInfo( ddsBuffer_t *dds, int *width, int *height, ddsPF_t *pf ){
 
 
 /*
-   DDSGetColorBlockColors()
-   extracts colors from a dds color block
+   DDSDecompressBlockFormat()
+   generic block decompression using bcdec, outputs RGBA8888
  */
 
-static void DDSGetColorBlockColors( ddsColorBlock_t *block, ddsColor_t colors[ 4 ] ){
-	unsigned short word;
+static int DDSDecompressBlockFormat( ddsBuffer_t *dds, int width, int height, unsigned char *pixels, ddsPF_t pf ){
+	int x, y, xBlocks, yBlocks;
+	int blockSize;
+	unsigned char *src;
+	unsigned char block[4 * 4 * 4]; /* 4x4 pixels, 4 bytes each (RGBA) */
 
+	xBlocks = ( width + 3 ) / 4;
+	yBlocks = ( height + 3 ) / 4;
 
-	/* color 0 */
-	word = DDSLittleShort( block->colors[ 0 ] );
-	colors[ 0 ].a = 0xff;
+	src = DDSGetDataPtr( dds );
 
-	/* extract rgb bits */
-	colors[ 0 ].b = (unsigned char) word;
-	colors[ 0 ].b <<= 3;
-	colors[ 0 ].b |= ( colors[ 0 ].b >> 5 );
-	word >>= 5;
-	colors[ 0 ].g = (unsigned char) word;
-	colors[ 0 ].g <<= 2;
-	colors[ 0 ].g |= ( colors[ 0 ].g >> 5 );
-	word >>= 6;
-	colors[ 0 ].r = (unsigned char) word;
-	colors[ 0 ].r <<= 3;
-	colors[ 0 ].r |= ( colors[ 0 ].r >> 5 );
-
-	/* same for color 1 */
-	word = DDSLittleShort( block->colors[ 1 ] );
-	colors[ 1 ].a = 0xff;
-
-	/* extract rgb bits */
-	colors[ 1 ].b = (unsigned char) word;
-	colors[ 1 ].b <<= 3;
-	colors[ 1 ].b |= ( colors[ 1 ].b >> 5 );
-	word >>= 5;
-	colors[ 1 ].g = (unsigned char) word;
-	colors[ 1 ].g <<= 2;
-	colors[ 1 ].g |= ( colors[ 1 ].g >> 5 );
-	word >>= 6;
-	colors[ 1 ].r = (unsigned char) word;
-	colors[ 1 ].r <<= 3;
-	colors[ 1 ].r |= ( colors[ 1 ].r >> 5 );
-
-	/* use this for all but the super-freak math method */
-	if ( block->colors[ 0 ] > block->colors[ 1 ] ) {
-		/* four-color block: derive the other two colors.
-		   00 = color 0, 01 = color 1, 10 = color 2, 11 = color 3
-		   these two bit codes correspond to the 2-bit fields
-		   stored in the 64-bit block. */
-
-		word = ( (unsigned short) colors[ 0 ].r * 2 + (unsigned short) colors[ 1 ].r ) / 3;
-		/* no +1 for rounding */
-		/* as bits have been shifted to 888 */
-		colors[ 2 ].r = (unsigned char) word;
-		word = ( (unsigned short) colors[ 0 ].g * 2 + (unsigned short) colors[ 1 ].g ) / 3;
-		colors[ 2 ].g = (unsigned char) word;
-		word = ( (unsigned short) colors[ 0 ].b * 2 + (unsigned short) colors[ 1 ].b ) / 3;
-		colors[ 2 ].b = (unsigned char) word;
-		colors[ 2 ].a = 0xff;
-
-		word = ( (unsigned short) colors[ 0 ].r + (unsigned short) colors[ 1 ].r * 2 ) / 3;
-		colors[ 3 ].r = (unsigned char) word;
-		word = ( (unsigned short) colors[ 0 ].g + (unsigned short) colors[ 1 ].g * 2 ) / 3;
-		colors[ 3 ].g = (unsigned char) word;
-		word = ( (unsigned short) colors[ 0 ].b + (unsigned short) colors[ 1 ].b * 2 ) / 3;
-		colors[ 3 ].b = (unsigned char) word;
-		colors[ 3 ].a = 0xff;
+	switch ( pf ) {
+	case DDS_PF_DXT1:   blockSize = BCDEC_BC1_BLOCK_SIZE; break;
+	case DDS_PF_DXT2:
+	case DDS_PF_DXT3:   blockSize = BCDEC_BC2_BLOCK_SIZE; break;
+	case DDS_PF_DXT4:
+	case DDS_PF_DXT5:   blockSize = BCDEC_BC3_BLOCK_SIZE; break;
+	case DDS_PF_BC4:    blockSize = BCDEC_BC4_BLOCK_SIZE; break;
+	case DDS_PF_BC5:    blockSize = BCDEC_BC5_BLOCK_SIZE; break;
+	case DDS_PF_BC6H:   blockSize = BCDEC_BC6H_BLOCK_SIZE; break;
+	case DDS_PF_BC7:    blockSize = BCDEC_BC7_BLOCK_SIZE; break;
+	default: return -1;
 	}
-	else
-	{
-		/* three-color block: derive the other color.
-		   00 = color 0, 01 = color 1, 10 = color 2,
-		   11 = transparent.
-		   These two bit codes correspond to the 2-bit fields
-		   stored in the 64-bit block */
 
-		word = ( (unsigned short) colors[ 0 ].r + (unsigned short) colors[ 1 ].r ) / 2;
-		colors[ 2 ].r = (unsigned char) word;
-		word = ( (unsigned short) colors[ 0 ].g + (unsigned short) colors[ 1 ].g ) / 2;
-		colors[ 2 ].g = (unsigned char) word;
-		word = ( (unsigned short) colors[ 0 ].b + (unsigned short) colors[ 1 ].b ) / 2;
-		colors[ 2 ].b = (unsigned char) word;
-		colors[ 2 ].a = 0xff;
+	for ( y = 0; y < yBlocks; y++ ) {
+		for ( x = 0; x < xBlocks; x++ ) {
+			int bx, by;
+			int pixW = ( x * 4 + 4 <= width )  ? 4 : width  - x * 4;
+			int pixH = ( y * 4 + 4 <= height ) ? 4 : height - y * 4;
 
-		/* random color to indicate alpha */
-		colors[ 3 ].r = 0x00;
-		colors[ 3 ].g = 0xff;
-		colors[ 3 ].b = 0xff;
-		colors[ 3 ].a = 0x00;
-	}
-}
-
-
-
-/*
-   DDSDecodeColorBlock()
-   decodes a dds color block
-   fixme: make endian-safe
- */
-
-static void DDSDecodeColorBlock( unsigned int *pixel, ddsColorBlock_t *block, int width, unsigned int colors[ 4 ] ){
-	int r, n;
-	unsigned int bits;
-	unsigned int masks[] = { 3, 12, 3 << 4, 3 << 6 };       /* bit masks = 00000011, 00001100, 00110000, 11000000 */
-	int shift[] = { 0, 2, 4, 6 };
-
-
-	/* r steps through lines in y */
-	for ( r = 0; r < 4; r++, pixel += ( width - 4 ) )  /* no width * 4 as unsigned int ptr inc will * 4 */
-	{
-		/* width * 4 bytes per pixel per line, each j dxtc row is 4 lines of pixels */
-
-		/* n steps through pixels */
-		for ( n = 0; n < 4; n++ )
-		{
-			bits = block->row[ r ] & masks[ n ];
-			bits >>= shift[ n ];
-
-			switch ( bits )
-			{
-			case 0:
-				*pixel = colors[ 0 ];
-				pixel++;
+			switch ( pf ) {
+			case DDS_PF_DXT1:
+				bcdec_bc1( src, block, 4 * 4 );
 				break;
-
-			case 1:
-				*pixel = colors[ 1 ];
-				pixel++;
+			case DDS_PF_DXT2:
+			case DDS_PF_DXT3:
+				bcdec_bc2( src, block, 4 * 4 );
 				break;
-
-			case 2:
-				*pixel = colors[ 2 ];
-				pixel++;
+			case DDS_PF_DXT4:
+			case DDS_PF_DXT5:
+				bcdec_bc3( src, block, 4 * 4 );
 				break;
-
-			case 3:
-				*pixel = colors[ 3 ];
-				pixel++;
+			case DDS_PF_BC4:
+				/* BC4: single channel (R), expand to RGBA */
+				{
+					unsigned char rBlock[4 * 4];
+					bcdec_bc4( src, rBlock, 4 );
+					for ( by = 0; by < 4; by++ ) {
+						for ( bx = 0; bx < 4; bx++ ) {
+							int idx = ( by * 4 + bx ) * 4;
+							unsigned char r = rBlock[ by * 4 + bx ];
+							block[idx + 0] = r;
+							block[idx + 1] = r;
+							block[idx + 2] = r;
+							block[idx + 3] = 255;
+						}
+					}
+				}
 				break;
-
+			case DDS_PF_BC5:
+				/* BC5: two channels (RG), expand to RGBA */
+				{
+					unsigned char rgBlock[4 * 4 * 2];
+					bcdec_bc5( src, rgBlock, 4 * 2 );
+					for ( by = 0; by < 4; by++ ) {
+						for ( bx = 0; bx < 4; bx++ ) {
+							int idx = ( by * 4 + bx ) * 4;
+							int srcIdx = ( by * 4 + bx ) * 2;
+							block[idx + 0] = rgBlock[srcIdx + 0];
+							block[idx + 1] = rgBlock[srcIdx + 1];
+							block[idx + 2] = 0;
+							block[idx + 3] = 255;
+						}
+					}
+				}
+				break;
+			case DDS_PF_BC6H:
+				/* BC6H: HDR float, convert to 8-bit RGBA */
+				{
+					float rgbBlock[4 * 4 * 3];
+					bcdec_bc6h_float( src, rgbBlock, 4 * 3, 0 );
+					for ( by = 0; by < 4; by++ ) {
+						for ( bx = 0; bx < 4; bx++ ) {
+							int idx = ( by * 4 + bx ) * 4;
+							int srcIdx = ( by * 4 + bx ) * 3;
+							/* simple tonemap: clamp to [0,1] */
+							float r = rgbBlock[srcIdx + 0];
+							float g = rgbBlock[srcIdx + 1];
+							float b = rgbBlock[srcIdx + 2];
+							if ( r < 0.0f ) r = 0.0f; if ( r > 1.0f ) r = 1.0f;
+							if ( g < 0.0f ) g = 0.0f; if ( g > 1.0f ) g = 1.0f;
+							if ( b < 0.0f ) b = 0.0f; if ( b > 1.0f ) b = 1.0f;
+							block[idx + 0] = (unsigned char)( r * 255.0f + 0.5f );
+							block[idx + 1] = (unsigned char)( g * 255.0f + 0.5f );
+							block[idx + 2] = (unsigned char)( b * 255.0f + 0.5f );
+							block[idx + 3] = 255;
+						}
+					}
+				}
+				break;
+			case DDS_PF_BC7:
+				bcdec_bc7( src, block, 4 * 4 );
+				break;
 			default:
-				/* invalid */
-				pixel++;
-				break;
+				return -1;
 			}
-		}
-	}
-}
 
+			/* copy decompressed block into output image */
+			for ( by = 0; by < pixH; by++ ) {
+				for ( bx = 0; bx < pixW; bx++ ) {
+					int dstIdx = ( ( y * 4 + by ) * width + ( x * 4 + bx ) ) * 4;
+					int srcIdx = ( by * 4 + bx ) * 4;
+					pixels[dstIdx + 0] = block[srcIdx + 0];
+					pixels[dstIdx + 1] = block[srcIdx + 1];
+					pixels[dstIdx + 2] = block[srcIdx + 2];
+					pixels[dstIdx + 3] = block[srcIdx + 3];
+				}
+			}
 
-
-/*
-   DDSDecodeAlphaExplicit()
-   decodes a dds explicit alpha block
- */
-
-static void DDSDecodeAlphaExplicit( unsigned int *pixel, ddsAlphaBlockExplicit_t *alphaBlock, int width, unsigned int alphaZero ){
-	int row, pix;
-	unsigned short word;
-	ddsColor_t color;
-
-
-	/* clear color */
-	color.r = 0;
-	color.g = 0;
-	color.b = 0;
-
-	/* walk rows */
-	for ( row = 0; row < 4; row++, pixel += ( width - 4 ) )
-	{
-		word = DDSLittleShort( alphaBlock->row[ row ] );
-
-		/* walk pixels */
-		for ( pix = 0; pix < 4; pix++ )
-		{
-			/* zero the alpha bits of image pixel */
-			*pixel &= alphaZero;
-			color.a = word & 0x000F;
-			color.a = color.a | ( color.a << 4 );
-			*pixel |= *( (unsigned int*) &color );
-			word >>= 4;     /* move next bits to lowest 4 */
-			pixel++;        /* move to next pixel in the row */
-
-		}
-	}
-}
-
-
-
-/*
-   DDSDecodeAlpha3BitLinear()
-   decodes interpolated alpha block
- */
-
-static void DDSDecodeAlpha3BitLinear( unsigned int *pixel, ddsAlphaBlock3BitLinear_t *alphaBlock, int width, unsigned int alphaZero ){
-
-	int row, pix;
-	unsigned int stuff;
-	unsigned char bits[ 4 ][ 4 ];
-	unsigned short alphas[ 8 ];
-	ddsColor_t aColors[ 4 ][ 4 ];
-
-
-	/* get initial alphas */
-	alphas[ 0 ] = alphaBlock->alpha0;
-	alphas[ 1 ] = alphaBlock->alpha1;
-
-	/* 8-alpha block */
-	if ( alphas[ 0 ] > alphas[ 1 ] ) {
-		/* 000 = alpha_0, 001 = alpha_1, others are interpolated */
-		alphas[ 2 ] = ( 6 * alphas[ 0 ] +     alphas[ 1 ] ) / 7; /* bit code 010 */
-		alphas[ 3 ] = ( 5 * alphas[ 0 ] + 2 * alphas[ 1 ] ) / 7; /* bit code 011 */
-		alphas[ 4 ] = ( 4 * alphas[ 0 ] + 3 * alphas[ 1 ] ) / 7; /* bit code 100 */
-		alphas[ 5 ] = ( 3 * alphas[ 0 ] + 4 * alphas[ 1 ] ) / 7; /* bit code 101 */
-		alphas[ 6 ] = ( 2 * alphas[ 0 ] + 5 * alphas[ 1 ] ) / 7; /* bit code 110 */
-		alphas[ 7 ] = (     alphas[ 0 ] + 6 * alphas[ 1 ] ) / 7; /* bit code 111 */
-	}
-
-	/* 6-alpha block */
-	else
-	{
-		/* 000 = alpha_0, 001 = alpha_1, others are interpolated */
-		alphas[ 2 ] = ( 4 * alphas[ 0 ] +     alphas[ 1 ] ) / 5;  /* bit code 010 */
-		alphas[ 3 ] = ( 3 * alphas[ 0 ] + 2 * alphas[ 1 ] ) / 5;  /* bit code 011 */
-		alphas[ 4 ] = ( 2 * alphas[ 0 ] + 3 * alphas[ 1 ] ) / 5;  /* bit code 100 */
-		alphas[ 5 ] = (    alphas[ 0 ] + 4 * alphas[ 1 ] ) / 5;  /* bit code 101 */
-		alphas[ 6 ] = 0;                                        /* bit code 110 */
-		alphas[ 7 ] = 255;                                      /* bit code 111 */
-	}
-
-	/* decode 3-bit fields into array of 16 bytes with same value */
-
-	/* first two rows of 4 pixels each */
-	stuff = *( (unsigned int*) &( alphaBlock->stuff[ 0 ] ) );
-
-	bits[ 0 ][ 0 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 0 ][ 1 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 0 ][ 2 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 0 ][ 3 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 1 ][ 0 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 1 ][ 1 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 1 ][ 2 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 1 ][ 3 ] = (unsigned char) ( stuff & 0x00000007 );
-
-	/* last two rows */
-	stuff = *( (unsigned int*) &( alphaBlock->stuff[ 3 ] ) ); /* last 3 bytes */
-
-	bits[ 2 ][ 0 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 2 ][ 1 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 2 ][ 2 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 2 ][ 3 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 3 ][ 0 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 3 ][ 1 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 3 ][ 2 ] = (unsigned char) ( stuff & 0x00000007 );
-	stuff >>= 3;
-	bits[ 3 ][ 3 ] = (unsigned char) ( stuff & 0x00000007 );
-
-	/* decode the codes into alpha values */
-	for ( row = 0; row < 4; row++ )
-	{
-		for ( pix = 0; pix < 4; pix++ )
-		{
-			aColors[ row ][ pix ].r = 0;
-			aColors[ row ][ pix ].g = 0;
-			aColors[ row ][ pix ].b = 0;
-			aColors[ row ][ pix ].a = (unsigned char) alphas[ bits[ row ][ pix ] ];
+			src += blockSize;
 		}
 	}
 
-	/* write out alpha values to the image bits */
-	for ( row = 0; row < 4; row++, pixel += width - 4 )
-	{
-		for ( pix = 0; pix < 4; pix++ )
-		{
-			/* zero the alpha bits of image pixel */
-			*pixel &= alphaZero;
-
-			/* or the bits into the prev. nulled alpha */
-			*pixel |= *( (unsigned int*) &( aColors[ row ][ pix ] ) );
-			pixel++;
-		}
-	}
-}
-
-
-
-/*
-   DDSDecompressDXT1()
-   decompresses a dxt1 format texture
- */
-
-static int DDSDecompressDXT1( ddsBuffer_t *dds, int width, int height, unsigned char *pixels ){
-	int x, y, xBlocks, yBlocks;
-	unsigned int    *pixel;
-	ddsColorBlock_t *block;
-	ddsColor_t colors[ 4 ];
-
-
-	/* setup */
-	xBlocks = width / 4;
-	yBlocks = height / 4;
-
-	/* walk y */
-	for ( y = 0; y < yBlocks; y++ )
-	{
-		/* 8 bytes per block */
-		block = (ddsColorBlock_t*) ( (char *) dds->data + y * xBlocks * 8 );
-
-		/* walk x */
-		for ( x = 0; x < xBlocks; x++, block++ )
-		{
-			DDSGetColorBlockColors( block, colors );
-			pixel = (unsigned int*) ( pixels + x * 16 + ( y * 4 ) * width * 4 );
-			DDSDecodeColorBlock( pixel, block, width, (unsigned int*) colors );
-		}
-	}
-
-	/* return ok */
 	return 0;
 }
-
-
-
-/*
-   DDSDecompressDXT3()
-   decompresses a dxt3 format texture
- */
-
-static int DDSDecompressDXT3( ddsBuffer_t *dds, int width, int height, unsigned char *pixels ){
-	int x, y, xBlocks, yBlocks;
-	unsigned int            *pixel, alphaZero;
-	ddsColorBlock_t         *block;
-	ddsAlphaBlockExplicit_t *alphaBlock;
-	ddsColor_t colors[ 4 ];
-
-
-	/* setup */
-	xBlocks = width / 4;
-	yBlocks = height / 4;
-
-	/* create zero alpha */
-	colors[ 0 ].a = 0;
-	colors[ 0 ].r = 0xFF;
-	colors[ 0 ].g = 0xFF;
-	colors[ 0 ].b = 0xFF;
-	alphaZero = *( (unsigned int*) &colors[ 0 ] );
-
-	/* walk y */
-	for ( y = 0; y < yBlocks; y++ )
-	{
-		/* 8 bytes per block, 1 block for alpha, 1 block for color */
-		block = (ddsColorBlock_t*) ( (char *) dds->data + y * xBlocks * 16 );
-
-		/* walk x */
-		for ( x = 0; x < xBlocks; x++, block++ )
-		{
-			/* get alpha block */
-			alphaBlock = (ddsAlphaBlockExplicit_t*) block;
-
-			/* get color block */
-			block++;
-			DDSGetColorBlockColors( block, colors );
-
-			/* decode color block */
-			pixel = (unsigned int*) ( pixels + x * 16 + ( y * 4 ) * width * 4 );
-			DDSDecodeColorBlock( pixel, block, width, (unsigned int*) colors );
-
-			/* overwrite alpha bits with alpha block */
-			DDSDecodeAlphaExplicit( pixel, alphaBlock, width, alphaZero );
-		}
-	}
-
-	/* return ok */
-	return 0;
-}
-
-
-
-/*
-   DDSDecompressDXT5()
-   decompresses a dxt5 format texture
- */
-
-static int DDSDecompressDXT5( ddsBuffer_t *dds, int width, int height, unsigned char *pixels ){
-	int x, y, xBlocks, yBlocks;
-	unsigned int                *pixel, alphaZero;
-	ddsColorBlock_t             *block;
-	ddsAlphaBlock3BitLinear_t   *alphaBlock;
-	ddsColor_t colors[ 4 ];
-
-
-	/* setup */
-	xBlocks = width / 4;
-	yBlocks = height / 4;
-
-	/* create zero alpha */
-	colors[ 0 ].a = 0;
-	colors[ 0 ].r = 0xFF;
-	colors[ 0 ].g = 0xFF;
-	colors[ 0 ].b = 0xFF;
-	alphaZero = *( (unsigned int*) &colors[ 0 ] );
-
-	/* walk y */
-	for ( y = 0; y < yBlocks; y++ )
-	{
-		/* 8 bytes per block, 1 block for alpha, 1 block for color */
-		block = (ddsColorBlock_t*) ( (char *) dds->data + y * xBlocks * 16 );
-
-		/* walk x */
-		for ( x = 0; x < xBlocks; x++, block++ )
-		{
-			/* get alpha block */
-			alphaBlock = (ddsAlphaBlock3BitLinear_t*) block;
-
-			/* get color block */
-			block++;
-			DDSGetColorBlockColors( block, colors );
-
-			/* decode color block */
-			pixel = (unsigned int*) ( pixels + x * 16 + ( y * 4 ) * width * 4 );
-			DDSDecodeColorBlock( pixel, block, width, (unsigned int*) colors );
-
-			/* overwrite alpha bits with alpha block */
-			DDSDecodeAlpha3BitLinear( pixel, alphaBlock, width, alphaZero );
-		}
-	}
-
-	/* return ok */
-	return 0;
-}
-
-
-
-/*
-   DDSDecompressDXT2()
-   decompresses a dxt2 format texture (fixme: un-premultiply alpha)
- */
-
-static int DDSDecompressDXT2( ddsBuffer_t *dds, int width, int height, unsigned char *pixels ){
-	int r;
-
-
-	/* decompress dxt3 first */
-	r = DDSDecompressDXT3( dds, width, height, pixels );
-
-	/* return to sender */
-	return r;
-}
-
-
-
-/*
-   DDSDecompressDXT4()
-   decompresses a dxt4 format texture (fixme: un-premultiply alpha)
- */
-
-static int DDSDecompressDXT4( ddsBuffer_t *dds, int width, int height, unsigned char *pixels ){
-	int r;
-
-
-	/* decompress dxt5 first */
-	r = DDSDecompressDXT5( dds, width, height, pixels );
-
-	/* return to sender */
-	return r;
-}
-
 
 
 /*
@@ -690,7 +416,7 @@ static int DDSDecompressARGB8888( ddsBuffer_t *dds, int width, int height, unsig
 
 
 	/* setup */
-	in = dds->data;
+	in = DDSGetDataPtr( dds );
 	out = pixels;
 
 	/* walk y */
@@ -732,28 +458,19 @@ int DDSDecompress( ddsBuffer_t *dds, unsigned char *pixels ){
 	switch ( pf )
 	{
 	case DDS_PF_ARGB8888:
-		/* fixme: support other [a]rgb formats */
 		r = DDSDecompressARGB8888( dds, width, height, pixels );
 		break;
 
 	case DDS_PF_DXT1:
-		r = DDSDecompressDXT1( dds, width, height, pixels );
-		break;
-
 	case DDS_PF_DXT2:
-		r = DDSDecompressDXT2( dds, width, height, pixels );
-		break;
-
 	case DDS_PF_DXT3:
-		r = DDSDecompressDXT3( dds, width, height, pixels );
-		break;
-
 	case DDS_PF_DXT4:
-		r = DDSDecompressDXT4( dds, width, height, pixels );
-		break;
-
 	case DDS_PF_DXT5:
-		r = DDSDecompressDXT5( dds, width, height, pixels );
+	case DDS_PF_BC4:
+	case DDS_PF_BC5:
+	case DDS_PF_BC6H:
+	case DDS_PF_BC7:
+		r = DDSDecompressBlockFormat( dds, width, height, pixels, pf );
 		break;
 
 	default:

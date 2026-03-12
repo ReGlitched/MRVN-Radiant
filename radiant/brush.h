@@ -89,45 +89,39 @@ inline void Winding_DrawWireframe( const Winding& winding ){
 inline void Winding_Draw( const Winding& winding, const Vector3& normal, RenderStateFlags state ){
 	gl().glVertexPointer( 3, GL_DOUBLE, sizeof( WindingVertex ), &winding.points.data()->vertex );
 
-	Vector3 normals[c_brush_maxFaces];
-
 	if ( ( state & RENDER_BUMP ) != 0 ) {
-		typedef Vector3* Vector3Iter;
-		for ( Vector3Iter i = normals, end = normals + winding.numpoints; i != end; ++i )
+		Vector3 normals[64]; // faces rarely exceed 64 vertices
+		const std::size_t n = std::min( winding.numpoints, std::size_t( 64 ) );
+		for ( std::size_t i = 0; i < n; ++i )
 		{
-			*i = normal;
+			normals[i] = normal;
 		}
 		gl().glNormalPointer( GL_FLOAT, sizeof( Vector3 ), normals );
 		gl().glVertexAttribPointer( c_attr_TexCoord0, 2, GL_FLOAT, 0, sizeof( WindingVertex ), &winding.points.data()->texcoord );
 		gl().glVertexAttribPointer( c_attr_Tangent, 3, GL_FLOAT, 0, sizeof( WindingVertex ), &winding.points.data()->tangent );
 		gl().glVertexAttribPointer( c_attr_Binormal, 3, GL_FLOAT, 0, sizeof( WindingVertex ), &winding.points.data()->bitangent );
+		gl().glDrawArrays( GL_TRIANGLE_FAN, 0, GLsizei( n ) );
 	}
-	else
-	{
-		if ( state & RENDER_LIGHTING ) {
-			typedef Vector3* Vector3Iter;
-			for ( Vector3Iter i = normals, last = normals + winding.numpoints; i != last; ++i )
-			{
-				*i = normal;
-			}
-			gl().glNormalPointer( GL_FLOAT, sizeof( Vector3 ), normals );
+	else if ( state & RENDER_LIGHTING ) {
+		Vector3 normals[64];
+		const std::size_t n = std::min( winding.numpoints, std::size_t( 64 ) );
+		for ( std::size_t i = 0; i < n; ++i )
+		{
+			normals[i] = normal;
 		}
+		gl().glNormalPointer( GL_FLOAT, sizeof( Vector3 ), normals );
 
 		if ( state & RENDER_TEXTURE ) {
 			gl().glTexCoordPointer( 2, GL_FLOAT, sizeof( WindingVertex ), &winding.points.data()->texcoord );
 		}
-	}
-#if 0
-	if ( state & RENDER_FILL ) {
 		gl().glDrawArrays( GL_TRIANGLE_FAN, 0, GLsizei( winding.numpoints ) );
 	}
-	else
-	{
-		gl().glDrawArrays( GL_LINE_LOOP, 0, GLsizei( winding.numpoints ) );
+	else {
+		if ( state & RENDER_TEXTURE ) {
+			gl().glTexCoordPointer( 2, GL_FLOAT, sizeof( WindingVertex ), &winding.points.data()->texcoord );
+		}
+		gl().glDrawArrays( GL_TRIANGLE_FAN, 0, GLsizei( winding.numpoints ) );
 	}
-#else
-	gl().glDrawArrays( GL_POLYGON, 0, GLsizei( winding.numpoints ) );
-#endif
 
 #if 0
 	const Winding& winding = winding;
@@ -343,6 +337,8 @@ public:
 	bool m_instanced;
 	bool m_realised;
 
+	struct DeferredTag {};
+
 	FaceShader( const char* shader, const ContentsFlagsValue& flags = ContentsFlagsValue( 0, 0, 0, false ) ) :
 		m_shader( shader ),
 		m_state( 0 ),
@@ -351,8 +347,17 @@ public:
 		m_realised( false ){
 		captureShader();
 	}
+	FaceShader( DeferredTag, const ContentsFlagsValue& flags = ContentsFlagsValue( 0, 0, 0, false ) ) :
+		m_shader( texdef_name_default() ),
+		m_state( 0 ),
+		m_flags( flags ),
+		m_instanced( false ),
+		m_realised( false ){
+	}
 	~FaceShader(){
-		releaseShader();
+		if ( m_state != 0 ) {
+			releaseShader();
+		}
 	}
 // copy-construction not supported
 	FaceShader( const FaceShader& other ) = delete;
@@ -411,7 +416,9 @@ public:
 		if ( m_instanced ) {
 			m_state->decrementUsed();
 		}
-		releaseShader();
+		if ( m_state != 0 ) {
+			releaseShader();
+		}
 		m_shader = name;
 		captureShader();
 		if ( m_instanced ) {
@@ -961,6 +968,18 @@ public:
 		m_plane.copy( DoubleVector3( 0, 0, 0 ), DoubleVector3( 64, 0, 0 ), DoubleVector3( 0, 64, 0 ) );
 		m_texdef.setBasis( m_plane.plane3().normal() );
 		planeChanged();
+	}
+	/// \brief Construct Face with deferred shader capture, for use during map import.
+	/// Shader will be captured when setShader is first called.
+	Face( FaceObserver* observer, FaceShader::DeferredTag ) :
+		m_refcount( 0 ),
+		m_shader( FaceShader::DeferredTag() ),
+		m_texdef( m_shader, TextureProjection(), false ),
+		m_filtered( false ),
+		m_observer( observer ),
+		m_undoable_observer( 0 ),
+		m_map( 0 ){
+		m_shader.attach( *this );
 	}
 	Face(
 	    const DoubleVector3& p0,
@@ -2227,21 +2246,12 @@ public:
 	}
 
 
-	void update_faces_wireframe( Array<PointVertex>& wire, const bool* faces_visible ) const {
-		std::size_t count = 0;
+	void update_faces_wireframe( RenderablePointVector& wire, const bool* faces_visible ) const {
+		wire.clear();
 		for ( std::size_t i = 0; i < m_faceCentroidPoints.size(); ++i )
 		{
 			if ( faces_visible[i] ) {
-				++count;
-			}
-		}
-
-		wire.resize( count );
-		Array<PointVertex>::iterator p = wire.begin();
-		for ( std::size_t i = 0; i < m_faceCentroidPoints.size(); ++i )
-		{
-			if ( faces_visible[i] ) {
-				*p++ = m_faceCentroidPoints[i];
+				wire.push_back( m_faceCentroidPoints[i] );
 			}
 		}
 	}
@@ -2830,15 +2840,21 @@ public:
 		return m_face->intersectVolume( volume, localToWorld );
 	}
 
-	void render( Renderer& renderer, const VolumeTest& volume, const Matrix4& localToWorld ) const {
-		if ( !m_face->isFiltered() && m_face->contributes() && intersectVolume( volume, localToWorld ) ) {
-			renderer.PushState();
-			renderer.Highlight( Renderer::ePrimitiveWire );
+	void render( Renderer& renderer, const VolumeTest& volume, const Matrix4& localToWorld, bool skipIntersectTest = false ) const {
+		if ( !m_face->isFiltered() && m_face->contributes() && ( skipIntersectTest || intersectVolume( volume, localToWorld ) ) ) {
 			if ( selectedComponents() ) {
+				renderer.PushState();
+				renderer.Highlight( Renderer::ePrimitiveWire );
 				renderer.Highlight( Renderer::EHighlightMode( Renderer::eFace | Renderer::eFaceWire ) );
+				m_face->render( renderer, localToWorld );
+				renderer.PopState();
 			}
-			m_face->render( renderer, localToWorld );
-			renderer.PopState();
+			else {
+				renderer.PushState();
+				renderer.Highlight( Renderer::ePrimitiveWire );
+				m_face->render( renderer, localToWorld );
+				renderer.PopState();
+			}
 		}
 	}
 
@@ -3394,8 +3410,7 @@ class BrushInstance :
 	mutable RenderableWireframe m_render_wireframe;
 	mutable RenderablePointVector m_render_selected;
 	mutable AABB m_aabb_component;
-	mutable Array<PointVertex> m_faceCentroidPointsCulled;
-	RenderablePointArray<PointVertex> m_render_faces_wireframe;
+	mutable RenderablePointVector m_render_faces_wireframe;
 	mutable bool m_viewChanged;   // requires re-evaluation of view-dependent cached data
 
 	BrushClipPlane m_clipPlane;
@@ -3425,7 +3440,7 @@ public:
 		m_brush( brush ),
 		m_selectable( SelectedChangedCaller( *this ) ),
 		m_render_selected( GL_POINTS ),
-		m_render_faces_wireframe( m_faceCentroidPointsCulled, GL_POINTS ),
+		m_render_faces_wireframe( GL_POINTS ),
 		m_viewChanged( false ),
 		m_transform( Brush::TransformChangedCaller( m_brush ), ApplyTransformCaller( *this ) ){
 		m_brush.instanceAttach( Instance::path() );
@@ -3593,7 +3608,11 @@ public:
 			m_viewChanged = false;
 
 			bool faces_visible[c_brush_maxFaces];
-			{
+
+			if ( volume.TestAABB( m_brush.localAABB(), localToWorld ) == c_volumeInside ) {
+				std::fill_n( faces_visible, m_faceInstances.size(), true );
+			}
+			else {
 				bool* j = faces_visible;
 				for ( FaceInstances::const_iterator i = m_faceInstances.begin(); i != m_faceInstances.end(); ++i, ++j )
 				{
@@ -3602,7 +3621,7 @@ public:
 			}
 
 			m_brush.update_wireframe( m_render_wireframe, faces_visible );
-			m_brush.update_faces_wireframe( m_faceCentroidPointsCulled, faces_visible );
+			m_brush.update_faces_wireframe( m_render_faces_wireframe, faces_visible );
 		}
 	}
 
@@ -3628,7 +3647,8 @@ public:
 
 		if ( volume.fill() && GlobalSelectionSystem().ComponentMode() == SelectionSystem::eFace ) {
 			evaluateViewDependent( volume, localToWorld );
-			renderer.addRenderable( m_render_faces_wireframe, localToWorld );
+			if ( !m_render_faces_wireframe.empty() )
+				renderer.addRenderable( m_render_faces_wireframe, localToWorld );
 		}
 		else
 		{
@@ -3662,10 +3682,13 @@ public:
 
 		m_lightList->evaluateLights();
 
+		// If the brush AABB is fully inside the view frustum, skip per-face plane tests
+		const bool brushFullyVisible = ( volume.TestAABB( m_brush.localAABB(), localToWorld ) == c_volumeInside );
+
 		for ( FaceInstances::const_iterator i = m_faceInstances.begin(); i != m_faceInstances.end(); ++i )
 		{
 			renderer.setLights( ( *i ).m_lights );
-			( *i ).render( renderer, volume, localToWorld );
+			( *i ).render( renderer, volume, localToWorld, brushFullyVisible );
 		}
 
 		renderComponentsSelected( renderer, volume, localToWorld );

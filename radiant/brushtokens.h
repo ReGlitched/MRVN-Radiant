@@ -483,7 +483,7 @@ public:
 
 			tokeniser.ungetToken();
 
-			m_brush.push_back( FaceSmartPointer( new Face( &m_brush ) ) );
+			m_brush.push_back( FaceSmartPointer( new Face( &m_brush, FaceShader::DeferredTag() ) ) );
 
 			//!todo BP support
 			tokeniser.nextLine();

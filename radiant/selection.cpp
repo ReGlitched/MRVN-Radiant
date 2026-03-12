@@ -6801,6 +6801,9 @@ private:
 	bool m_pivot_moving;
 	mutable bool m_pivotIsCustom;
 
+	mutable int m_batchSelectDepth;
+	mutable bool m_batchSelectDirty;
+
 	void Scene_TestSelect( Selector& selector, SelectionTest& test, const View& view, SelectionSystem::EMode mode, SelectionSystem::EComponentMode componentMode );
 
 	bool nothingSelected() const {
@@ -6835,7 +6838,9 @@ public:
 		m_transformOrigin_manipulator( *this, m_pivotIsCustom ),
 		m_pivotChanged( false ),
 		m_pivot_moving( false ),
-		m_pivotIsCustom( false ){
+		m_pivotIsCustom( false ),
+		m_batchSelectDepth( 0 ),
+		m_batchSelectDirty( false ){
 		SetManipulatorMode( eTranslate );
 		pivotChanged();
 		addSelectionChangeCallback( PivotChangedSelectionCaller( *this ) );
@@ -6844,7 +6849,20 @@ public:
 	void pivotChanged() const {
 		m_pivotChanged = true;
 		m_lazy_bounds.setInvalid();
+		if ( m_batchSelectDepth > 0 ) {
+			m_batchSelectDirty = true;
+			return;
+		}
 		SceneChangeNotify();
+	}
+	void beginBatchSelect() const {
+		++m_batchSelectDepth;
+	}
+	void endBatchSelect() const {
+		if ( --m_batchSelectDepth == 0 && m_batchSelectDirty ) {
+			m_batchSelectDirty = false;
+			SceneChangeNotify();
+		}
 	}
 	typedef ConstMemberCaller<RadiantSelectionSystem, &RadiantSelectionSystem::pivotChanged> PivotChangedCaller;
 	void pivotChangedSelection( const Selectable& selectable ){
@@ -6956,14 +6974,18 @@ public:
 		return *( *( --( --m_selection.end() ) ) );
 	}
 	void setSelectedAll( bool selected ){
+		beginBatchSelect();
 		GlobalSceneGraph().traverse( select_all( selected ) );
+		endBatchSelect();
 
 		m_manipulator->setSelected( selected );
 	}
 	void setSelectedAllComponents( bool selected ){
+		beginBatchSelect();
 		Scene_SelectAll_Component( selected, SelectionSystem::eVertex );
 		Scene_SelectAll_Component( selected, SelectionSystem::eEdge );
 		Scene_SelectAll_Component( selected, SelectionSystem::eFace );
+		endBatchSelect();
 
 		m_manipulator->setSelected( selected );
 	}
@@ -7137,6 +7159,8 @@ public:
 		//globalOutputStream() << device_point[0] << "   " << device_point[1] << '\n';
 		ASSERT_MESSAGE( fabs( device_point[0] ) <= 1.f && fabs( device_point[1] ) <= 1.f, "point-selection error" );
 
+		beginBatchSelect();
+
 		if ( modifier == eReplace ) {
 			deselectComponentsOrAll( face );
 		}
@@ -7170,7 +7194,8 @@ public:
 				case RadiantSelectionSystem::eReplace:
 					{
 						// select closest
-						( *selector_point_ents.begin() ).second->setSelected( true );
+						Selectable* selectable = ( *selector_point_ents.begin() ).second;
+						selectable->setSelected( true );
 					}
 					break;
 				case RadiantSelectionSystem::eSelect:
@@ -7202,7 +7227,8 @@ public:
 					case RadiantSelectionSystem::eReplace:
 						{
 							// select closest
-							( *selector.begin() ).second->setSelected( true );
+							Selectable* selectable = ( *selector.begin() ).second;
+							selectable->setSelected( true );
 						}
 						break;
 					// select the next object in the list from the one already selected
@@ -7252,6 +7278,8 @@ public:
 				}
 			}
 		}
+
+		endBatchSelect();
 	}
 
 	bool SelectPoint_InitPaint( const View& view, const float device_point[2], const float device_epsilon[2], bool face ){
@@ -7273,7 +7301,8 @@ public:
 				Scene_TestSelect( selector_point_ents, volume, scissored, eEntity, ComponentMode() );
 			}
 			if( prefer_point_ents && !selector_point_ents.failed() ){
-				const bool wasSelected = ( *selector_point_ents.begin() ).second->isSelected();
+				Selectable* selectable = ( *selector_point_ents.begin() ).second;
+				const bool wasSelected = selectable->isSelected();
 				SelectionPool_Select( selector_point_ents, !wasSelected, SELECT_MATCHING_DIST );
 				return !wasSelected;
 			}
@@ -7285,7 +7314,8 @@ public:
 					Scene_TestSelect( selector, volume, scissored, g_modifiers == c_modifierAlt? ePrimitive : Mode(), ComponentMode() );
 				}
 				if ( !selector.failed() ){
-					const bool wasSelected = ( *selector.begin() ).second->isSelected();
+					Selectable* selectable = ( *selector.begin() ).second;
+					const bool wasSelected = selectable->isSelected();
 					SelectionPool_Select( selector, !wasSelected, ( Mode() == eComponent && g_modifiers != c_modifierAlt )? SELECT_MATCHING_COMPONENTS_DIST : SELECT_MATCHING_DIST );
 
 #if 0
@@ -7326,10 +7356,12 @@ public:
 			Scene_TestSelect( pool, volume, scissored, Mode(), ComponentMode() );
 		}
 
+		beginBatchSelect();
 		for ( SelectionPool::iterator i = pool.begin(); i != pool.end(); ++i )
 		{
 			( *i ).second->setSelected( rect.modifier == rect_t::eSelect? true : rect.modifier == rect_t::eDeselect? false : !( *i ).second->isSelected() );
 		}
+		endBatchSelect();
 	}
 
 

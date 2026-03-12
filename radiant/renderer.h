@@ -28,6 +28,7 @@
 #include "scenelib.h"
 #include "math/frustum.h"
 #include <vector>
+#include <cmath>
 
 inline Cullable* Instance_getCullable( scene::Instance& instance ){
 	return InstanceTypeCast<Cullable>::cast( instance );
@@ -74,15 +75,33 @@ class ForEachVisible : public scene::Graph::Walker
 	const VolumeTest& m_volume;
 	const Walker_& m_walker;
 	mutable std::vector<VolumeIntersectionValue> m_state;
+	Vector3 m_viewer;
+	float m_distanceCullSq; // squared max distance for early cull; 0 = disabled
 public:
-	ForEachVisible( const VolumeTest& volume, const Walker_& walker )
-		: m_volume( volume ), m_walker( walker ){
+	ForEachVisible( const VolumeTest& volume, const Walker_& walker, float maxDistance = 0 )
+		: m_volume( volume ), m_walker( walker ), m_viewer( volume.getViewer() ),
+		  m_distanceCullSq( maxDistance > 0 ? maxDistance * maxDistance : 0 ){
 		m_state.push_back( c_volumePartial );
 	}
 	bool pre( const scene::Path& path, scene::Instance& instance ) const {
 		VolumeIntersectionValue visible = ( path.top().get().visible() ) ? m_state.back() : c_volumeOutside;
 
 		if ( visible == c_volumePartial ) {
+			// Quick distance-based pre-cull: reject instances whose nearest AABB point is beyond max distance
+			if ( m_distanceCullSq > 0 ) {
+				const AABB& aabb = instance.worldAABB();
+				if ( aabb_valid( aabb ) ) {
+					// Compute squared distance from viewer to nearest point on AABB
+					float dx = std::max( 0.f, std::abs( m_viewer.x() - aabb.origin.x() ) - aabb.extents.x() );
+					float dy = std::max( 0.f, std::abs( m_viewer.y() - aabb.origin.y() ) - aabb.extents.y() );
+					float dz = std::max( 0.f, std::abs( m_viewer.z() - aabb.origin.z() ) - aabb.extents.z() );
+					float distSq = dx * dx + dy * dy + dz * dz;
+					if ( distSq > m_distanceCullSq ) {
+						m_state.push_back( c_volumeOutside );
+						return false;
+					}
+				}
+			}
 			visible = m_volume.TestAABB( instance.worldAABB() );
 		}
 
@@ -106,8 +125,8 @@ public:
 };
 
 template<typename Functor>
-inline void Scene_forEachVisible( scene::Graph& graph, const VolumeTest& volume, const Functor& functor ){
-	graph.traverse( ForEachVisible< CullingWalker<Functor> >( volume, CullingWalker<Functor>( volume, functor ) ) );
+inline void Scene_forEachVisible( scene::Graph& graph, const VolumeTest& volume, const Functor& functor, float maxDistance = 0 ){
+	graph.traverse( ForEachVisible< CullingWalker<Functor> >( volume, CullingWalker<Functor>( volume, functor ), maxDistance ) );
 }
 
 class RenderHighlighted
@@ -165,7 +184,7 @@ public:
 	}
 };
 
-inline void Scene_Render( Renderer& renderer, const VolumeTest& volume ){
-	GlobalSceneGraph().traverse( ForEachVisible<RenderHighlighted>( volume, RenderHighlighted( renderer, volume ) ) );
+inline void Scene_Render( Renderer& renderer, const VolumeTest& volume, float maxDistance = 0 ){
+	GlobalSceneGraph().traverse( ForEachVisible<RenderHighlighted>( volume, RenderHighlighted( renderer, volume ), maxDistance ) );
 	GlobalShaderCache().forEachRenderable( RenderHighlighted::RenderCaller( RenderHighlighted( renderer, volume ) ) );
 }

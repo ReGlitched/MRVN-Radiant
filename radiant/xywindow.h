@@ -73,7 +73,7 @@ private:
 };
 
 #include "timer.h"
-class QWidget;
+#include <QWidget>
 
 class XYWnd
 {
@@ -241,6 +241,8 @@ public:
 };
 
 inline void XYWnd_Update( XYWnd& xywnd ){
+	if ( !xywnd.GetWidget()->isVisible() )
+		return;
 	xywnd.m_drawRequired = true;
 	xywnd.queueDraw();
 }

@@ -62,9 +62,48 @@ typedef enum
 	DDS_PF_DXT3,
 	DDS_PF_DXT4,
 	DDS_PF_DXT5,
+	DDS_PF_BC4,
+	DDS_PF_BC5,
+	DDS_PF_BC6H,
+	DDS_PF_BC7,
 	DDS_PF_UNKNOWN
 }
 ddsPF_t;
+
+
+/* DX10 extended header (follows standard DDS header when fourCC == "DX10") */
+typedef struct ddsDX10Header_s
+{
+	unsigned int dxgiFormat;
+	unsigned int resourceDimension;
+	unsigned int miscFlag;
+	unsigned int arraySize;
+	unsigned int miscFlags2;
+}
+ddsDX10Header_t;
+
+/* DXGI format values we care about */
+#define DXGI_FORMAT_BC1_TYPELESS          70
+#define DXGI_FORMAT_BC1_UNORM             71
+#define DXGI_FORMAT_BC1_UNORM_SRGB        72
+#define DXGI_FORMAT_BC2_TYPELESS          73
+#define DXGI_FORMAT_BC2_UNORM             74
+#define DXGI_FORMAT_BC2_UNORM_SRGB        75
+#define DXGI_FORMAT_BC3_TYPELESS          76
+#define DXGI_FORMAT_BC3_UNORM             77
+#define DXGI_FORMAT_BC3_UNORM_SRGB        78
+#define DXGI_FORMAT_BC4_TYPELESS          79
+#define DXGI_FORMAT_BC4_UNORM             80
+#define DXGI_FORMAT_BC4_SNORM             81
+#define DXGI_FORMAT_BC5_TYPELESS          82
+#define DXGI_FORMAT_BC5_UNORM             83
+#define DXGI_FORMAT_BC5_SNORM             84
+#define DXGI_FORMAT_BC6H_TYPELESS         94
+#define DXGI_FORMAT_BC6H_UF16             95
+#define DXGI_FORMAT_BC6H_SF16             96
+#define DXGI_FORMAT_BC7_TYPELESS          97
+#define DXGI_FORMAT_BC7_UNORM             98
+#define DXGI_FORMAT_BC7_UNORM_SRGB        99
 
 
 /* 16bpp stuff */

@@ -674,9 +674,12 @@ scene::Node& loadPicoModel( Assimp::Importer& importer, ArchiveFile& file ){
 	               | aiProcess_FindDegenerates
 	               | aiProcess_FindInvalidData
 	               | aiProcess_ValidateDataStructure
-	               | aiProcess_FlipUVs
 	               | aiProcess_FlipWindingOrder
 	               | aiProcess_PreTransformVertices;
+	// Respawn RMDL UVs are already in the expected orientation for editor rendering
+	if ( !path_extension_is( file.getName(), "rmdl" ) ) {
+		flags |= aiProcess_FlipUVs;
+	}
 	// rotate the whole scene 90 degrees around the x axis to convert assimp's Y = UP to Quakes's Z = UP
 	importer.SetPropertyMatrix( AI_CONFIG_PP_PTV_ROOT_TRANSFORMATION, aiMatrix4x4( 1, 0, 0, 0,
 	                                                                               0, 0, -1, 0,

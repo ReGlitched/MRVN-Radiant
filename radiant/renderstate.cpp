@@ -95,17 +95,22 @@ std::size_t g_count_prims;
 std::size_t g_count_states;
 std::size_t g_count_transforms;
 Timer g_timer;
+static bool g_statsEnabled = false;
 
 inline void count_prim(){
-	++g_count_prims;
+	if( g_statsEnabled ) ++g_count_prims;
 }
 
 inline void count_state(){
-	++g_count_states;
+	if( g_statsEnabled ) ++g_count_states;
 }
 
 inline void count_transform(){
-	++g_count_transforms;
+	if( g_statsEnabled ) ++g_count_transforms;
+}
+
+void Renderer_SetStatsEnabled( bool enabled ){
+	g_statsEnabled = enabled;
 }
 
 void Renderer_ResetStats(){
@@ -557,7 +562,7 @@ public:
 		return m_state;
 	}
 
-	void render( OpenGLState& current, unsigned int globalstate, const Vector3& viewer );
+	void render( OpenGLState& current, unsigned int globalstate, const Vector3& viewer, const Matrix4& viewMatrix );
 };
 
 #define LIGHT_SHADER_DEBUG 0
@@ -978,7 +983,7 @@ public:
 		debug_string( "begin rendering" );
 		for ( OpenGLStates::iterator i = g_state_sorted.begin(); i != g_state_sorted.end(); ++i )
 		{
-			( *i ).second->render( current, globalstate, viewer );
+			( *i ).second->render( current, globalstate, viewer, modelview );
 		}
 		debug_string( "end rendering" );
 
@@ -1551,9 +1556,8 @@ void OpenGLState_apply( const OpenGLState& self, OpenGLState& current, unsigned 
 	GlobalOpenGL_debugAssertNoErrors();
 }
 
-void Renderables_flush( OpenGLStateBucket::Renderables& renderables, OpenGLState& current, unsigned int globalstate, const Vector3& viewer ){
+void Renderables_flush( OpenGLStateBucket::Renderables& renderables, OpenGLState& current, unsigned int globalstate, const Vector3& viewer, const Matrix4& viewMatrix ){
 	const Matrix4* transform = 0;
-	gl().glPushMatrix();
 
 	if ( current.m_program != 0 && current.m_textureSkyBox != 0 && globalstate & RENDER_PROGRAM ) {
 		current.m_program->setParameters( viewer, g_matrix4_identity, g_vector3_identity, g_vector3_identity, g_matrix4_identity );
@@ -1561,13 +1565,11 @@ void Renderables_flush( OpenGLStateBucket::Renderables& renderables, OpenGLState
 
 	for ( OpenGLStateBucket::Renderables::const_iterator i = renderables.begin(); i != renderables.end(); ++i )
 	{
-		//qglLoadMatrixf(i->m_transform);
 		if ( !transform || ( transform != ( *i ).m_transform && !matrix4_affine_equal( *transform, *( *i ).m_transform ) ) ) {
 			count_transform();
 			transform = ( *i ).m_transform;
-			gl().glPopMatrix();
-			gl().glPushMatrix();
-			gl().glMultMatrixf( reinterpret_cast<const float*>( transform ) );
+			const Matrix4 combined = matrix4_multiplied_by_matrix4( viewMatrix, *transform );
+			gl().glLoadMatrixf( reinterpret_cast<const float*>( &combined ) );
 			gl().glFrontFace( ( ( current.m_state & RENDER_CULLFACE ) != 0 && matrix4_handedness( *transform ) == MATRIX4_RIGHTHANDED ) ? GL_CW : GL_CCW );
 		}
 
@@ -1618,11 +1620,11 @@ void Renderables_flush( OpenGLStateBucket::Renderables& renderables, OpenGLState
 
 		( *i ).m_renderable->render( current.m_state );
 	}
-	gl().glPopMatrix();
+	gl().glLoadMatrixf( reinterpret_cast<const float*>( &viewMatrix ) );
 	renderables.clear();
 }
 
-void OpenGLStateBucket::render( OpenGLState& current, unsigned int globalstate, const Vector3& viewer ){
+void OpenGLStateBucket::render( OpenGLState& current, unsigned int globalstate, const Vector3& viewer, const Matrix4& viewMatrix ){
 	if ( ( globalstate & m_state.m_state & RENDER_SCREEN ) != 0 ) {
 		OpenGLState_apply( m_state, current, globalstate );
 		debug_colour( "screen fill" );
@@ -1650,7 +1652,7 @@ void OpenGLStateBucket::render( OpenGLState& current, unsigned int globalstate, 
 	}
 	else if ( !m_renderables.empty() ) {
 		OpenGLState_apply( m_state, current, globalstate );
-		Renderables_flush( m_renderables, current, globalstate, viewer );
+		Renderables_flush( m_renderables, current, globalstate, viewer, viewMatrix );
 	}
 }
 

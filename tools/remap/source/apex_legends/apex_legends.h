@@ -104,7 +104,7 @@ struct ShadowEnvironment_t {
     uint32_t endAabbs;           // +0x0C - end index into CSM AABB nodes
     uint32_t endObjRefs;         // +0x10 - end index into CSM obj references
     uint32_t endShadowMeshes;    // +0x14 - end index into shadow meshes
-    Vector3  shadowDir;          // +0x18 - normalized sun direction vector (points TO the sun)
+    Vector3  shadowDir;          // +0x18 - normalized sun direction vector (direction light travels, FROM sun towards ground)
 };
 #pragma pack(pop)
 static_assert(sizeof(ShadowEnvironment_t) == 36, "ShadowEnvironment_t must be exactly 36 bytes");
@@ -133,40 +133,49 @@ struct ShadowMeshAlphaVertex_t {
 #pragma pack(pop)
 static_assert(sizeof(ShadowMeshAlphaVertex_t) == 20, "ShadowMeshAlphaVertex_t must be exactly 20 bytes");
 
-// Light Probe structure (lump 0x65)
-// Version differences:
-//   v47-v50: 48 bytes (dlightprobe_v50_t) - extra 4 bytes of unknown data
-//   v51+:    44 bytes (dlightprobe_t) - current format
-// We use v51+ format (44 bytes) since Apex v47+ BSP loader supports both
-// Stores ambient lighting as spherical harmonics + references to static lights
+// Light Probe structure (lump 0x65) - 48 bytes
+// Used for BSP v47+ (Apex Legends). Verified against official map lump sizes:
+//   - mp_rr_canyonlands: 28352592 bytes / 48 = 590679 probes (exact)
+//   - mp_rr_desertlands: 33877392 bytes / 48 = 705779 probes (exact)
+// Stores ambient lighting as L1 spherical harmonics + references to static lights
 // Used by Mod_LeafAmbientColorAtPosWithNormal for ambient lighting lookups
+//
+// SH coefficient format per channel:
+//   [0] = X gradient (posX - negX directional difference)
+//   [1] = Y gradient (posY - negY directional difference)  
+//   [2] = Z gradient (posZ - negZ directional difference)
+//   [3] = DC term (average ambient)
+//
+// Scale factor: Game multiplies int16 SH values by 0.00012207031 (1/8192)
+// This means int16 value of 8192 (0x2000) = 1.0 linear light intensity
+// The game's default probe uses 0x2000 for DC terms when no probe data exists
+//
+// Official map analysis shows:
+//   - DC range: 0 to ~8192 for normally lit areas (can exceed for HDR)
+//   - Gradient range: -8192 to +8192 
+//   - lightingFlags (offset 36): usually 0x0096 (150 decimal)
+//   - Padding0 (offset 40): usually 0xFFFFFFFF for most probes
+//   - Padding1 (offset 44): always 0x00000000
 #pragma pack(push, 1)
 struct LightProbe_t {
-    int16_t  ambientSH[3][4];    // +0x00 - Spherical harmonics for R, G, B (24 bytes)
-                                 //         Each row: [X, Y, Z, DC] coefficients
-                                 //         DC component scaled to ~0x2000 for neutral
-    uint16_t staticLightIndexes[4]; // +0x18 - Indices into worldLights (8 bytes)
-                                    //         0xFFFF = no light, otherwise index + 32
-    uint8_t  staticLightFlags[4];   // +0x20 - Flags for each static light (4 bytes)
-    uint32_t padding0;              // +0x24 - Padding (4 bytes)
-    uint32_t padding1;              // +0x28 - Padding (4 bytes)
-};
-#pragma pack(pop)
-static_assert(sizeof(LightProbe_t) == 44, "LightProbe_t must be exactly 44 bytes");
-
-// Light Probe v50 structure (lump 0x65) - for BSP versions 47-50
-// Contains extra unknown field compared to v51+ format
-#pragma pack(push, 1)
-struct LightProbe_v50_t {
     int16_t  ambientSH[3][4];       // +0x00 - Spherical harmonics for R, G, B (24 bytes)
-    uint16_t staticLightIndexes[4]; // +0x18 - Indices into worldLights (8 bytes)
-    uint8_t  staticLightFlags[4];   // +0x20 - Flags for each static light (4 bytes)
-    uint32_t unknown;               // +0x24 - Unknown (extra in v50)
-    uint32_t padding0;              // +0x28 - Padding (4 bytes)
-    uint32_t padding1;              // +0x2C - Padding (4 bytes)
+    uint16_t staticLightIndexes[4]; // +0x18 - Raw worldlight indices (8 bytes)
+                                    //         BSP stores 0-based worldlight index
+                                    //         Engine's Mod_LoadLightProbes adds +32 at load time
+                                    //         to convert to global light handles (0-31=shadowenvs, 32+=worldlights)
+                                    //         0xFFFF = no light in this slot
+    uint8_t  staticLightFlags[4];   // +0x20 - Weight/flags for each static light (4 bytes)
+                                    //         Game calls this "staticLightWeights"
+                                    //         0xFF = valid light, 0x00 = no light
+                                    //         CRITICAL: Game breaks loop when weight[slot] == 0
+                                    //         So EACH valid slot must have non-zero weight!
+    uint16_t lightingFlags;         // +0x24 - Lighting flags (usually 0x0096 = 150)
+    uint16_t reserved;              // +0x26 - Reserved (usually 0xFFFF)
+    uint32_t padding0;              // +0x28 - Padding (usually 0xFFFFFFFF)
+    uint32_t padding1;              // +0x2C - Padding (always 0x00000000)
 };
 #pragma pack(pop)
-static_assert(sizeof(LightProbe_v50_t) == 48, "LightProbe_v50_t must be exactly 48 bytes");
+static_assert(sizeof(LightProbe_t) == 48, "LightProbe_t must be exactly 48 bytes");
 
 // Light Probe Reference (lump 0x68) - 20 bytes  
 // References a light probe in the spatial lookup tree
@@ -248,6 +257,7 @@ namespace ApexLegends {
     void        EmitBVHNode();
     int         EmitBVHDataleaf();
     int         EmitContentsMask( int mask );
+    void        AddCollisionStaticProp( uint32_t propIndex, const MinMax& worldBounds );
     void        EmitMeshes(const entity_t &e);
     uint32_t    EmitTextureData(shaderInfo_t shader);
     uint16_t    EmitMaterialSort(uint32_t index, int offset, int count, int16_t lightmapIdx);
@@ -354,6 +364,21 @@ namespace ApexLegends {
     };
     static_assert(sizeof(BVHNode_t) == 64, "BVHNode_t must be exactly 64 bytes");
 
+    // 0x11 - CollSurfProps_s (8 bytes)
+    // Surface properties for collision system
+    // References Surface Names lump (0x0F) via nameOffset
+    // References Contents Masks lump (0x10) via contentsIdx
+    // From IDA reverse engineering of Coll_ExpandQueryResultProperties
+    #pragma pack(push, 1)
+    struct CollSurfProps_t {
+        uint16_t surfFlags;      // +0x00: Surface flags (SURF_* flags)
+        uint8_t  surfTypeID;     // +0x02: Surface type ID (for footsteps, impacts, decals)
+        uint8_t  contentsIdx;    // +0x03: Index into Contents Masks lump
+        uint32_t nameOffset;     // +0x04: Offset into Surface Names lump
+    };
+    #pragma pack(pop)
+    static_assert(sizeof(CollSurfProps_t) == 8, "CollSurfProps_t must be exactly 8 bytes");
+
     // 0x47
     struct VertexUnlit_t {
         uint32_t  vertexIndex;
@@ -444,7 +469,63 @@ namespace ApexLegends {
     };
 
 
-    // GameLump Stub
+    // 0x23 - GameLump structures for Apex Legends
+    // These differ from TF2 in prop fields at +52 and prop header semantics
+    struct GameLumpHeader_t {
+        uint32_t  version;            // Always 1
+        char      ident[4];           // "prps"
+        uint32_t  gameConst;          // 3080192 (0x002F0000) for Apex v47
+        uint32_t  offset;             // Absolute offset to data after this header
+        uint32_t  length;             // Size of data after this header
+    };
+    static_assert(sizeof(GameLumpHeader_t) == 20, "GameLumpHeader_t must be exactly 20 bytes");
+
+    struct GameLumpPathHeader_t {
+        uint32_t  numPaths;
+    };
+
+    struct GameLumpPropHeader_t {
+        uint32_t  numStaticProps;     // Total count of static props
+        uint32_t  numOpaqueProps;     // Number of opaque props (sorted first)
+        uint32_t  firstTransProp;     // Index of first transparent prop
+    };
+    static_assert(sizeof(GameLumpPropHeader_t) == 12, "GameLumpPropHeader_t must be exactly 12 bytes");
+
+    // Apex Legends Static Prop (64 bytes)
+    // Differs from TF2 at +0x34: diffuseMod/wind/setDress instead of cpu/gpu/diffuse/collision
+    #pragma pack(push, 1)
+    struct GameLumpProp_t {
+        Vector3   origin;             // +0x00 (12 bytes)
+        Vector3   angles;             // +0x0C (12 bytes) - pitch, yaw, roll
+        float     scale;              // +0x18 (4 bytes)
+        uint16_t  modelName;          // +0x1C (2 bytes) - index into path array
+        uint8_t   solid;              // +0x1E (1 byte) - solid type
+        uint8_t   flags;              // +0x1F (1 byte) - prop flags
+        uint16_t  skin;               // +0x20 (2 bytes)
+        int16_t   envCubemap;         // +0x22 (2 bytes) - cubemap index, 0xFFFF = default
+        float     fadeDist;           // +0x24 (4 bytes) - fade distance, -1 = use default
+        Vector3   lightingOrigin;     // +0x28 (12 bytes) - custom lighting sample pos
+        uint8_t   diffuseModulation[4]; // +0x34 (4 bytes) - sRGB RGBA tint
+        uint32_t  precompiledWind;    // +0x38 (4 bytes) - packed wind evaluation data
+        uint8_t   setDressLevel;      // +0x3C (1 byte) - set dressing LOD level
+        uint8_t   padding[3];         // +0x3D (3 bytes)
+    };
+    #pragma pack(pop)
+    static_assert(sizeof(GameLumpProp_t) == 64, "GameLumpProp_t must be exactly 64 bytes");
+
+    // Apex Legends Parented Static Prop Info (64 bytes)
+    // Links a static prop to a brush model for moving/parenting
+    #pragma pack(push, 1)
+    struct GameLumpParentInfo_t {
+        float     modelToParent[12];  // +0x00 (48 bytes) - 3x4 transform matrix
+        uint32_t  parentBrushModelIndex; // +0x30 (4 bytes)
+        uint32_t  staticPropIndex;    // +0x34 (4 bytes) - must be sorted ascending
+        uint32_t  padding[2];         // +0x38 (8 bytes)
+    };
+    #pragma pack(pop)
+    static_assert(sizeof(GameLumpParentInfo_t) == 64, "GameLumpParentInfo_t must be exactly 64 bytes");
+
+    // GameLump Stub (for empty game lumps)
     struct GameLump_Stub_t {
         uint32_t  version = 1;
         char      magic[4];
@@ -554,7 +635,7 @@ namespace ApexLegends {
         // Light probe lumps (0x04, 0x65-0x68)
         // These provide ambient lighting for models and world geometry
         inline std::vector<LightProbeParentInfo_t> lightprobeParentInfos;   // Lump 0x04
-        inline std::vector<LightProbe_v50_t>       lightprobes;             // Lump 0x65 (48 bytes for v50)
+        inline std::vector<LightProbe_t>           lightprobes;             // Lump 0x65 (48 bytes)
         inline std::vector<uint32_t>               staticPropLightprobeIndices; // Lump 0x66
         inline std::vector<LightProbeTree_t>       lightprobeTree;          // Lump 0x67
         inline std::vector<LightProbeRef_t>        lightprobeReferences;    // Lump 0x68
@@ -567,9 +648,20 @@ namespace ApexLegends {
         inline std::vector<CubemapSample_t>      cubemaps;            // Lump 0x2A - cubemap sample positions
         inline std::vector<float>                cubemapsAmbientRcp;  // Lump 0x2B - ambient reciprocal per cubemap
         
-        // Stubs (for lumps not yet implemented)
-        inline std::vector<uint8_t>  surfaceProperties_stub;
-        inline std::vector<uint8_t>  unknown25_stub;
-        inline std::vector<uint8_t>  unknown27_stub;
+        // Surface Properties lump (0x11)
+        // Maps surface property indices to contents masks, surface types, and surface names
+        inline std::vector<CollSurfProps_t>      surfaceProperties;   // Lump 0x11
+        
+        // Cell AABB system lumps (visibility/streaming)
+        inline std::vector<uint32_t>             cellAABBNumObjRefsTotal;  // Lump 0x25 - cumulative obj ref count per node
+        inline std::vector<uint16_t>             cellAABBFadeDists;        // Lump 0x27 - fade distances for objects
+
+        // GameLump (0x23) - Static props
+        inline GameLumpHeader_t                         gameLumpHeader;
+        inline GameLumpPathHeader_t                     gameLumpPathHeader;
+        inline std::vector<Titanfall::GameLumpPath_t>   gameLumpPaths;    // 128-byte path strings (.rmdl)
+        inline GameLumpPropHeader_t                     gameLumpPropHeader;
+        inline std::vector<GameLumpProp_t>              gameLumpProps;
+        inline std::vector<GameLumpParentInfo_t>        gameLumpParentInfos;
     }
 }

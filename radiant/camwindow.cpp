@@ -70,6 +70,8 @@
 #include <QOpenGLWidget>
 
 #include <QApplication>
+#include <QElapsedTimer>
+#include <QTimer>
 #include <set>
 
 // https://stackoverflow.com/questions/42566421/how-to-queue-lambda-function-into-qts-event-loop/42566867#42566867
@@ -94,6 +96,7 @@ class IdleDraw2 : public QObject
 	bool m_running{};
 	bool m_queued{};
 	bool m_redrawDo{};
+	QElapsedTimer m_frameTimer;
 
 	void invoke(){
 		if( !m_running ){
@@ -112,6 +115,7 @@ class IdleDraw2 : public QObject
 		m_queued = false;
 		m_redrawDo = false;
 
+		m_frameTimer.start();
 		doLoop();
 	}
 public:
@@ -136,8 +140,19 @@ public:
 		doLoop();
 	}
 	void doLoop(){
-		if( m_loopFunc != Callback() )
-			queueDraw( Callback(), true );
+		if( m_loopFunc != Callback() ){
+			const int elapsed = m_frameTimer.isValid() ? m_frameTimer.elapsed() : 16;
+			const int delay = 16 - elapsed; // ~60 FPS cap
+			if( delay <= 0 ){
+				queueDraw( Callback(), true );
+			}
+			else{
+				QTimer::singleShot( delay, this, [this](){
+					if( m_loopFunc != Callback() )
+						queueDraw( Callback(), true );
+				} );
+			}
+		}
 	}
 	void breakLoop(){
 		m_loopFunc = {};
@@ -166,7 +181,8 @@ struct camwindow_globals_private_t
 	float m_angleSpeed = 3.f;
 	bool m_bCamInverseMouse = false;
 	bool m_bCamDiscrete = true;
-	bool m_bCubicClipping = false;
+	bool m_bCubicClipping = true;
+	float m_fFarClipDistance = 0.f; // 0 = use CubicScale formula; >0 = use this value directly (world units)
 	int m_strafeMode = 3;
 	bool m_bFaceWire = true;
 	bool m_bFaceFill = true;
@@ -297,9 +313,12 @@ inline Matrix4 projection_for_camera( float near_z, float far_z, float fieldOfVi
 }
 
 float Camera_getFarClipPlane( camera_t& camera ){
-	return ( g_camwindow_globals_private.m_bCubicClipping )
-	       ? pow( 2.0, ( g_camwindow_globals.m_nCubicScale + 7 ) / 2.0 )
-	       : ( ( g_MaxWorldCoord - g_MinWorldCoord ) * sqrt( 3 ) );
+	if ( g_camwindow_globals_private.m_bCubicClipping ) {
+		if ( g_camwindow_globals_private.m_fFarClipDistance > 0 )
+			return g_camwindow_globals_private.m_fFarClipDistance;
+		return pow( 2.0, ( g_camwindow_globals.m_nCubicScale + 7 ) / 2.0 );
+	}
+	return ( ( g_MaxWorldCoord - g_MinWorldCoord ) * sqrt( 3 ) );
 }
 
 void Camera_updateProjection( camera_t& camera ){
@@ -1204,6 +1223,61 @@ static void selection_button_press( const QMouseEvent& event, WindowObserver* ob
 		observer->onMouseDown( WindowVector( event.x(), event.y() ), button_for_button( event.button() ), modifiers_for_state( event.modifiers() ) );
 }
 
+static Vector3 camera_ray_direction( CamWnd& camwnd, float x, float y ){
+	const camera_t& cam = camwnd.getCamera();
+	const Matrix4 screen2world = matrix4_affine_inverse( cam.m_view->GetViewMatrix() );
+
+	Vector3 normalized;
+	normalized[0] = 2.0f * x / cam.width - 1.0f;
+	normalized[1] = 2.0f * y / cam.height - 1.0f;
+	normalized[1] *= -1.f;
+	normalized[2] = 0.f;
+	normalized *= ( camera_t::near_z * 2.f );
+	matrix4_transform_point( screen2world, normalized );
+	return vector3_normalised( normalized - Camera_getOrigin( camwnd ) );
+}
+
+static void camera_draw_terrain_brush_preview( CamWnd& camwnd ){
+	if ( !Patch_TerrainTool_IsActive() ) {
+		return;
+	}
+	Vector3 p( g_vector3_identity );
+	if ( !Patch_TerrainTool_GetPreviewPoint( p ) ) {
+		return;
+	}
+	const float r = static_cast<float>( Patch_TerrainTool_GetBrushRadius() );
+	if ( r <= 0.f ) {
+		return;
+	}
+
+	gl().glMatrixMode( GL_PROJECTION );
+	gl().glLoadMatrixf( reinterpret_cast<const float*>( &camwnd.getCamera().projection ) );
+	gl().glMatrixMode( GL_MODELVIEW );
+	gl().glLoadMatrixf( reinterpret_cast<const float*>( &camwnd.getCamera().modelview ) );
+	gl().glDisable( GL_TEXTURE_2D );
+	gl().glDisable( GL_LIGHTING );
+	gl().glEnable( GL_BLEND );
+	gl().glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+	gl().glColor4f( 1.0f, 0.85f, 0.15f, 0.95f );
+	gl().glLineWidth( 1.5f );
+
+	constexpr int steps = 32;
+	auto drawCircle = [&]( int a, int b ){
+		gl().glBegin( GL_LINE_LOOP );
+		for ( int i = 0; i < steps; ++i ){
+			const float ang = static_cast<float>( ( 2.0 * c_pi * i ) / steps );
+			Vector3 v( p );
+			v[a] += std::cos( ang ) * r;
+			v[b] += std::sin( ang ) * r;
+			gl().glVertex3fv( vector3_to_array( v ) );
+		}
+		gl().glEnd();
+	};
+	drawCircle( 0, 1 );
+	drawCircle( 0, 2 );
+	drawCircle( 1, 2 );
+}
+
 static void selection_button_release( const QMouseEvent& event, WindowObserver* observer ){
 	observer->onMouseUp( WindowVector( event.x(), event.y() ), button_for_button( event.button() ), modifiers_for_state( event.modifiers() ) );
 }
@@ -1639,19 +1713,39 @@ protected:
 	}
 
 	void mousePressEvent( QMouseEvent *event ) override {
+		const auto e = scaledEvent( event );
+		if( !m_camwnd.m_bFreeMove && Patch_TerrainTool_IsActive() && e.button() == Qt::MouseButton::LeftButton ){
+			const Vector3 rayDir = camera_ray_direction( m_camwnd, e.x(), e.y() );
+			if( Patch_TerrainTool_CamMouseDown( Camera_getOrigin( m_camwnd ), rayDir ) ){
+				setFocus();
+				return;
+			}
+		}
 		if( !m_camwnd.m_bFreeMove ){
 			setFocus();
-			selection_button_press( scaledEvent( event ), m_camwnd.m_window_observer );
-			enable_freelook_button_press( scaledEvent( event ), m_camwnd );
+			selection_button_press( e, m_camwnd.m_window_observer );
+			enable_freelook_button_press( e, m_camwnd );
 		}
 		else{
-			selection_button_press_freemove( this, scaledEvent( event ), m_camwnd.m_window_observer );
-			disable_freelook_button_press( scaledEvent( event ), m_camwnd );
+			selection_button_press_freemove( this, e, m_camwnd.m_window_observer );
+			disable_freelook_button_press( e, m_camwnd );
 		}
 	}
 	void mouseMoveEvent( QMouseEvent *event ) override {
+		const auto e = scaledEvent( event );
+		if( !m_camwnd.m_bFreeMove && Patch_TerrainTool_IsActive() ){
+			const Vector3 rayDir = camera_ray_direction( m_camwnd, e.x(), e.y() );
+			Patch_TerrainTool_CamHover( Camera_getOrigin( m_camwnd ), rayDir );
+		}
+		if( !m_camwnd.m_bFreeMove && Patch_TerrainTool_IsActive() && e.buttons().testFlag( Qt::MouseButton::LeftButton ) ){
+			const Vector3 rayDir = camera_ray_direction( m_camwnd, e.x(), e.y() );
+			if( Patch_TerrainTool_CamMouseMove( Camera_getOrigin( m_camwnd ), rayDir, true ) ){
+				m_camwnd.queue_draw();
+				return;
+			}
+		}
 		if( !m_camwnd.m_bFreeMove ){
-			m_camwnd.m_deferred_motion.motion( scaledEvent( event ) );
+			m_camwnd.m_deferred_motion.motion( e );
 			m_camwnd.getCamera().m_idleDraw.queueDraw( DeferredMotion2::InvokeCaller( m_camwnd.m_deferred_motion ), false );
 		}
 		else{
@@ -1659,12 +1753,18 @@ protected:
 		}
 	}
 	void mouseReleaseEvent( QMouseEvent *event ) override {
+		const auto e = scaledEvent( event );
+		if( !m_camwnd.m_bFreeMove && Patch_TerrainTool_IsActive() && e.button() == Qt::MouseButton::LeftButton ){
+			if( Patch_TerrainTool_CamMouseUp() ){
+				return;
+			}
+		}
 		if( !m_camwnd.m_bFreeMove ){
-			selection_button_release( scaledEvent( event ), m_camwnd.m_window_observer );
+			selection_button_release( e, m_camwnd.m_window_observer );
 		}
 		else{
-			selection_button_release_freemove( this, scaledEvent( event ), m_camwnd.m_window_observer );
-			disable_freelook_button_release( scaledEvent( event ), m_camwnd );
+			selection_button_release_freemove( this, e, m_camwnd.m_window_observer );
+			disable_freelook_button_release( e, m_camwnd );
 		}
 	}
 	void wheelEvent( QWheelEvent *event ) override {
@@ -1850,6 +1950,7 @@ public:
 		m_viewer( viewer ){
 		ASSERT_NOTNULL( select0 );
 	//	ASSERT_NOTNULL( select1 );
+		m_state_stack.reserve( 8 );
 		m_state_stack.push_back( state_type() );
 	}
 
@@ -1878,20 +1979,22 @@ public:
 		m_state_stack.back().m_lights = &lights;
 	}
 	void addRenderable( const OpenGLRenderable& renderable, const Matrix4& world ){
-		if ( m_state_stack.back().m_highlight & ePrimitive ) {
-			m_state_select0->addRenderable( renderable, world, m_state_stack.back().m_lights );
+		const auto& state = m_state_stack.back();
+		if ( state.m_highlight ) {
+			if ( state.m_highlight & ePrimitive ) {
+				m_state_select0->addRenderable( renderable, world, state.m_lights );
+			}
+			else if ( m_state_wire && state.m_highlight & ePrimitiveWire ) {
+				m_state_wire->addRenderable( renderable, world, state.m_lights );
+			}
+			if ( m_state_select1 && state.m_highlight & eFace ) {
+				m_state_select1->addRenderable( renderable, world, state.m_lights );
+			}
+			if ( m_state_facewire && state.m_highlight & eFaceWire ) {
+				m_state_facewire->addRenderable( renderable, world, state.m_lights );
+			}
 		}
-		else if ( m_state_wire && m_state_stack.back().m_highlight & ePrimitiveWire ) {
-			m_state_wire->addRenderable( renderable, world, m_state_stack.back().m_lights );
-		}
-		if ( m_state_select1 && m_state_stack.back().m_highlight & eFace ) {
-			m_state_select1->addRenderable( renderable, world, m_state_stack.back().m_lights );
-		}
-		if ( m_state_facewire && m_state_stack.back().m_highlight & eFaceWire ) {
-			m_state_facewire->addRenderable( renderable, world, m_state_stack.back().m_lights );
-		}
-
-		m_state_stack.back().m_state->addRenderable( renderable, world, m_state_stack.back().m_lights );
+		state.m_state->addRenderable( renderable, world, state.m_lights );
 	}
 
 	void render( const Matrix4& modelview, const Matrix4& projection ){
@@ -2021,6 +2124,8 @@ void CamWnd::Cam_Draw(){
 	gl().glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 
 	extern void Renderer_ResetStats();
+	extern void Renderer_SetStatsEnabled( bool );
+	Renderer_SetStatsEnabled( g_camwindow_globals.m_showStats );
 	Renderer_ResetStats();
 	extern void Cull_ResetStats();
 	Cull_ResetStats();
@@ -2113,7 +2218,7 @@ void CamWnd::Cam_Draw(){
 		                      g_camwindow_globals_private.m_bFaceFill ? m_state_select1 : 0,
 		                      m_view.getViewer() );
 
-		Scene_Render( renderer, m_view );
+		Scene_Render( renderer, m_view, Camera_getFarClipPlane( m_Camera ) );
 
 		if( g_camwindow_globals_private.m_bShowWorkzone && GlobalSelectionSystem().countSelected() != 0 && GlobalSelectionSystem().ManipulatorMode() != SelectionSystem::eUV ){
 			m_draw_workzone.render( renderer, m_state_workzone );
@@ -2125,6 +2230,8 @@ void CamWnd::Cam_Draw(){
 
 		renderer.render( m_Camera.modelview, m_Camera.projection );
 	}
+
+	camera_draw_terrain_brush_preview( *this );
 
 	// prepare for 2d stuff
 	gl().glColor4f( 1, 1, 1, 1 );
@@ -2521,6 +2628,15 @@ void fieldOfViewImport( float value ){
 }
 typedef FreeCaller1<float, fieldOfViewImport> fieldOfViewImportCaller;
 
+void farClipDistanceImport( float value ){
+	g_camwindow_globals_private.m_fFarClipDistance = value;
+	if( g_camwnd ){
+		Camera_updateProjection( g_camwnd->getCamera() );
+		CamWnd_Update( *g_camwnd );
+	}
+}
+typedef FreeCaller1<float, farClipDistanceImport> farClipDistanceImportCaller;
+
 void Camera_constructPreferences( PreferencesPage& page ){
 	page.appendSpinner( "Movement Speed", g_camwindow_globals_private.m_nMoveSpeed, 1, CAM_MAX_SPEED );
 	page.appendSpinner( "Time to Max Speed", g_camwindow_globals_private.m_time_toMaxSpeed, 0, 5000 );
@@ -2539,6 +2655,11 @@ void Camera_constructPreferences( PreferencesPage& page ){
 	    FreeCaller1<bool, Camera_SetFarClip>(),
 	    BoolExportCaller( g_camwindow_globals_private.m_bCubicClipping )
 	);
+	page.appendSpinner( "Far Clip Distance (0 = auto)", 0.0, 200000.0,
+	                    FloatImportCallback( farClipDistanceImportCaller() ),
+	                    FloatExportCallback( FloatExportCaller( g_camwindow_globals_private.m_fFarClipDistance ) ),
+	                    0
+	                  );
 	page.appendCheckBox(
 	    "", "Colorize selection",
 	    BoolImportCaller( g_camwindow_globals_private.m_bFaceFill ),
@@ -2680,6 +2801,7 @@ void CamWnd_Construct(){
 	GlobalPreferenceSystem().registerPreference( "CamDiscrete", makeBoolStringImportCallback( CamWndMoveDiscreteImportCaller() ), BoolExportStringCaller( g_camwindow_globals_private.m_bCamDiscrete ) );
 	GlobalPreferenceSystem().registerPreference( "CubicClipping", BoolImportStringCaller( g_camwindow_globals_private.m_bCubicClipping ), BoolExportStringCaller( g_camwindow_globals_private.m_bCubicClipping ) );
 	GlobalPreferenceSystem().registerPreference( "CubicScale", IntImportStringCaller( g_camwindow_globals.m_nCubicScale ), IntExportStringCaller( g_camwindow_globals.m_nCubicScale ) );
+	GlobalPreferenceSystem().registerPreference( "FarClipDistance", FloatImportStringCaller( g_camwindow_globals_private.m_fFarClipDistance ), FloatExportStringCaller( g_camwindow_globals_private.m_fFarClipDistance ) );
 	GlobalPreferenceSystem().registerPreference( "SI_Colors4", Vector3ImportStringCaller( g_camwindow_globals.color_cameraback ), Vector3ExportStringCaller( g_camwindow_globals.color_cameraback ) );
 	GlobalPreferenceSystem().registerPreference( "SI_Colors12", Vector3ImportStringCaller( g_camwindow_globals.color_selbrushes3d ), Vector3ExportStringCaller( g_camwindow_globals.color_selbrushes3d ) );
 	GlobalPreferenceSystem().registerPreference( "CameraRenderMode", makeIntStringImportCallback( RenderModeImportCaller() ), makeIntStringExportCallback( RenderModeExportCaller() ) );

@@ -209,18 +209,38 @@ GraphTreeModel* scene_graph_get_tree_model(){
 
 class SceneGraphObserver : public scene::Instantiable::Observer
 {
+	bool m_batch = false;
 public:
 	void insert( scene::Instance* instance ){
-		g_sceneGraph->sceneChanged();
+		if ( !m_batch ) {
+			g_sceneGraph->sceneChanged();
+		}
 		graph_tree_model_insert( g_tree_model, *instance );
 	}
 	void erase( scene::Instance* instance ){
 		g_sceneGraph->sceneChanged();
 		graph_tree_model_erase( g_tree_model, *instance );
 	}
+	void beginBatchInsert(){
+		m_batch = true;
+		graph_tree_model_begin_batch_insert( g_tree_model );
+	}
+	void endBatchInsert(){
+		m_batch = false;
+		graph_tree_model_end_batch_insert( g_tree_model );
+		g_sceneGraph->sceneChanged();
+	}
 };
 
 SceneGraphObserver g_SceneGraphObserver;
+
+void SceneGraph_beginBatchInsert(){
+	g_SceneGraphObserver.beginBatchInsert();
+}
+
+void SceneGraph_endBatchInsert(){
+	g_SceneGraphObserver.endBatchInsert();
+}
 
 void SceneGraph_Construct(){
 	g_tree_model = graph_tree_model_new();

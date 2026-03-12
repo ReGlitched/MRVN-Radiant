@@ -20,3 +20,6 @@
  */
 
 #pragma once
+
+void SceneGraph_beginBatchInsert();
+void SceneGraph_endBatchInsert();

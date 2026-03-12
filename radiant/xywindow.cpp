@@ -42,6 +42,7 @@
 #include <QOpenGLWidget>
 #include <QMouseEvent>
 #include <QTimer>
+#include <cmath>
 
 #include "generic/callback.h"
 #include "string/string.h"
@@ -58,6 +59,7 @@
 #include "gtkutil/filechooser.h"
 #include "gtkutil/fbo.h"
 #include "gtkmisc.h"
+#include "patchmanip.h"
 #include "select.h"
 #include "brushmanip.h"
 #include "selection.h"
@@ -425,6 +427,29 @@ void XYWnd::overlayDraw(){
 			gl().glVertex3fv( vector3_to_array( v ) );
 		}
 		gl().glEnd();
+	}
+
+	if ( Patch_TerrainTool_IsActive() ) {
+		const float radius = static_cast<float>( Patch_TerrainTool_GetBrushRadius() );
+		if ( radius > 0.f ) {
+			gl().glMatrixMode( GL_PROJECTION );
+			gl().glLoadMatrixf( reinterpret_cast<const float*>( &m_projection ) );
+
+			gl().glMatrixMode( GL_MODELVIEW );
+			gl().glLoadMatrixf( reinterpret_cast<const float*>( &m_modelview ) );
+
+			NDIM1NDIM2( m_viewType )
+			Vector3 v( m_mousePosition );
+			gl().glColor4f( 1.0f, 0.85f, 0.15f, 0.9f );
+			gl().glBegin( GL_LINE_LOOP );
+			for ( int i = 0; i < 32; ++i ){
+				const float a = c_pi / 16.f * i;
+				v[nDim1] = m_mousePosition[nDim1] + std::cos( a ) * radius;
+				v[nDim2] = m_mousePosition[nDim2] + std::sin( a ) * radius;
+				gl().glVertex3fv( vector3_to_array( v ) );
+			}
+			gl().glEnd();
+		}
 	}
 
 	m_XORRectangle.render( m_XORRect, Width(), Height() );
@@ -979,6 +1004,12 @@ void XYWnd::mouseDown( const WindowVector& position, ButtonIdentifier button, Mo
 	XY_MouseDown( static_cast<int>( position.x() ), static_cast<int>( position.y() ), buttons_for_button_and_modifiers( button, modifiers ) );
 }
 void XYWnd::XY_MouseDown( int x, int y, unsigned int buttons ){
+	if ( Patch_TerrainTool_IsActive() && buttons == RAD_LBUTTON ) {
+		const Vector3 point = XY_ToPoint( x, y, true );
+		if ( Patch_TerrainTool_XYMouseDown( static_cast<int>( m_viewType ), point ) ) {
+			return;
+		}
+	}
 	if ( buttons == Move_buttons() ) {
 		Move_Begin();
 		EntityCreate_MouseDown( x, y );
@@ -1007,6 +1038,11 @@ void XYWnd::XY_MouseDown( int x, int y, unsigned int buttons ){
 }
 
 void XYWnd::XY_MouseUp( int x, int y, unsigned int buttons ){
+	if ( Patch_TerrainTool_IsActive() && ( buttons & RAD_LBUTTON ) ) {
+		if ( Patch_TerrainTool_XYMouseUp() ) {
+			return;
+		}
+	}
 	if ( m_move_started ) {
 		Move_End();
 		EntityCreate_MouseUp( x, y );
@@ -1030,6 +1066,13 @@ void XYWnd::XY_MouseUp( int x, int y, unsigned int buttons ){
 
 void XYWnd::XY_MouseMoved( int x, int y, unsigned int buttons ){
 	m_mousePosition = XY_ToPoint( x, y, true );
+
+	if ( Patch_TerrainTool_IsActive() ) {
+		if ( Patch_TerrainTool_XYMouseMove( static_cast<int>( m_viewType ), m_mousePosition, ( buttons & RAD_LBUTTON ) != 0 ) ) {
+			queueDraw();
+			return;
+		}
+	}
 
 	// rbutton = drag xy origin
 	if ( m_move_started ) {
@@ -1820,6 +1863,8 @@ void XYWnd::XY_Draw(){
 	gl().glClear( GL_COLOR_BUFFER_BIT );
 
 	extern void Renderer_ResetStats();
+	extern void Renderer_SetStatsEnabled( bool );
+	Renderer_SetStatsEnabled( g_camwindow_globals.m_showStats );
 	Renderer_ResetStats();
 
 	//
