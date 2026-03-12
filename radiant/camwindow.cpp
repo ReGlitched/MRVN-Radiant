@@ -166,7 +166,8 @@ struct camwindow_globals_private_t
 	float m_angleSpeed = 3.f;
 	bool m_bCamInverseMouse = false;
 	bool m_bCamDiscrete = true;
-	bool m_bCubicClipping = false;
+	bool m_bCubicClipping = true;
+	float m_fFarClipDistance = 0.f; // 0 = use CubicScale formula; >0 = use this value directly (world units)
 	int m_strafeMode = 3;
 	bool m_bFaceWire = true;
 	bool m_bFaceFill = true;
@@ -297,9 +298,12 @@ inline Matrix4 projection_for_camera( float near_z, float far_z, float fieldOfVi
 }
 
 float Camera_getFarClipPlane( camera_t& camera ){
-	return ( g_camwindow_globals_private.m_bCubicClipping )
-	       ? pow( 2.0, ( g_camwindow_globals.m_nCubicScale + 7 ) / 2.0 )
-	       : ( ( g_MaxWorldCoord - g_MinWorldCoord ) * sqrt( 3 ) );
+	if ( g_camwindow_globals_private.m_bCubicClipping ) {
+		if ( g_camwindow_globals_private.m_fFarClipDistance > 0 )
+			return g_camwindow_globals_private.m_fFarClipDistance;
+		return pow( 2.0, ( g_camwindow_globals.m_nCubicScale + 7 ) / 2.0 );
+	}
+	return ( ( g_MaxWorldCoord - g_MinWorldCoord ) * sqrt( 3 ) );
 }
 
 void Camera_updateProjection( camera_t& camera ){
@@ -2194,7 +2198,7 @@ void CamWnd::Cam_Draw(){
 		                      g_camwindow_globals_private.m_bFaceFill ? m_state_select1 : 0,
 		                      m_view.getViewer() );
 
-		Scene_Render( renderer, m_view );
+		Scene_Render( renderer, m_view, Camera_getFarClipPlane( m_Camera ) );
 
 		if( g_camwindow_globals_private.m_bShowWorkzone && GlobalSelectionSystem().countSelected() != 0 && GlobalSelectionSystem().ManipulatorMode() != SelectionSystem::eUV ){
 			m_draw_workzone.render( renderer, m_state_workzone );
@@ -2604,6 +2608,15 @@ void fieldOfViewImport( float value ){
 }
 typedef FreeCaller1<float, fieldOfViewImport> fieldOfViewImportCaller;
 
+void farClipDistanceImport( float value ){
+	g_camwindow_globals_private.m_fFarClipDistance = value;
+	if( g_camwnd ){
+		Camera_updateProjection( g_camwnd->getCamera() );
+		CamWnd_Update( *g_camwnd );
+	}
+}
+typedef FreeCaller1<float, farClipDistanceImport> farClipDistanceImportCaller;
+
 void Camera_constructPreferences( PreferencesPage& page ){
 	page.appendSpinner( "Movement Speed", g_camwindow_globals_private.m_nMoveSpeed, 1, CAM_MAX_SPEED );
 	page.appendSpinner( "Time to Max Speed", g_camwindow_globals_private.m_time_toMaxSpeed, 0, 5000 );
@@ -2622,6 +2635,11 @@ void Camera_constructPreferences( PreferencesPage& page ){
 	    FreeCaller1<bool, Camera_SetFarClip>(),
 	    BoolExportCaller( g_camwindow_globals_private.m_bCubicClipping )
 	);
+	page.appendSpinner( "Far Clip Distance (0 = auto)", 0.0, 200000.0,
+	                    FloatImportCallback( farClipDistanceImportCaller() ),
+	                    FloatExportCallback( FloatExportCaller( g_camwindow_globals_private.m_fFarClipDistance ) ),
+	                    0
+	                  );
 	page.appendCheckBox(
 	    "", "Colorize selection",
 	    BoolImportCaller( g_camwindow_globals_private.m_bFaceFill ),
@@ -2763,6 +2781,7 @@ void CamWnd_Construct(){
 	GlobalPreferenceSystem().registerPreference( "CamDiscrete", makeBoolStringImportCallback( CamWndMoveDiscreteImportCaller() ), BoolExportStringCaller( g_camwindow_globals_private.m_bCamDiscrete ) );
 	GlobalPreferenceSystem().registerPreference( "CubicClipping", BoolImportStringCaller( g_camwindow_globals_private.m_bCubicClipping ), BoolExportStringCaller( g_camwindow_globals_private.m_bCubicClipping ) );
 	GlobalPreferenceSystem().registerPreference( "CubicScale", IntImportStringCaller( g_camwindow_globals.m_nCubicScale ), IntExportStringCaller( g_camwindow_globals.m_nCubicScale ) );
+	GlobalPreferenceSystem().registerPreference( "FarClipDistance", FloatImportStringCaller( g_camwindow_globals_private.m_fFarClipDistance ), FloatExportStringCaller( g_camwindow_globals_private.m_fFarClipDistance ) );
 	GlobalPreferenceSystem().registerPreference( "SI_Colors4", Vector3ImportStringCaller( g_camwindow_globals.color_cameraback ), Vector3ExportStringCaller( g_camwindow_globals.color_cameraback ) );
 	GlobalPreferenceSystem().registerPreference( "SI_Colors12", Vector3ImportStringCaller( g_camwindow_globals.color_selbrushes3d ), Vector3ExportStringCaller( g_camwindow_globals.color_selbrushes3d ) );
 	GlobalPreferenceSystem().registerPreference( "CameraRenderMode", makeIntStringImportCallback( RenderModeImportCaller() ), makeIntStringExportCallback( RenderModeExportCaller() ) );
