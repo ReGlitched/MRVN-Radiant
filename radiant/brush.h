@@ -343,6 +343,8 @@ public:
 	bool m_instanced;
 	bool m_realised;
 
+	struct DeferredTag {};
+
 	FaceShader( const char* shader, const ContentsFlagsValue& flags = ContentsFlagsValue( 0, 0, 0, false ) ) :
 		m_shader( shader ),
 		m_state( 0 ),
@@ -351,8 +353,17 @@ public:
 		m_realised( false ){
 		captureShader();
 	}
+	FaceShader( DeferredTag, const ContentsFlagsValue& flags = ContentsFlagsValue( 0, 0, 0, false ) ) :
+		m_shader( texdef_name_default() ),
+		m_state( 0 ),
+		m_flags( flags ),
+		m_instanced( false ),
+		m_realised( false ){
+	}
 	~FaceShader(){
-		releaseShader();
+		if ( m_state != 0 ) {
+			releaseShader();
+		}
 	}
 // copy-construction not supported
 	FaceShader( const FaceShader& other ) = delete;
@@ -411,7 +422,9 @@ public:
 		if ( m_instanced ) {
 			m_state->decrementUsed();
 		}
-		releaseShader();
+		if ( m_state != 0 ) {
+			releaseShader();
+		}
 		m_shader = name;
 		captureShader();
 		if ( m_instanced ) {
@@ -961,6 +974,18 @@ public:
 		m_plane.copy( DoubleVector3( 0, 0, 0 ), DoubleVector3( 64, 0, 0 ), DoubleVector3( 0, 64, 0 ) );
 		m_texdef.setBasis( m_plane.plane3().normal() );
 		planeChanged();
+	}
+	/// \brief Construct Face with deferred shader capture, for use during map import.
+	/// Shader will be captured when setShader is first called.
+	Face( FaceObserver* observer, FaceShader::DeferredTag ) :
+		m_refcount( 0 ),
+		m_shader( FaceShader::DeferredTag() ),
+		m_texdef( m_shader, TextureProjection(), false ),
+		m_filtered( false ),
+		m_observer( observer ),
+		m_undoable_observer( 0 ),
+		m_map( 0 ){
+		m_shader.attach( *this );
 	}
 	Face(
 	    const DoubleVector3& p0,

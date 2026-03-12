@@ -78,6 +78,7 @@
 #include "brush.h"
 #include "patch.h"
 #include "grid.h"
+#include "scenegraph.h"
 
 class NameObserver
 {
@@ -972,8 +973,10 @@ void Map_LoadFile( const char *filename ){
 		ScopeTimer timer( "map load" );
 		g_map.m_name = filename;
 		Map_UpdateTitle( g_map );
+		SceneGraph_beginBatchInsert();
 		g_map.m_resource = GlobalReferenceCache().capture( g_map.m_name.c_str() );
 		g_map.m_resource->attach( g_map );
+		SceneGraph_endBatchInsert();
 		Node_getTraversable( GlobalSceneGraph().root() )->traverse( entity_updateworldspawn() );
 	}
 
@@ -1507,15 +1510,18 @@ bool Map_ImportFile( const char* filename ){
 	{
 		const EBrushType brush_type = GlobalBrushCreator().getFormat();
 
+		SceneGraph_beginBatchInsert();
 		Resource* resource = GlobalReferenceCache().capture( filename );
 		resource->refresh(); // avoid loading old version if map has changed on disk since last import
 		if ( !resource->load() ) {
+			SceneGraph_endBatchInsert();
 			GlobalReferenceCache().release( filename );
 			if ( brush_type != GlobalBrushCreator().getFormat() ) {
 				GlobalBrushCreator().toggleFormat( brush_type );
 			}
 			goto tryDecompile;
 		}
+		SceneGraph_endBatchInsert();
 		if ( brush_type != GlobalBrushCreator().getFormat() ) {
 			Node_getTraversable( *resource->getNode() )->traverse( Convert_Brushes( BrushType_getTexdefType( GlobalBrushCreator().getFormat() ), BrushType_getTexdefType( brush_type ) ) );
 			GlobalBrushCreator().toggleFormat( brush_type );

@@ -31,6 +31,8 @@ class Instance;
 }
 void graph_tree_model_insert( GraphTreeModel* model, const scene::Instance& instance );
 void graph_tree_model_erase( GraphTreeModel* model, const scene::Instance& instance );
+void graph_tree_model_begin_batch_insert( GraphTreeModel* model );
+void graph_tree_model_end_batch_insert( GraphTreeModel* model );
 
 
 #include <qnamespace.h>

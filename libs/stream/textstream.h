@@ -374,7 +374,7 @@ public:
 };
 
 /// doublefuffered to be able to read forward for map format (valve220) detection
-template<typename TextInputStreamType, int SIZE = 1024>
+template<typename TextInputStreamType, int SIZE = 16384>
 class SingleCharacterInputStreamDoubleBuffered
 {
 	TextInputStreamType& m_inputStream;

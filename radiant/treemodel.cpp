@@ -263,11 +263,14 @@ public:
 	void insert( const scene::Instance& instance ) {
 		auto [parent, index] = findParents( instance.path() );
 
-		const int n = parent->lower_bound( node_get_name_safe( instance.path().top().get() ), instance.path().top().get_pointer() );
-
-		beginInsertRows( index, n, n );
+		if ( !m_batch ) {
+			const int n = parent->lower_bound( node_get_name_safe( instance.path().top().get() ), instance.path().top().get_pointer() );
+			beginInsertRows( index, n, n );
+		}
 		parent->insert( new GraphTreeNode( const_cast<scene::Instance&>( instance ), node_get_name_safe( instance.path().top().get() ), instance.path().top().get_pointer() ) );
-		endInsertRows();
+		if ( !m_batch ) {
+			endInsertRows();
+		}
 
 		node_attach_name_changed_callback( instance.path().top(), ConstReferenceCaller1<scene::Instance, const char*, graph_tree_model_set_name>( instance ) );
 	}
@@ -309,6 +312,16 @@ public:
 	}
 private:
 	GraphTreeNode *rootItem;
+	bool m_batch = false;
+public:
+	void beginBatchInsert(){
+		m_batch = true;
+		beginResetModel();
+	}
+	void endBatchInsert(){
+		m_batch = false;
+		endResetModel();
+	}
 };
 
 GraphTreeModel* graph_tree_model_new(){
@@ -325,6 +338,14 @@ void graph_tree_model_insert( GraphTreeModel* model, const scene::Instance& inst
 
 void graph_tree_model_erase( GraphTreeModel* model, const scene::Instance& instance ){
 	model->remove( instance );
+}
+
+void graph_tree_model_begin_batch_insert( GraphTreeModel* model ){
+	model->beginBatchInsert();
+}
+
+void graph_tree_model_end_batch_insert( GraphTreeModel* model ){
+	model->endBatchInsert();
 }
 
 

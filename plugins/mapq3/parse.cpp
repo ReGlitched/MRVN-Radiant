@@ -21,7 +21,7 @@
 
 #include "parse.h"
 
-#include <list>
+#include <vector>
 
 #include "ientity.h"
 #include "ibrush.h"
@@ -38,7 +38,7 @@ inline MapImporter* Node_getMapImporter( scene::Node& node ){
 }
 
 
-typedef std::list< std::pair<CopiedString, CopiedString> > KeyValues;
+typedef std::vector< std::pair<CopiedString, CopiedString> > KeyValues;
 
 NodeSmartReference g_nullNode( NewNullNode() );
 
@@ -55,6 +55,7 @@ NodeSmartReference Entity_create( EntityCreator& entityTable, EntityClass* entit
 NodeSmartReference Entity_parseTokens( Tokeniser& tokeniser, EntityCreator& entityTable, const PrimitiveParser& parser, int index ){
 	NodeSmartReference entity( g_nullNode );
 	KeyValues keyValues;
+	keyValues.reserve( 16 );
 	const char* classname = "";
 
 	int count_primitives = 0;

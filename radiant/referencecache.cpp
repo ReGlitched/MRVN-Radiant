@@ -66,7 +66,7 @@ EntityCreator* g_entityCreator = 0;
 
 bool MapResource_loadFile( const MapFormat& format, scene::Node& root, const char* filename ){
 	globalOutputStream() << "Open file " << filename << " for read...";
-	TextFileInputStream file( filename );
+	TextBufferInputStream file( filename );
 	if ( !file.failed() ) {
 		globalOutputStream() << "success\n";
 		ScopeDisableScreenUpdates disableScreenUpdates( path_get_filename_start( filename ), "Loading Map" );
