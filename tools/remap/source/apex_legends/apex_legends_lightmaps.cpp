@@ -38,13 +38,15 @@
 
 #include "../remap.h"
 #include "../bspfile_abstract.h"
-#include "../embree_trace.h"
+#include "../hiprt_trace.h"
 #include "apex_legends.h"
 #include <algorithm>
 #include <cmath>
 #include <cfloat>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
+#include <chrono>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -957,42 +959,226 @@ void ApexLegends::ComputeLightmapLighting() {
     
     Sys_Printf("     Computing direct lighting...\n");
     
+    int totalSurfaces = static_cast<int>(LightmapBuild::surfaces.size());
+    int surfacesDone = 0;
+    int lastPct = -1;
+    auto lightingStart = std::chrono::high_resolution_clock::now();
+    
+    // Pre-compute sun direction once
+    Vector3 sunDir(0, 0, 0);
+    if (sky.valid) {
+        sunDir = sky.sunDir * -1.0f;
+    }
+    
     for (SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
         Vector3 sampleNormal = surf.plane.normal();
+        int numTexels = surf.rect.width * surf.rect.height;
         
-        // For each texel
-        for (int y = 0; y < surf.rect.height; y++) {
-            for (int x = 0; x < surf.rect.width; x++) {
-                Vector3 worldPos = ComputeTexelWorldPos(surf, (float)x, (float)y);
-                TexelLighting_t lighting = ComputeLightingAtPoint(worldPos, sampleNormal, sky);
-                
-                // Store in luxel arrays (direct and indirect separately)
-                surf.luxels[y * surf.rect.width + x] = lighting.direct;
-                surf.indirectLuxels[y * surf.rect.width + x] = lighting.indirect;
-                
-                // Store direct light for radiosity if enabled
-                if (RADIOSITY_BOUNCES > 0 && patchIndex < static_cast<int>(RadiosityData::patches.size())) {
-                    RadiosityData::patches[patchIndex].directLight = lighting.direct;
-                    RadiosityData::patches[patchIndex].totalLight = lighting.direct;
-                    patchIndex++;
+        // ===== Phase 1: Generate all visibility rays for this surface =====
+        std::vector<Vector3> rayOrigins;
+        std::vector<Vector3> rayDirs;
+        std::vector<float>   rayMaxDists;
+        
+        // Per-texel bookkeeping
+        struct TexelRayInfo {
+            int firstRayIdx;
+            int numSunRays;    // 0 or 1
+            int numLightRays;
+            int numAoRays;
+            float sunNdotL;
+            int firstLightContribIdx;
+        };
+        std::vector<TexelRayInfo> texelInfo(numTexels);
+        std::vector<Vector3> lightContribs;  // pre-computed color per light shadow ray
+        
+        for (int texelIdx = 0; texelIdx < numTexels; texelIdx++) {
+            int x = texelIdx % surf.rect.width;
+            int y = texelIdx / surf.rect.width;
+            Vector3 worldPos = ComputeTexelWorldPos(surf, (float)x, (float)y);
+            
+            TexelRayInfo &info = texelInfo[texelIdx];
+            info.firstRayIdx = static_cast<int>(rayOrigins.size());
+            info.numSunRays = 0;
+            info.numLightRays = 0;
+            info.numAoRays = 0;
+            info.sunNdotL = 0;
+            info.firstLightContribIdx = static_cast<int>(lightContribs.size());
+            
+            // Sun shadow ray
+            if (sky.valid) {
+                float ndotl = vector3_dot(sampleNormal, sunDir);
+                info.sunNdotL = ndotl;
+                if (ndotl > 0) {
+                    rayOrigins.push_back(worldPos);
+                    rayDirs.push_back(sunDir);
+                    rayMaxDists.push_back(65536.0f);
+                    info.numSunRays = 1;
                 }
-                
-                totalTexels++;
             }
+            
+            // Point/spot light shadow rays
+            for (const WorldLight_t &light : ApexLegends::Bsp::worldLights) {
+                if (light.type == emit_skyambient || light.type == emit_skylight) continue;
+                if (light.flags & WORLDLIGHT_FLAG_REALTIME) continue;
+                
+                Vector3 lightPos(light.origin[0], light.origin[1], light.origin[2]);
+                
+                if (light.type == emit_point) {
+                    Vector3 toLight = lightPos - worldPos;
+                    float dist = vector3_length(toLight);
+                    if (dist < 0.001f) continue;
+                    
+                    Vector3 lightDir = toLight / dist;
+                    float NdotL = vector3_dot(sampleNormal, lightDir);
+                    if (NdotL <= 0) continue;
+                    
+                    float atten;
+                    if (light.quadratic_attn > 0 || light.linear_attn > 0) {
+                        atten = 1.0f / (light.constant_attn +
+                                       light.linear_attn * dist +
+                                       light.quadratic_attn * dist * dist);
+                    } else {
+                        atten = 1.0f / (1.0f + dist * dist * 0.0001f);
+                    }
+                    
+                    rayOrigins.push_back(worldPos);
+                    rayDirs.push_back(lightDir);
+                    rayMaxDists.push_back(dist - 1.0f);
+                    lightContribs.push_back(light.intensity * NdotL * atten * 100.0f);
+                    info.numLightRays++;
+                    
+                } else if (light.type == emit_spotlight) {
+                    Vector3 toLight = lightPos - worldPos;
+                    float dist = vector3_length(toLight);
+                    if (dist < 0.001f) continue;
+                    
+                    Vector3 lightDir = toLight / dist;
+                    float NdotL = vector3_dot(sampleNormal, lightDir);
+                    if (NdotL <= 0) continue;
+                    
+                    float spotDot = vector3_dot(-lightDir, light.normal);
+                    if (spotDot <= light.stopdot2) continue;
+                    
+                    float spotAtten = 1.0f;
+                    if (spotDot < light.stopdot) {
+                        spotAtten = (spotDot - light.stopdot2) / (light.stopdot - light.stopdot2);
+                    }
+                    float distAtten = 1.0f / (1.0f + dist * dist * 0.0001f);
+                    
+                    rayOrigins.push_back(worldPos);
+                    rayDirs.push_back(lightDir);
+                    rayMaxDists.push_back(dist - 1.0f);
+                    lightContribs.push_back(light.intensity * NdotL * spotAtten * distAtten * 100.0f);
+                    info.numLightRays++;
+                }
+            }
+            
+            // AO hemisphere rays
+            if (sky.valid) {
+                int step = std::max(1, NUM_SPHERE_NORMALS / AO_HEMISPHERE_RAYS);
+                for (int i = 0; i < NUM_SPHERE_NORMALS; i += step) {
+                    float cosTheta = vector3_dot(g_SphereNormals[i], sampleNormal);
+                    if (cosTheta <= 0) continue;
+                    rayOrigins.push_back(worldPos);
+                    rayDirs.push_back(g_SphereNormals[i]);
+                    rayMaxDists.push_back(AO_TRACE_DISTANCE);
+                    info.numAoRays++;
+                }
+            }
+        }
+        
+        // ===== Phase 2: Batch GPU dispatch =====
+        int totalRays = static_cast<int>(rayOrigins.size());
+        std::vector<uint8_t> hitResults(totalRays, 0);
+        if (totalRays > 0 && HIPRTTrace::IsSceneReady()) {
+            HIPRTTrace::BatchTestVisibility(totalRays, rayOrigins.data(), rayDirs.data(),
+                                            rayMaxDists.data(), hitResults.data());
+        }
+        
+        // ===== Phase 3: Process results and compute lighting =====
+        for (int texelIdx = 0; texelIdx < numTexels; texelIdx++) {
+            const TexelRayInfo &info = texelInfo[texelIdx];
+            Vector3 directLight(0, 0, 0);
+            float aoFactor = 1.0f;
+            
+            int rayIdx = info.firstRayIdx;
+            
+            // Sun contribution
+            if (info.numSunRays > 0) {
+                if (!hitResults[rayIdx]) {
+                    directLight = directLight + sky.sunColor * (info.sunNdotL * sky.sunIntensity);
+                }
+                rayIdx++;
+            }
+            
+            // Light contributions
+            for (int li = 0; li < info.numLightRays; li++) {
+                if (!hitResults[rayIdx]) {
+                    directLight = directLight + lightContribs[info.firstLightContribIdx + li];
+                }
+                rayIdx++;
+            }
+            
+            // AO
+            if (info.numAoRays > 0) {
+                int unoccluded = 0;
+                for (int a = 0; a < info.numAoRays; a++) {
+                    if (!hitResults[rayIdx + a]) unoccluded++;
+                }
+                aoFactor = (float)unoccluded / info.numAoRays;
+                aoFactor = std::pow(aoFactor, 1.5f);
+            }
+            
+            Vector3 ambientFill = sky.ambientColor * (sky.ambientIntensity * aoFactor);
+            Vector3 finalDirect = directLight + ambientFill;
+            Vector3 finalIndirect = sky.ambientColor * (sky.ambientIntensity * aoFactor * INDIRECT_AMBIENT_SCALE);
+            
+            int x = texelIdx % surf.rect.width;
+            int y = texelIdx / surf.rect.width;
+            surf.luxels[y * surf.rect.width + x] = finalDirect;
+            surf.indirectLuxels[y * surf.rect.width + x] = finalIndirect;
+            
+            if (RADIOSITY_BOUNCES > 0 && patchIndex < static_cast<int>(RadiosityData::patches.size())) {
+                RadiosityData::patches[patchIndex].directLight = finalDirect;
+                RadiosityData::patches[patchIndex].totalLight = finalDirect;
+                patchIndex++;
+            }
+            
+            totalTexels++;
+        }
+        
+        surfacesDone++;
+        int pct = (totalSurfaces > 0) ? (surfacesDone * 100 / totalSurfaces) : 100;
+        if (pct != lastPct && (pct % 10 == 0 || surfacesDone == totalSurfaces)) {
+            auto now = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration<double>(now - lightingStart).count();
+            Sys_Printf("     ...%d%% (%d/%d surfaces, %d rays, %.1fs elapsed)\n", pct, surfacesDone, totalSurfaces, totalRays, elapsed);
+            lastPct = pct;
         }
     }
     
-    Sys_Printf("     %9d texels computed (direct)\n", totalTexels);
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - lightingStart).count();
+        Sys_Printf("     %9d texels computed (direct) in %.2fs\n", totalTexels, elapsed);
+    }
     
     // =====================================================
     // ADAPTIVE SUPERSAMPLING (Source SDK style)
     // Detect high-gradient areas and supersample them to
     // smooth shadow edges and lighting discontinuities.
+    // Uses batch GPU ray dispatch for performance.
     // =====================================================
     if (SUPERSAMPLE_PASSES > 0) {
         Sys_Printf("     Computing adaptive supersampling (%d passes, %dx%d grid)...\n",
                    SUPERSAMPLE_PASSES, SUPERSAMPLE_GRID, SUPERSAMPLE_GRID);
         int totalSupersampled = 0;
+        auto ssStart = std::chrono::high_resolution_clock::now();
+        
+        int ssSubSamples = SUPERSAMPLE_GRID * SUPERSAMPLE_GRID;
+        int ssSurfacesDone = 0;
+        int ssTotalSurfaces = static_cast<int>(LightmapBuild::surfaces.size());
+        int ssLastPct = -1;
         
         for (SurfaceLightmap_t &surf : LightmapBuild::surfaces) {
             int w = surf.rect.width;
@@ -1007,38 +1193,225 @@ void ApexLegends::ComputeLightmapLighting() {
             
             std::vector<bool> processed(numTexels, false);
             std::vector<float> gradient(numTexels, 0.0f);
+            Vector3 sampleNormal = surf.plane.normal();
             
-            // Iterative refinement: recheck gradients after each pass
-            // because supersampling one texel can change the gradient of neighbors
             for (int pass = 0; pass < SUPERSAMPLE_PASSES; pass++) {
                 ComputeLightmapGradients(surf, intensity, processed, gradient);
                 
-                bool didWork = false;
+                // Identify texels needing supersampling this pass
+                std::vector<int> ssTexels;
                 for (int i = 0; i < numTexels; i++) {
                     if (processed[i]) continue;
                     if (gradient[i] < SUPERSAMPLE_GRADIENT_THRESHOLD) continue;
+                    ssTexels.push_back(i);
+                }
+                if (ssTexels.empty()) break;
+                
+                // ===== Phase 1: Generate all rays for all sub-samples =====
+                struct SubSampleRayInfo {
+                    int firstRayIdx;
+                    int numSunRays;
+                    int numLightRays;
+                    int numAoRays;
+                    float sunNdotL;
+                    int firstLightContribIdx;
+                };
+                
+                int totalSubSamples = static_cast<int>(ssTexels.size()) * ssSubSamples;
+                std::vector<SubSampleRayInfo> subInfo(totalSubSamples);
+                std::vector<Vector3> rayOrigins;
+                std::vector<Vector3> rayDirs;
+                std::vector<float>   rayMaxDists;
+                std::vector<Vector3> lightContribs;
+                
+                // Reserve a rough estimate to avoid excessive reallocation
+                int estRaysPerSample = 1 + static_cast<int>(ApexLegends::Bsp::worldLights.size()) + AO_HEMISPHERE_RAYS;
+                rayOrigins.reserve(totalSubSamples * estRaysPerSample);
+                rayDirs.reserve(totalSubSamples * estRaysPerSample);
+                rayMaxDists.reserve(totalSubSamples * estRaysPerSample);
+                
+                int subIdx = 0;
+                for (int texelIdx : ssTexels) {
+                    int texelX = texelIdx % w;
+                    int texelY = texelIdx / w;
                     
-                    // High gradient - supersample this texel
-                    processed[i] = true;
-                    didWork = true;
-                    
-                    int x = i % w;
-                    int y = i / w;
-                    
-                    TexelLighting_t ss = SupersampleTexel(surf, x, y, sky);
-                    surf.luxels[i] = ss.direct;
-                    surf.indirectLuxels[i] = ss.indirect;
-                    
-                    // Update intensity for next gradient pass
-                    intensity[i] = ComputeTexelIntensity(surf.luxels[i]);
-                    totalSupersampled++;
+                    for (int sy = 0; sy < SUPERSAMPLE_GRID; sy++) {
+                        for (int sx = 0; sx < SUPERSAMPLE_GRID; sx++) {
+                            float subX = texelX + (sx + 0.5f) / SUPERSAMPLE_GRID;
+                            float subY = texelY + (sy + 0.5f) / SUPERSAMPLE_GRID;
+                            Vector3 worldPos = ComputeTexelWorldPos(surf, subX, subY);
+                            
+                            SubSampleRayInfo &info = subInfo[subIdx];
+                            info.firstRayIdx = static_cast<int>(rayOrigins.size());
+                            info.numSunRays = 0;
+                            info.numLightRays = 0;
+                            info.numAoRays = 0;
+                            info.sunNdotL = 0;
+                            info.firstLightContribIdx = static_cast<int>(lightContribs.size());
+                            
+                            // Sun shadow ray
+                            if (sky.valid) {
+                                float ndotl = vector3_dot(sampleNormal, sunDir);
+                                info.sunNdotL = ndotl;
+                                if (ndotl > 0) {
+                                    rayOrigins.push_back(worldPos);
+                                    rayDirs.push_back(sunDir);
+                                    rayMaxDists.push_back(65536.0f);
+                                    info.numSunRays = 1;
+                                }
+                            }
+                            
+                            // Point/spot light shadow rays
+                            for (const WorldLight_t &light : ApexLegends::Bsp::worldLights) {
+                                if (light.type == emit_skyambient || light.type == emit_skylight) continue;
+                                if (light.flags & WORLDLIGHT_FLAG_REALTIME) continue;
+                                
+                                Vector3 lightPos(light.origin[0], light.origin[1], light.origin[2]);
+                                
+                                if (light.type == emit_point) {
+                                    Vector3 toLight = lightPos - worldPos;
+                                    float dist = vector3_length(toLight);
+                                    if (dist < 0.001f) continue;
+                                    
+                                    Vector3 lightDir = toLight / dist;
+                                    float NdotL = vector3_dot(sampleNormal, lightDir);
+                                    if (NdotL <= 0) continue;
+                                    
+                                    float atten;
+                                    if (light.quadratic_attn > 0 || light.linear_attn > 0) {
+                                        atten = 1.0f / (light.constant_attn +
+                                                       light.linear_attn * dist +
+                                                       light.quadratic_attn * dist * dist);
+                                    } else {
+                                        atten = 1.0f / (1.0f + dist * dist * 0.0001f);
+                                    }
+                                    
+                                    rayOrigins.push_back(worldPos);
+                                    rayDirs.push_back(lightDir);
+                                    rayMaxDists.push_back(dist - 1.0f);
+                                    lightContribs.push_back(light.intensity * NdotL * atten * 100.0f);
+                                    info.numLightRays++;
+                                    
+                                } else if (light.type == emit_spotlight) {
+                                    Vector3 toLight = lightPos - worldPos;
+                                    float dist = vector3_length(toLight);
+                                    if (dist < 0.001f) continue;
+                                    
+                                    Vector3 lightDir = toLight / dist;
+                                    float NdotL = vector3_dot(sampleNormal, lightDir);
+                                    if (NdotL <= 0) continue;
+                                    
+                                    float spotDot = vector3_dot(-lightDir, light.normal);
+                                    if (spotDot <= light.stopdot2) continue;
+                                    
+                                    float spotAtten = 1.0f;
+                                    if (spotDot < light.stopdot) {
+                                        spotAtten = (spotDot - light.stopdot2) / (light.stopdot - light.stopdot2);
+                                    }
+                                    float distAtten = 1.0f / (1.0f + dist * dist * 0.0001f);
+                                    
+                                    rayOrigins.push_back(worldPos);
+                                    rayDirs.push_back(lightDir);
+                                    rayMaxDists.push_back(dist - 1.0f);
+                                    lightContribs.push_back(light.intensity * NdotL * spotAtten * distAtten * 100.0f);
+                                    info.numLightRays++;
+                                }
+                            }
+                            
+                            // AO hemisphere rays
+                            if (sky.valid) {
+                                int step = std::max(1, NUM_SPHERE_NORMALS / AO_HEMISPHERE_RAYS);
+                                for (int i = 0; i < NUM_SPHERE_NORMALS; i += step) {
+                                    float cosTheta = vector3_dot(g_SphereNormals[i], sampleNormal);
+                                    if (cosTheta <= 0) continue;
+                                    rayOrigins.push_back(worldPos);
+                                    rayDirs.push_back(g_SphereNormals[i]);
+                                    rayMaxDists.push_back(AO_TRACE_DISTANCE);
+                                    info.numAoRays++;
+                                }
+                            }
+                            
+                            subIdx++;
+                        }
+                    }
                 }
                 
-                if (!didWork) break;  // No more high-gradient texels
+                // ===== Phase 2: Batch GPU dispatch =====
+                int totalRays = static_cast<int>(rayOrigins.size());
+                std::vector<uint8_t> hitResults(totalRays, 0);
+                if (totalRays > 0 && HIPRTTrace::IsSceneReady()) {
+                    HIPRTTrace::BatchTestVisibility(totalRays, rayOrigins.data(), rayDirs.data(),
+                                                    rayMaxDists.data(), hitResults.data());
+                }
+                
+                // ===== Phase 3: Process results — average sub-samples per texel =====
+                subIdx = 0;
+                for (int texelIdx : ssTexels) {
+                    Vector3 totalDirect(0, 0, 0);
+                    Vector3 totalIndirect(0, 0, 0);
+                    
+                    for (int s = 0; s < ssSubSamples; s++) {
+                        const SubSampleRayInfo &info = subInfo[subIdx];
+                        Vector3 directLight(0, 0, 0);
+                        float aoFactor = 1.0f;
+                        int rayIdx = info.firstRayIdx;
+                        
+                        // Sun
+                        if (info.numSunRays > 0) {
+                            if (!hitResults[rayIdx]) {
+                                directLight = directLight + sky.sunColor * (info.sunNdotL * sky.sunIntensity);
+                            }
+                            rayIdx++;
+                        }
+                        
+                        // Lights
+                        for (int li = 0; li < info.numLightRays; li++) {
+                            if (!hitResults[rayIdx]) {
+                                directLight = directLight + lightContribs[info.firstLightContribIdx + li];
+                            }
+                            rayIdx++;
+                        }
+                        
+                        // AO
+                        if (info.numAoRays > 0) {
+                            int unoccluded = 0;
+                            for (int a = 0; a < info.numAoRays; a++) {
+                                if (!hitResults[rayIdx + a]) unoccluded++;
+                            }
+                            aoFactor = (float)unoccluded / info.numAoRays;
+                            aoFactor = std::pow(aoFactor, 1.5f);
+                        }
+                        
+                        Vector3 ambientFill = sky.ambientColor * (sky.ambientIntensity * aoFactor);
+                        totalDirect = totalDirect + directLight + ambientFill;
+                        totalIndirect = totalIndirect + sky.ambientColor * (sky.ambientIntensity * aoFactor * INDIRECT_AMBIENT_SCALE);
+                        
+                        subIdx++;
+                    }
+                    
+                    float inv = 1.0f / ssSubSamples;
+                    surf.luxels[texelIdx] = totalDirect * inv;
+                    surf.indirectLuxels[texelIdx] = totalIndirect * inv;
+                    intensity[texelIdx] = ComputeTexelIntensity(surf.luxels[texelIdx]);
+                    processed[texelIdx] = true;
+                    totalSupersampled++;
+                }
+            }
+            
+            ssSurfacesDone++;
+            int pct = (ssTotalSurfaces > 0) ? (ssSurfacesDone * 100 / ssTotalSurfaces) : 100;
+            if (pct != ssLastPct && (pct % 10 == 0 || ssSurfacesDone == ssTotalSurfaces)) {
+                auto now = std::chrono::high_resolution_clock::now();
+                double elapsed = std::chrono::duration<double>(now - ssStart).count();
+                Sys_Printf("     ...%d%% (%d/%d surfaces, %d supersampled, %.1fs elapsed)\n",
+                           pct, ssSurfacesDone, ssTotalSurfaces, totalSupersampled, elapsed);
+                ssLastPct = pct;
             }
         }
         
-        Sys_Printf("     %9d texels supersampled\n", totalSupersampled);
+        auto ssEnd = std::chrono::high_resolution_clock::now();
+        double ssElapsed = std::chrono::duration<double>(ssEnd - ssStart).count();
+        Sys_Printf("     %9d texels supersampled in %.2fs\n", totalSupersampled, ssElapsed);
     }
     
     // =====================================================
@@ -1518,7 +1891,7 @@ static bool RayTriangleIntersect(const Vector3 &rayOrigin, const Vector3 &rayDir
     return t > EPSILON;  // Hit in front of ray origin
 }
 
-// Fallback brute-force ray tracing (used when Embree is not available)
+// Fallback brute-force ray tracing (used when HIPRT is not available)
 static bool TraceRayAgainstMeshes_Fallback(const Vector3 &origin, const Vector3 &dir, float maxDist) {
     float closestHit = maxDist;
     
@@ -1561,12 +1934,12 @@ static bool TraceRayAgainstMeshes_Fallback(const Vector3 &origin, const Vector3 
 }
 
 // Trace a ray against all mesh geometry
-// Uses Embree BVH acceleration when available, falls back to brute force
+// Uses HIPRT BVH acceleration when available, falls back to brute force
 // Returns true if something is hit within maxDist
 static bool TraceRayAgainstMeshes(const Vector3 &origin, const Vector3 &dir, float maxDist) {
-    // Use Embree if scene is ready (much faster - O(log n) vs O(n))
-    if (EmbreeTrace::IsSceneReady()) {
-        return EmbreeTrace::TestVisibility(origin, dir, maxDist);
+    // Use HIPRT if scene is ready (much faster - O(log n) vs O(n))
+    if (HIPRTTrace::IsSceneReady()) {
+        return HIPRTTrace::TestVisibility(origin, dir, maxDist);
     }
     
     // Fallback to brute force ray tracing
@@ -1588,15 +1961,15 @@ static bool TraceRayGetSurfaceColor(const Vector3 &origin, const Vector3 &dir,
     outColor = Vector3(0.5f, 0.5f, 0.5f);
     outDist = maxDist;
     
-    // Try Embree extended trace for UV coordinates
-    if (EmbreeTrace::IsSceneReady()) {
+    // Try HIPRT extended trace for UV coordinates
+    if (HIPRTTrace::IsSceneReady()) {
         float hitDist;
         Vector3 hitNormal;
         int meshIndex;
         Vector2 hitUV;
         int primID;
         
-        if (EmbreeTrace::TraceRayExtended(origin, dir, maxDist, hitDist, hitNormal, 
+        if (HIPRTTrace::TraceRayExtended(origin, dir, maxDist, hitDist, hitNormal, 
                                           meshIndex, hitUV, primID)) {
             outDist = hitDist;
             
@@ -1882,12 +2255,12 @@ static float GetDistanceToNearestSurface(const Vector3 &pos, Vector3 &outPushDir
         const Vector3 &dir = testDirs[i];
         float offset = 2.0f;
         
-        // Use Embree for precise distance if available
-        if (EmbreeTrace::IsSceneReady()) {
+        // Use HIPRT for precise distance if available
+        if (HIPRTTrace::IsSceneReady()) {
             float hitDist;
             Vector3 hitNormal;
             int meshIndex;
-            if (EmbreeTrace::TraceRay(pos + dir * offset, dir, 512.0f, hitDist, hitNormal, meshIndex)) {
+            if (HIPRTTrace::TraceRay(pos + dir * offset, dir, 512.0f, hitDist, hitNormal, meshIndex)) {
                 if (hitDist < minDist) {
                     minDist = hitDist;
                     outPushDir = dir * -1.0f;  // Push away from nearest surface
@@ -1989,29 +2362,170 @@ static void GenerateProbePositionsVoronoi(const MinMax &worldBounds,
     
     // =========================================================================
     // Step 2: Offset samples above surfaces for probe positions
+    // Uses batch GPU dispatch for solid rejection tests
     // =========================================================================
     std::vector<Vector3> candidatePositions;
     candidatePositions.reserve(geometrySamples.size());
     
     constexpr float MIN_SURFACE_DISTANCE = 72.0f;  // Minimum distance from any surface
     
-    for (const Vector3 &sample : geometrySamples) {
-        // Offset sample upward (probes should be in playable space, not embedded in geometry)
-        Vector3 probePos = sample + Vector3(0, 0, 96.0f);  // Start higher
+    auto step2Start = std::chrono::high_resolution_clock::now();
+    
+    // Phase 1: Batch solid rejection - test all elevated positions at once
+    Sys_Printf("     Step 2: Testing %zu positions for solid rejection...\n", geometrySamples.size());
+    {
+        size_t N = geometrySamples.size();
+        std::vector<Vector3> elevatedPositions(N);
+        for (size_t i = 0; i < N; i++) {
+            elevatedPositions[i] = geometrySamples[i] + Vector3(0, 0, 96.0f);
+        }
         
-        // Check if this position is valid (not inside solid)
-        if (IsPositionInsideSolid(probePos, 48.0f)) continue;
+        // Generate 6 cardinal direction rays per position for solid test
+        const Vector3 cardinalDirs[6] = {
+            Vector3(1,0,0), Vector3(-1,0,0),
+            Vector3(0,1,0), Vector3(0,-1,0),
+            Vector3(0,0,1), Vector3(0,0,-1)
+        };
+        const float solidOffset = 2.0f;
+        const float solidTestDist = 48.0f;
         
-        // Push probe away from nearby surfaces to ensure minimum distance
-        probePos = PushProbeAwayFromSurfaces(probePos, MIN_SURFACE_DISTANCE);
+        size_t totalRays = N * 6;
+        std::vector<Vector3> rayOrigins(totalRays);
+        std::vector<Vector3> rayDirs(totalRays);
+        std::vector<float>   rayMaxDists(totalRays);
         
-        // Re-check validity after pushing
-        if (!IsPositionInsideSolid(probePos, 32.0f)) {
-            candidatePositions.push_back(probePos);
+        for (size_t i = 0; i < N; i++) {
+            for (int d = 0; d < 6; d++) {
+                size_t idx = i * 6 + d;
+                rayOrigins[idx] = elevatedPositions[i] + cardinalDirs[d] * solidOffset;
+                rayDirs[idx] = cardinalDirs[d];
+                rayMaxDists[idx] = solidTestDist;
+            }
+        }
+        
+        // Batch GPU dispatch
+        std::vector<uint8_t> hitResults(totalRays, 0);
+        if (totalRays > 0 && HIPRTTrace::IsSceneReady()) {
+            HIPRTTrace::BatchTestVisibility(static_cast<int>(totalRays), rayOrigins.data(),
+                                            rayDirs.data(), rayMaxDists.data(), hitResults.data());
+        }
+        
+        // Filter: keep positions where NOT all 6 directions hit (not inside solid)
+        std::vector<Vector3> passedFirst;
+        passedFirst.reserve(N);
+        for (size_t i = 0; i < N; i++) {
+            size_t base = i * 6;
+            bool allHit = hitResults[base] && hitResults[base+1] && hitResults[base+2] &&
+                          hitResults[base+3] && hitResults[base+4] && hitResults[base+5];
+            if (!allHit) {
+                passedFirst.push_back(elevatedPositions[i]);
+            }
+        }
+        
+        Sys_Printf("     %zu / %zu passed initial solid rejection (%.1fs)\n", 
+                   passedFirst.size(), N,
+                   std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - step2Start).count());
+        
+        // Phase 2: Push probes away from surfaces (iterative, uses closest-hit)
+        // Batch across all surviving positions per iteration
+        Sys_Printf("     Pushing %zu probes away from surfaces...\n", passedFirst.size());
+        
+        std::vector<Vector3> pushedPositions = passedFirst;
+        std::vector<bool> converged(pushedPositions.size(), false);
+        
+        for (int iter = 0; iter < 4; iter++) {
+            // Collect all active positions that need distance checks
+            std::vector<size_t> activeIndices;
+            for (size_t i = 0; i < pushedPositions.size(); i++) {
+                if (!converged[i]) activeIndices.push_back(i);
+            }
+            if (activeIndices.empty()) break;
+            
+            // Generate 6 closest-hit rays per active position
+            size_t numActive = activeIndices.size();
+            size_t numRays = numActive * 6;
+            std::vector<Vector3> distRayOrigins(numRays);
+            std::vector<Vector3> distRayDirs(numRays);
+            std::vector<float>   distRayMaxDists(numRays, 512.0f);
+            
+            for (size_t a = 0; a < numActive; a++) {
+                const Vector3 &pos = pushedPositions[activeIndices[a]];
+                for (int d = 0; d < 6; d++) {
+                    size_t idx = a * 6 + d;
+                    distRayOrigins[idx] = pos + cardinalDirs[d] * solidOffset;
+                    distRayDirs[idx] = cardinalDirs[d];
+                }
+            }
+            
+            // Batch closest-hit dispatch
+            std::vector<float> hitDists(numRays, -1.0f);
+            if (numRays > 0 && HIPRTTrace::IsSceneReady()) {
+                HIPRTTrace::BatchTraceRay(static_cast<int>(numRays), distRayOrigins.data(),
+                                          distRayDirs.data(), distRayMaxDists.data(), hitDists.data());
+            }
+            
+            // Process results: find nearest surface per position and push away
+            for (size_t a = 0; a < numActive; a++) {
+                size_t posIdx = activeIndices[a];
+                float minDist = FLT_MAX;
+                int minDir = -1;
+                
+                for (int d = 0; d < 6; d++) {
+                    float dist = hitDists[a * 6 + d];
+                    if (dist >= 0 && dist < minDist) {
+                        minDist = dist;
+                        minDir = d;
+                    }
+                }
+                
+                if (minDist >= MIN_SURFACE_DISTANCE) {
+                    converged[posIdx] = true;
+                } else if (minDir >= 0) {
+                    float pushAmount = MIN_SURFACE_DISTANCE - minDist + 8.0f;
+                    pushedPositions[posIdx] = pushedPositions[posIdx] + cardinalDirs[minDir] * (-pushAmount);
+                }
+            }
+        }
+        
+        // Phase 3: Batch second solid rejection for pushed positions
+        {
+            size_t M = pushedPositions.size();
+            size_t totalRays2 = M * 6;
+            std::vector<Vector3> rayOrigins2(totalRays2);
+            std::vector<Vector3> rayDirs2(totalRays2);
+            std::vector<float>   rayMaxDists2(totalRays2);
+            
+            for (size_t i = 0; i < M; i++) {
+                for (int d = 0; d < 6; d++) {
+                    size_t idx = i * 6 + d;
+                    rayOrigins2[idx] = pushedPositions[i] + cardinalDirs[d] * solidOffset;
+                    rayDirs2[idx] = cardinalDirs[d];
+                    rayMaxDists2[idx] = 32.0f;
+                }
+            }
+            
+            std::vector<uint8_t> hitResults2(totalRays2, 0);
+            if (totalRays2 > 0 && HIPRTTrace::IsSceneReady()) {
+                HIPRTTrace::BatchTestVisibility(static_cast<int>(totalRays2), rayOrigins2.data(),
+                                                rayDirs2.data(), rayMaxDists2.data(), hitResults2.data());
+            }
+            
+            for (size_t i = 0; i < M; i++) {
+                size_t base = i * 6;
+                bool allHit = hitResults2[base] && hitResults2[base+1] && hitResults2[base+2] &&
+                              hitResults2[base+3] && hitResults2[base+4] && hitResults2[base+5];
+                if (!allHit) {
+                    candidatePositions.push_back(pushedPositions[i]);
+                }
+            }
         }
     }
     
-    Sys_Printf("     %zu valid candidate positions after solid rejection\n", candidatePositions.size());
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - step2Start).count();
+        Sys_Printf("     %zu valid candidate positions after solid rejection (%.2fs)\n", candidatePositions.size(), elapsed);
+    }
     
     if (candidatePositions.empty()) {
         Vector3 center = (worldBounds.mins + worldBounds.maxs) * 0.5f;
@@ -2148,79 +2662,260 @@ static void GenerateProbePositionsVoronoi(const MinMax &worldBounds,
     
     // =========================================================================
     // Step 5: Filter final positions and enforce minimum spacing
+    // Uses batch GPU dispatch for solid rejection
     // =========================================================================
     std::vector<Vector3> finalPositions;
     finalPositions.reserve(centroids.size());
     
     constexpr float FINAL_MIN_SURFACE_DISTANCE = 64.0f;
     
-    for (Vector3 centroid : centroids) {
-        // Skip if inside solid
-        if (IsPositionInsideSolid(centroid, 32.0f)) continue;
+    Sys_Printf("     Step 5: Filtering %zu centroids...\n", centroids.size());
+    auto step5Start = std::chrono::high_resolution_clock::now();
+    
+    {
+        const Vector3 cardinalDirs[6] = {
+            Vector3(1,0,0), Vector3(-1,0,0),
+            Vector3(0,1,0), Vector3(0,-1,0),
+            Vector3(0,0,1), Vector3(0,0,-1)
+        };
+        const float solidOffset = 2.0f;
         
-        // Push centroid away from surfaces
-        centroid = PushProbeAwayFromSurfaces(centroid, FINAL_MIN_SURFACE_DISTANCE);
+        // Phase 1: Batch solid rejection of centroids
+        size_t M = centroids.size();
+        size_t totalRays = M * 6;
+        std::vector<Vector3> rayOrigins(totalRays);
+        std::vector<Vector3> rayDirs(totalRays);
+        std::vector<float>   rayMaxDists(totalRays);
         
-        // Re-check if still valid after pushing
-        if (IsPositionInsideSolid(centroid, 24.0f)) continue;
-        
-        // Skip if too close to an existing probe
-        bool tooClose = false;
-        for (const Vector3 &existing : finalPositions) {
-            Vector3 delta = centroid - existing;
-            if (vector3_dot(delta, delta) < LIGHT_PROBE_MIN_SPACING * LIGHT_PROBE_MIN_SPACING) {
-                tooClose = true;
-                break;
+        for (size_t i = 0; i < M; i++) {
+            for (int d = 0; d < 6; d++) {
+                size_t idx = i * 6 + d;
+                rayOrigins[idx] = centroids[i] + cardinalDirs[d] * solidOffset;
+                rayDirs[idx] = cardinalDirs[d];
+                rayMaxDists[idx] = 32.0f;
             }
         }
         
-        if (!tooClose) {
-            finalPositions.push_back(centroid);
+        std::vector<uint8_t> solidHits(totalRays, 0);
+        if (totalRays > 0 && HIPRTTrace::IsSceneReady()) {
+            HIPRTTrace::BatchTestVisibility(static_cast<int>(totalRays), rayOrigins.data(),
+                                            rayDirs.data(), rayMaxDists.data(), solidHits.data());
         }
+        
+        // Collect non-solid centroids
+        std::vector<Vector3> validCentroids;
+        for (size_t i = 0; i < M; i++) {
+            size_t base = i * 6;
+            bool allHit = solidHits[base] && solidHits[base+1] && solidHits[base+2] &&
+                          solidHits[base+3] && solidHits[base+4] && solidHits[base+5];
+            if (!allHit) {
+                validCentroids.push_back(centroids[i]);
+            }
+        }
+        
+        Sys_Printf("     %zu / %zu centroids passed solid rejection\n", validCentroids.size(), M);
+        
+        // Phase 2: Batch push away from surfaces
+        std::vector<Vector3> pushedPositions = validCentroids;
+        std::vector<bool> converged(pushedPositions.size(), false);
+        
+        for (int iter = 0; iter < 4; iter++) {
+            std::vector<size_t> activeIndices;
+            for (size_t i = 0; i < pushedPositions.size(); i++) {
+                if (!converged[i]) activeIndices.push_back(i);
+            }
+            if (activeIndices.empty()) break;
+            
+            size_t numActive = activeIndices.size();
+            size_t numRays = numActive * 6;
+            std::vector<Vector3> distRayOrigins(numRays);
+            std::vector<Vector3> distRayDirs(numRays);
+            std::vector<float>   distRayMaxDists(numRays, 512.0f);
+            
+            for (size_t a = 0; a < numActive; a++) {
+                const Vector3 &pos = pushedPositions[activeIndices[a]];
+                for (int d = 0; d < 6; d++) {
+                    size_t idx = a * 6 + d;
+                    distRayOrigins[idx] = pos + cardinalDirs[d] * solidOffset;
+                    distRayDirs[idx] = cardinalDirs[d];
+                }
+            }
+            
+            std::vector<float> hitDists(numRays, -1.0f);
+            if (numRays > 0 && HIPRTTrace::IsSceneReady()) {
+                HIPRTTrace::BatchTraceRay(static_cast<int>(numRays), distRayOrigins.data(),
+                                          distRayDirs.data(), distRayMaxDists.data(), hitDists.data());
+            }
+            
+            for (size_t a = 0; a < numActive; a++) {
+                size_t posIdx = activeIndices[a];
+                float minDist = FLT_MAX;
+                int minDir = -1;
+                
+                for (int d = 0; d < 6; d++) {
+                    float dist = hitDists[a * 6 + d];
+                    if (dist >= 0 && dist < minDist) {
+                        minDist = dist;
+                        minDir = d;
+                    }
+                }
+                
+                if (minDist >= FINAL_MIN_SURFACE_DISTANCE) {
+                    converged[posIdx] = true;
+                } else if (minDir >= 0) {
+                    float pushAmount = FINAL_MIN_SURFACE_DISTANCE - minDist + 8.0f;
+                    pushedPositions[posIdx] = pushedPositions[posIdx] + cardinalDirs[minDir] * (-pushAmount);
+                }
+            }
+        }
+        
+        // Phase 3: Batch second solid rejection + minimum spacing filter
+        {
+            size_t P = pushedPositions.size();
+            size_t totalRays2 = P * 6;
+            std::vector<Vector3> rayOrigins2(totalRays2);
+            std::vector<Vector3> rayDirs2(totalRays2);
+            std::vector<float>   rayMaxDists2(totalRays2);
+            
+            for (size_t i = 0; i < P; i++) {
+                for (int d = 0; d < 6; d++) {
+                    size_t idx = i * 6 + d;
+                    rayOrigins2[idx] = pushedPositions[i] + cardinalDirs[d] * solidOffset;
+                    rayDirs2[idx] = cardinalDirs[d];
+                    rayMaxDists2[idx] = 24.0f;
+                }
+            }
+            
+            std::vector<uint8_t> solidHits2(totalRays2, 0);
+            if (totalRays2 > 0 && HIPRTTrace::IsSceneReady()) {
+                HIPRTTrace::BatchTestVisibility(static_cast<int>(totalRays2), rayOrigins2.data(),
+                                                rayDirs2.data(), rayMaxDists2.data(), solidHits2.data());
+            }
+            
+            for (size_t i = 0; i < P; i++) {
+                size_t base = i * 6;
+                bool allHit = solidHits2[base] && solidHits2[base+1] && solidHits2[base+2] &&
+                              solidHits2[base+3] && solidHits2[base+4] && solidHits2[base+5];
+                if (allHit) continue;
+                
+                // Skip if too close to an existing probe
+                bool tooClose = false;
+                for (const Vector3 &existing : finalPositions) {
+                    Vector3 delta = pushedPositions[i] - existing;
+                    if (vector3_dot(delta, delta) < LIGHT_PROBE_MIN_SPACING * LIGHT_PROBE_MIN_SPACING) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (!tooClose) {
+                    finalPositions.push_back(pushedPositions[i]);
+                }
+            }
+        }
+    }
+    
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - step5Start).count();
+        Sys_Printf("     %zu final positions after filtering (%.2fs)\n", finalPositions.size(), elapsed);
     }
     
     // =========================================================================
     // Step 6: Add probes at shadow/light transition boundaries
+    // Uses batch GPU dispatch for shadow boundary detection
     // =========================================================================
-    Sys_Printf("     Adding probes at shadow boundaries...\n");
+    Sys_Printf("     Step 6: Detecting shadow boundaries (%zu probes)...\n", finalPositions.size());
+    auto step6Start = std::chrono::high_resolution_clock::now();
     
     std::vector<Vector3> shadowBoundaryProbes;
     
-    // For each final probe, test if there are significant lighting differences
-    // at nearby positions - this indicates a shadow boundary that needs more probes
-    for (size_t i = 0; i < finalPositions.size(); i++) {
-        const Vector3 &pos = finalPositions[i];
+    {
+        // Generate 8 upward-angled rays per probe for shadow boundary detection
+        size_t N = finalPositions.size();
+        size_t totalRays = N * 8;
+        std::vector<Vector3> rayOrigins(totalRays);
+        std::vector<Vector3> rayDirs(totalRays);
+        std::vector<float>   rayMaxDists(totalRays);
         
-        // Test visibility to sky in 8 horizontal directions
-        int sunlitCount = 0;
-        const float testDist = 8192.0f;
+        std::vector<Vector3> testDirs(8);
+        for (int d = 0; d < 8; d++) {
+            float angle = d * M_PI / 4.0f;
+            testDirs[d] = Vector3(std::cos(angle) * 0.5f, std::sin(angle) * 0.5f, 0.707f);
+        }
         
-        for (int dir = 0; dir < 8; dir++) {
-            float angle = dir * M_PI / 4.0f;
-            Vector3 testDir(std::cos(angle) * 0.5f, std::sin(angle) * 0.5f, 0.707f);  // 45 degree upward
-            
-            Vector3 rayOrigin = pos + testDir * 2.0f;
-            if (!TraceRayAgainstMeshes(rayOrigin, testDir, testDist)) {
-                sunlitCount++;
+        for (size_t i = 0; i < N; i++) {
+            for (int d = 0; d < 8; d++) {
+                size_t idx = i * 8 + d;
+                rayOrigins[idx] = finalPositions[i] + testDirs[d] * 2.0f;
+                rayDirs[idx] = testDirs[d];
+                rayMaxDists[idx] = 8192.0f;
             }
         }
         
-        // If partially occluded (some rays hit, some don't), we're near a shadow boundary
-        if (sunlitCount > 0 && sunlitCount < 8) {
-            // Add extra probes nearby to capture the gradient
-            for (int dir = 0; dir < 4; dir++) {
-                float angle = dir * M_PI / 2.0f;
-                Vector3 offset(std::cos(angle) * 64.0f, std::sin(angle) * 64.0f, 0);
-                Vector3 newPos = pos + offset;
+        // Batch dispatch
+        std::vector<uint8_t> hitResults(totalRays, 0);
+        if (totalRays > 0 && HIPRTTrace::IsSceneReady()) {
+            HIPRTTrace::BatchTestVisibility(static_cast<int>(totalRays), rayOrigins.data(),
+                                            rayDirs.data(), rayMaxDists.data(), hitResults.data());
+        }
+        
+        // Process results: find probes at shadow boundaries and add extra probes
+        const Vector3 cardinalDirs[6] = {
+            Vector3(1,0,0), Vector3(-1,0,0),
+            Vector3(0,1,0), Vector3(0,-1,0),
+            Vector3(0,0,1), Vector3(0,0,-1)
+        };
+        
+        // Collect candidate boundary probe positions
+        std::vector<Vector3> boundaryCandidates;
+        
+        for (size_t i = 0; i < N; i++) {
+            int sunlitCount = 0;
+            for (int d = 0; d < 8; d++) {
+                if (!hitResults[i * 8 + d]) sunlitCount++;
+            }
+            
+            if (sunlitCount > 0 && sunlitCount < 8) {
+                for (int dir = 0; dir < 4; dir++) {
+                    float angle = dir * M_PI / 2.0f;
+                    Vector3 offset(std::cos(angle) * 64.0f, std::sin(angle) * 64.0f, 0);
+                    Vector3 newPos = finalPositions[i] + offset;
+                    boundaryCandidates.push_back(newPos);
+                }
+            }
+        }
+        
+        if (!boundaryCandidates.empty()) {
+            // Batch solid rejection for boundary candidates
+            size_t BC = boundaryCandidates.size();
+            size_t bcTotalRays = BC * 6;
+            std::vector<Vector3> bcRayOrigins(bcTotalRays);
+            std::vector<Vector3> bcRayDirs(bcTotalRays);
+            std::vector<float>   bcRayMaxDists(bcTotalRays);
+            
+            for (size_t i = 0; i < BC; i++) {
+                for (int d = 0; d < 6; d++) {
+                    size_t idx = i * 6 + d;
+                    bcRayOrigins[idx] = boundaryCandidates[i] + cardinalDirs[d] * 2.0f;
+                    bcRayDirs[idx] = cardinalDirs[d];
+                    bcRayMaxDists[idx] = 24.0f;
+                }
+            }
+            
+            std::vector<uint8_t> bcHits(bcTotalRays, 0);
+            if (bcTotalRays > 0 && HIPRTTrace::IsSceneReady()) {
+                HIPRTTrace::BatchTestVisibility(static_cast<int>(bcTotalRays), bcRayOrigins.data(),
+                                                bcRayDirs.data(), bcRayMaxDists.data(), bcHits.data());
+            }
+            
+            for (size_t i = 0; i < BC; i++) {
+                size_t base = i * 6;
+                bool allHit = bcHits[base] && bcHits[base+1] && bcHits[base+2] &&
+                              bcHits[base+3] && bcHits[base+4] && bcHits[base+5];
+                if (allHit) continue;
                 
-                // Validate new position
-                if (IsPositionInsideSolid(newPos, 24.0f)) continue;
+                Vector3 &newPos = boundaryCandidates[i];
                 
-                // Push away from surfaces
-                newPos = PushProbeAwayFromSurfaces(newPos, FINAL_MIN_SURFACE_DISTANCE);
-                if (IsPositionInsideSolid(newPos, 16.0f)) continue;
-                
-                // Check distance from all existing probes
                 bool tooClose = false;
                 for (const Vector3 &existing : finalPositions) {
                     Vector3 delta = newPos - existing;
@@ -2229,11 +2924,13 @@ static void GenerateProbePositionsVoronoi(const MinMax &worldBounds,
                         break;
                     }
                 }
-                for (const Vector3 &existing : shadowBoundaryProbes) {
-                    if (tooClose) break;
-                    Vector3 delta = newPos - existing;
-                    if (vector3_dot(delta, delta) < 48.0f * 48.0f) {
-                        tooClose = true;
+                if (!tooClose) {
+                    for (const Vector3 &existing : shadowBoundaryProbes) {
+                        Vector3 delta = newPos - existing;
+                        if (vector3_dot(delta, delta) < 48.0f * 48.0f) {
+                            tooClose = true;
+                            break;
+                        }
                     }
                 }
                 
@@ -2249,8 +2946,14 @@ static void GenerateProbePositionsVoronoi(const MinMax &worldBounds,
         finalPositions.push_back(sbp);
     }
     
-    if (!shadowBoundaryProbes.empty()) {
-        Sys_Printf("     Added %zu shadow boundary probes\n", shadowBoundaryProbes.size());
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - step6Start).count();
+        if (!shadowBoundaryProbes.empty()) {
+            Sys_Printf("     Added %zu shadow boundary probes (%.2fs)\n", shadowBoundaryProbes.size(), elapsed);
+        } else {
+            Sys_Printf("     No shadow boundary probes needed (%.2fs)\n", elapsed);
+        }
     }
     
     // =========================================================================
@@ -2322,11 +3025,11 @@ static void GenerateProbePositionsVoronoi(const MinMax &worldBounds,
                 Vector3 rayDir(0, 0, -1);
                 float maxTrace = startZ - meshBounds.mins[2] + 16.0f;
                 
-                if (EmbreeTrace::IsSceneReady()) {
+                if (HIPRTTrace::IsSceneReady()) {
                     float hitDist;
                     Vector3 hitNormal;
                     int meshIndex;
-                    if (EmbreeTrace::TraceRay(rayStart, rayDir, maxTrace, hitDist, hitNormal, meshIndex)) {
+                    if (HIPRTTrace::TraceRay(rayStart, rayDir, maxTrace, hitDist, hitNormal, meshIndex)) {
                         // Accept any upward-facing surface as floor
                         if (hitNormal[2] > 0.1f) {
                             floorZ = rayStart[2] - hitDist;
@@ -2334,7 +3037,7 @@ static void GenerateProbePositionsVoronoi(const MinMax &worldBounds,
                         }
                     }
                 } else {
-                    // Fallback without Embree
+                    // Fallback without HIPRT
                     if (TraceRayAgainstMeshes(rayStart, rayDir, maxTrace)) {
                         floorZ = meshBounds.mins[2] + 16.0f;
                         foundFloor = true;
@@ -2922,32 +3625,324 @@ void ApexLegends::EmitLightProbes() {
     baseProbe.padding0 = 0xFFFFFFFF;       // Usually 0xFFFFFFFF in official maps  
     baseProbe.padding1 = 0x00000000;       // Always 0 in official maps
     
-    // Compute per-probe lighting using spherical sampling
+    // Compute per-probe lighting using batch GPU dispatch
     Sys_Printf("     Computing probe lighting using 162-direction spherical sampling...\n");
+    Sys_Printf("     Batch processing %zu probes...\n", probePositions.size());
+    auto probeLightStart = std::chrono::high_resolution_clock::now();
     
     std::vector<ProbeCandidate> candidates;
     candidates.reserve(probePositions.size());
     
-    for (size_t i = 0; i < probePositions.size(); i++) {
-        const Vector3 &pos = probePositions[i];
-        
-        ProbeCandidate candidate;
-        candidate.pos = pos;
-        candidate.keep = true;
-        
-        // Compute ambient using Source SDK style spherical sampling
-        // This samples 162 directions and accumulates into 6-sided cube
-        ComputeAmbientFromSphericalSamples(pos, sky, candidate.cube);
-        
-        candidates.push_back(candidate);
-        
-        // Progress indicator for large probe counts
-        if ((i + 1) % 100 == 0 || i + 1 == probePositions.size()) {
-            Sys_Printf("       Computed %zu / %zu probes...\n", i + 1, probePositions.size());
+    // Count non-sky worldlights for point light shadow rays
+    std::vector<size_t> pointLightIndices;
+    for (size_t li = 0; li < ApexLegends::Bsp::worldLights.size(); li++) {
+        const WorldLight_t &light = ApexLegends::Bsp::worldLights[li];
+        if (light.type == emit_skyambient || light.type == emit_skylight) continue;
+        pointLightIndices.push_back(li);
+    }
+    
+    size_t numProbes = probePositions.size();
+    size_t numPointLights = pointLightIndices.size();
+    
+    // ===== Phase 1: Batch all 162-direction visibility rays for all probes =====
+    Sys_Printf("     Phase 1: Generating %zu direction rays (%zu probes x 162 dirs)...\n",
+               numProbes * NUM_SPHERE_NORMALS, numProbes);
+    
+    size_t totalDirRays = numProbes * NUM_SPHERE_NORMALS;
+    std::vector<Vector3> dirRayOrigins(totalDirRays);
+    std::vector<Vector3> dirRayDirs(totalDirRays);
+    std::vector<float>   dirRayMaxDists(totalDirRays, LIGHT_PROBE_TRACE_DIST);
+    
+    for (size_t p = 0; p < numProbes; p++) {
+        const Vector3 &pos = probePositions[p];
+        for (int d = 0; d < NUM_SPHERE_NORMALS; d++) {
+            size_t idx = p * NUM_SPHERE_NORMALS + d;
+            dirRayOrigins[idx] = pos + g_SphereNormals[d] * 2.0f;
+            dirRayDirs[idx] = g_SphereNormals[d];
         }
     }
     
-    Sys_Printf("     Finished computing %zu probe(s)\n", probePositions.size());
+    // Batch visibility test (hit = geometry, miss = sky)
+    std::vector<uint8_t> dirHits(totalDirRays, 0);
+    if (totalDirRays > 0 && HIPRTTrace::IsSceneReady()) {
+        HIPRTTrace::BatchTestVisibility(static_cast<int>(totalDirRays), dirRayOrigins.data(),
+                                        dirRayDirs.data(), dirRayMaxDists.data(), dirHits.data());
+    }
+    
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - probeLightStart).count();
+        Sys_Printf("     Phase 1 complete: %zu direction rays dispatched (%.2fs)\n", totalDirRays, elapsed);
+    }
+    
+    // ===== Phase 2: Batch closest-hit for rays that hit geometry (need distance) =====
+    // Collect indices of rays that hit
+    std::vector<size_t> hitRayIndices;
+    hitRayIndices.reserve(totalDirRays / 2);
+    for (size_t i = 0; i < totalDirRays; i++) {
+        if (dirHits[i]) hitRayIndices.push_back(i);
+    }
+    
+    Sys_Printf("     Phase 2: %zu rays hit geometry, getting distances...\n", hitRayIndices.size());
+    
+    // Batch closest-hit for hit rays to get distance (for distance falloff)
+    std::vector<float> hitDistances(totalDirRays, -1.0f);
+    if (!hitRayIndices.empty() && HIPRTTrace::IsSceneReady()) {
+        size_t numHitRays = hitRayIndices.size();
+        std::vector<Vector3> hitRayOrigins(numHitRays);
+        std::vector<Vector3> hitRayDirections(numHitRays);
+        std::vector<float>   hitRayMaxDists(numHitRays, LIGHT_PROBE_TRACE_DIST);
+        std::vector<float>   hitRayDists(numHitRays, -1.0f);
+        
+        for (size_t i = 0; i < numHitRays; i++) {
+            hitRayOrigins[i] = dirRayOrigins[hitRayIndices[i]];
+            hitRayDirections[i] = dirRayDirs[hitRayIndices[i]];
+        }
+        
+        HIPRTTrace::BatchTraceRay(static_cast<int>(numHitRays), hitRayOrigins.data(),
+                                   hitRayDirections.data(), hitRayMaxDists.data(), hitRayDists.data());
+        
+        // Map distances back to the full array
+        for (size_t i = 0; i < numHitRays; i++) {
+            hitDistances[hitRayIndices[i]] = hitRayDists[i];
+        }
+    }
+    
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - probeLightStart).count();
+        Sys_Printf("     Phase 2 complete (%.2fs)\n", elapsed);
+    }
+    
+    // ===== Phase 3: Batch point light shadow rays for all probes =====
+    // Pre-compute per-probe per-light ray data
+    struct ProbeLightRayInfo {
+        Vector3 dirToLight;
+        float dist;
+        float falloff;
+        Vector3 lightColor;
+    };
+    
+    std::vector<Vector3> lightRayOrigins;
+    std::vector<Vector3> lightRayDirs;
+    std::vector<float>   lightRayMaxDists;
+    std::vector<size_t>  lightRayProbeIdx;  // which probe this ray belongs to
+    std::vector<ProbeLightRayInfo> lightRayInfos;
+    
+    if (numPointLights > 0) {
+        Sys_Printf("     Phase 3: Generating point light shadow rays (%zu probes x %zu lights)...\n",
+                   numProbes, numPointLights);
+        
+        lightRayOrigins.reserve(numProbes * numPointLights);
+        lightRayDirs.reserve(numProbes * numPointLights);
+        lightRayMaxDists.reserve(numProbes * numPointLights);
+        lightRayProbeIdx.reserve(numProbes * numPointLights);
+        lightRayInfos.reserve(numProbes * numPointLights);
+        
+        for (size_t p = 0; p < numProbes; p++) {
+            const Vector3 &pos = probePositions[p];
+            
+            for (size_t li : pointLightIndices) {
+                const WorldLight_t &light = ApexLegends::Bsp::worldLights[li];
+                Vector3 lightPos(light.origin[0], light.origin[1], light.origin[2]);
+                Vector3 delta = lightPos - pos;
+                float distSq = vector3_dot(delta, delta);
+                
+                if (distSq < 1.0f) continue;
+                
+                float dist = std::sqrt(distSq);
+                Vector3 dirToLight = delta * (1.0f / dist);
+                
+                lightRayOrigins.push_back(pos + dirToLight * 2.0f);
+                lightRayDirs.push_back(dirToLight);
+                lightRayMaxDists.push_back(dist - 4.0f);
+                lightRayProbeIdx.push_back(p);
+                
+                ProbeLightRayInfo info;
+                info.dirToLight = dirToLight;
+                info.dist = dist;
+                info.falloff = 1.0f / (distSq + 1.0f);
+                info.lightColor = light.intensity * 0.01f;
+                lightRayInfos.push_back(info);
+            }
+        }
+        
+        // Batch dispatch
+        std::vector<uint8_t> lightHits(lightRayOrigins.size(), 0);
+        if (!lightRayOrigins.empty() && HIPRTTrace::IsSceneReady()) {
+            HIPRTTrace::BatchTestVisibility(static_cast<int>(lightRayOrigins.size()),
+                                            lightRayOrigins.data(), lightRayDirs.data(),
+                                            lightRayMaxDists.data(), lightHits.data());
+        }
+        
+        // Store hit results for Phase 4 processing
+        // We'll use the lightHits vector directly in Phase 4
+        // (swap into a member variable for use below)
+        lightRayOrigins.clear(); // free memory, we have lightHits and lightRayInfos
+        lightRayDirs.clear();
+        lightRayMaxDists.clear();
+        
+        // Process point light contributions per probe
+        // Build per-probe light box contributions
+        std::vector<std::array<Vector3, 6>> probeLightContribs(numProbes);
+        for (size_t p = 0; p < numProbes; p++) {
+            for (int i = 0; i < 6; i++) probeLightContribs[p][i] = Vector3(0, 0, 0);
+        }
+        
+        for (size_t r = 0; r < lightRayInfos.size(); r++) {
+            if (lightHits[r]) continue;  // Light is occluded
+            
+            size_t probeIdx = lightRayProbeIdx[r];
+            const ProbeLightRayInfo &info = lightRayInfos[r];
+            
+            for (int i = 0; i < 6; i++) {
+                float weight = vector3_dot(info.dirToLight, g_BoxDirections[i]);
+                if (weight > 0) {
+                    probeLightContribs[probeIdx][i] = probeLightContribs[probeIdx][i] + 
+                        info.lightColor * (weight * info.falloff);
+                }
+            }
+        }
+        
+        {
+            auto now = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration<double>(now - probeLightStart).count();
+            Sys_Printf("     Phase 3 complete: %zu light shadow rays (%.2fs)\n", lightRayInfos.size(), elapsed);
+        }
+        
+        // ===== Phase 4: Assemble final ambient cubes from all data =====
+        Sys_Printf("     Phase 4: Assembling %zu probe ambient cubes...\n", numProbes);
+        
+        for (size_t p = 0; p < numProbes; p++) {
+            ProbeCandidate candidate;
+            candidate.pos = probePositions[p];
+            candidate.keep = true;
+            
+            // Compute radcolor from direction ray results
+            Vector3 radcolor[NUM_SPHERE_NORMALS];
+            
+            for (int d = 0; d < NUM_SPHERE_NORMALS; d++) {
+                size_t rayIdx = p * NUM_SPHERE_NORMALS + d;
+                const Vector3 &dir = g_SphereNormals[d];
+                radcolor[d] = Vector3(0, 0, 0);
+                
+                if (!dirHits[rayIdx]) {
+                    // Sky contribution
+                    radcolor[d] = radcolor[d] + sky.ambientColor * 0.5f;
+                    
+                    float sunDot = vector3_dot(dir, sky.sunDir * -1.0f);
+                    if (sunDot > 0) {
+                        radcolor[d] = radcolor[d] + sky.sunColor * (sunDot * sky.sunIntensity * 0.5f);
+                    }
+                    
+                    float upDot = dir[2];
+                    if (upDot > 0) {
+                        radcolor[d] = radcolor[d] + sky.ambientColor * (upDot * 0.3f);
+                    }
+                } else {
+                    // Geometry hit - use neutral bounce color (surface color requires extended trace)
+                    float hitDist = hitDistances[rayIdx];
+                    float distFactor = 1.0f;
+                    if (hitDist >= 0 && hitDist < 512.0f) {
+                        distFactor = 1.0f + (512.0f - hitDist) / 512.0f * 0.5f;
+                    }
+                    
+                    // Use ambient color * neutral reflectance since we don't have surface color
+                    Vector3 bounceColor;
+                    bounceColor[0] = sky.ambientColor[0] * 0.5f;
+                    bounceColor[1] = sky.ambientColor[1] * 0.5f;
+                    bounceColor[2] = sky.ambientColor[2] * 0.5f;
+                    radcolor[d] = bounceColor * (0.4f * distFactor);
+                }
+            }
+            
+            // Accumulate into 6-sided ambient cube
+            for (int j = 0; j < 6; j++) {
+                float totalWeight = 0.0f;
+                candidate.cube[j] = Vector3(0, 0, 0);
+                
+                for (int d = 0; d < NUM_SPHERE_NORMALS; d++) {
+                    float weight = vector3_dot(g_SphereNormals[d], g_BoxDirections[j]);
+                    if (weight > 0) {
+                        totalWeight += weight;
+                        candidate.cube[j] = candidate.cube[j] + radcolor[d] * weight;
+                    }
+                }
+                
+                if (totalWeight > 0.0f) {
+                    candidate.cube[j] = candidate.cube[j] * (1.0f / totalWeight);
+                }
+                
+                // Add point light contributions
+                candidate.cube[j] = candidate.cube[j] + probeLightContribs[p][j];
+            }
+            
+            candidates.push_back(candidate);
+        }
+    } else {
+        // No point lights - simpler path using only direction rays
+        for (size_t p = 0; p < numProbes; p++) {
+            ProbeCandidate candidate;
+            candidate.pos = probePositions[p];
+            candidate.keep = true;
+            
+            Vector3 radcolor[NUM_SPHERE_NORMALS];
+            
+            for (int d = 0; d < NUM_SPHERE_NORMALS; d++) {
+                size_t rayIdx = p * NUM_SPHERE_NORMALS + d;
+                const Vector3 &dir = g_SphereNormals[d];
+                radcolor[d] = Vector3(0, 0, 0);
+                
+                if (!dirHits[rayIdx]) {
+                    radcolor[d] = radcolor[d] + sky.ambientColor * 0.5f;
+                    float sunDot = vector3_dot(dir, sky.sunDir * -1.0f);
+                    if (sunDot > 0) {
+                        radcolor[d] = radcolor[d] + sky.sunColor * (sunDot * sky.sunIntensity * 0.5f);
+                    }
+                    float upDot = dir[2];
+                    if (upDot > 0) {
+                        radcolor[d] = radcolor[d] + sky.ambientColor * (upDot * 0.3f);
+                    }
+                } else {
+                    float hitDist = hitDistances[rayIdx];
+                    float distFactor = 1.0f;
+                    if (hitDist >= 0 && hitDist < 512.0f) {
+                        distFactor = 1.0f + (512.0f - hitDist) / 512.0f * 0.5f;
+                    }
+                    Vector3 bounceColor;
+                    bounceColor[0] = sky.ambientColor[0] * 0.5f;
+                    bounceColor[1] = sky.ambientColor[1] * 0.5f;
+                    bounceColor[2] = sky.ambientColor[2] * 0.5f;
+                    radcolor[d] = bounceColor * (0.4f * distFactor);
+                }
+            }
+            
+            for (int j = 0; j < 6; j++) {
+                float totalWeight = 0.0f;
+                candidate.cube[j] = Vector3(0, 0, 0);
+                
+                for (int d = 0; d < NUM_SPHERE_NORMALS; d++) {
+                    float weight = vector3_dot(g_SphereNormals[d], g_BoxDirections[j]);
+                    if (weight > 0) {
+                        totalWeight += weight;
+                        candidate.cube[j] = candidate.cube[j] + radcolor[d] * weight;
+                    }
+                }
+                
+                if (totalWeight > 0.0f) {
+                    candidate.cube[j] = candidate.cube[j] * (1.0f / totalWeight);
+                }
+            }
+            
+            candidates.push_back(candidate);
+        }
+    }
+    
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - probeLightStart).count();
+        Sys_Printf("     Finished computing %zu probe(s) in %.2fs\n", probePositions.size(), elapsed);
+    }
     
     // Compress probe list if we have too many (Source SDK style optimization)
     // Remove redundant probes that can be reconstructed from neighbors

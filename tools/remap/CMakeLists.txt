@@ -1,19 +1,22 @@
-# Optional Embree support for accelerated ray tracing
-option(USE_EMBREE "Use Intel Embree for accelerated ray tracing" ON)
+# Optional HIPRT support for accelerated ray tracing
+# HIPRT uses Orochi (GPU abstraction over HIP/CUDA) and hiprtew (runtime DLL loading)
+# so no HIP SDK installation is required - GPU libraries are loaded dynamically at runtime.
+option(USE_HIPRT "Use AMD HIP RT for accelerated ray tracing" ON)
 
-if(USE_EMBREE)
-    # For Visual Studio, look in windeps folder first
-    if(MSVC)
-        set(embree_DIR "${CMAKE_SOURCE_DIR}/windeps/embree/lib/cmake/embree-4.4.0")
-    endif()
+if(USE_HIPRT)
+    set(HIPRT_SDK_DIR "${CMAKE_SOURCE_DIR}/windeps/hiprt")
+    set(HIPRT_LIB "${HIPRT_SDK_DIR}/hiprt/win/hiprt0300064.lib")
     
-    find_package(embree 4 QUIET)
-    if(embree_FOUND)
-        message(STATUS "Embree found: ${embree_DIR}")
-        add_compile_definitions(USE_EMBREE)
+    if(EXISTS "${HIPRT_SDK_DIR}/hiprt/hiprt.h" AND EXISTS "${HIPRT_LIB}")
+        message(STATUS "HIPRT SDK found: ${HIPRT_SDK_DIR}")
+        add_compile_definitions(USE_HIPRT)
+        add_compile_definitions(OROCHI_ENABLE_CUEW)
+        # Pass SDK path as string for runtime kernel compilation include paths
+        string(REPLACE "\\" "/" HIPRT_SDK_DIR_FWD "${HIPRT_SDK_DIR}")
+        add_compile_definitions(HIPRT_SDK_INCLUDE_DIR=\"${HIPRT_SDK_DIR_FWD}\")
     else()
-        message(STATUS "Embree not found - using fallback ray tracing")
-        set(USE_EMBREE OFF)
+        message(STATUS "HIPRT SDK not found in windeps - using fallback ray tracing")
+        set(USE_HIPRT OFF)
     endif()
 endif()
 
@@ -48,8 +51,8 @@ add_executable(remap
                common/unzip.h
                common/vfs.cpp
                common/vfs.h
-               source/embree_trace.cpp
-               source/embree_trace.h
+               source/hiprt_trace.cpp
+               source/hiprt_trace.h
                source/apex_legends/apex_legends_bsp.cpp
                source/apex_legends/apex_legends_collisions.cpp
                source/apex_legends/apex_legends_entities.cpp
@@ -133,6 +136,22 @@ target_include_directories(remap PRIVATE .
                            ${PNG_INCLUDE_DIRS}
                           )
 
+# HIPRT: add Orochi/hipew/cuew sources and include directories
+if(USE_HIPRT)
+    target_sources(remap PRIVATE
+        ${HIPRT_SDK_DIR}/contrib/Orochi/Orochi/Orochi.cpp
+        ${HIPRT_SDK_DIR}/contrib/Orochi/contrib/hipew/src/hipew.cpp
+        ${HIPRT_SDK_DIR}/contrib/Orochi/contrib/cuew/src/cuew.cpp
+    )
+    target_include_directories(remap PRIVATE
+        ${HIPRT_SDK_DIR}
+        ${HIPRT_SDK_DIR}/contrib/Orochi
+        ${HIPRT_SDK_DIR}/contrib/Orochi/contrib/hipew/include
+        ${HIPRT_SDK_DIR}/contrib/Orochi/contrib/cuew/include
+        ${CMAKE_SOURCE_DIR}/windeps/cuda/include
+    )
+endif()
+
 target_link_libraries(remap
                       xml
                       ddslib
@@ -149,20 +168,33 @@ target_link_libraries(remap
                       ${LIBXML2_LIBRARIES}
                      )
 
-# Link Embree if available
-if(USE_EMBREE AND embree_FOUND)
-    target_link_libraries(remap embree)
+# Link HIPRT if available
+if(USE_HIPRT)
+    target_link_libraries(remap ${HIPRT_LIB} version)
     
-    # Copy Embree DLLs to output directory (Windows only)
+    # Copy HIPRT DLLs to output directory (Windows only)
     if(WIN32)
-        set(EMBREE_BIN_DIR "${CMAKE_SOURCE_DIR}/windeps/embree/bin")
+        set(HIPRT_DLL_DIR "${HIPRT_SDK_DIR}/hiprt/win")
         add_custom_command(TARGET remap POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${EMBREE_BIN_DIR}/embree4.dll"
-                "${EMBREE_BIN_DIR}/tbb12.dll"
-                "${EMBREE_BIN_DIR}/tbbmalloc.dll"
+                "${HIPRT_DLL_DIR}/hiprt0300064.dll"
+                "${HIPRT_DLL_DIR}/amd_comgr0604.dll"
+                "${HIPRT_DLL_DIR}/hiprtc0604.dll"
+                "${HIPRT_DLL_DIR}/hiprtc-builtins0604.dll"
                 $<TARGET_FILE_DIR:remap>
-            COMMENT "Copying Embree DLLs..."
+            COMMENT "Copying HIPRT DLLs..."
+        )
+        # Copy kernel bitcode files needed at runtime
+        add_custom_command(TARGET remap POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${HIPRT_DLL_DIR}/hiprt03000_6.4_amd.hipfb"
+                "${HIPRT_DLL_DIR}/hiprt03000_6.4_amd_lib_win.bc"
+                "${HIPRT_DLL_DIR}/hiprt03000_nv.fatbin"
+                "${HIPRT_DLL_DIR}/hiprt03000_nv_lib.fatbin"
+                "${HIPRT_DLL_DIR}/oro_compiled_kernels.fatbin"
+                "${HIPRT_DLL_DIR}/oro_compiled_kernels.hipfb"
+                $<TARGET_FILE_DIR:remap>
+            COMMENT "Copying HIPRT kernel files..."
         )
     endif()
 endif()
