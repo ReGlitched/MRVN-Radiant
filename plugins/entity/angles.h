@@ -22,6 +22,7 @@
 #pragma once
 
 #include "ientity.h"
+#include "qerplugin.h"
 
 #include "math/quaternion.h"
 #include "generic/callback.h"
@@ -71,13 +72,23 @@ inline void read_angles( Vector3& angles, const char* value ){
 	}
 }
 inline void write_angles( const Vector3& angles, Entity* entity ){
+	const auto usesVectorAnglesKey = []() -> bool {
+		const char* gameType = GlobalRadiant().getGameDescriptionKeyValue( "type" );
+		if( gameType != 0 && string_equal( gameType, "apexlegends" ) ){
+			return true;
+		}
+
+		const char* basegame = GlobalRadiant().getGameDescriptionKeyValue( "basegame" );
+		return basegame != 0 && string_equal( basegame, "platform" );
+	};
+
 	if ( angles == ANGLESKEY_IDENTITY ) {
 		entity->setKeyValue( "angle", "" );
 		entity->setKeyValue( "angles", "" );
 	}
 	else
 	{
-		if ( angles[0] == 0 && angles[1] == 0 ) {
+		if ( angles[0] == 0 && angles[1] == 0 && !usesVectorAnglesKey() ) {
 			const float yaw = angles[2];
 			entity->setKeyValue( "angles", "" );
 			write_angle( yaw, entity );
