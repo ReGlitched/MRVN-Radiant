@@ -28,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <QAbstractItemView>
@@ -444,6 +445,48 @@ Entity* selected_entity(){
 	return entity;
 }
 
+struct SelectedPresetEntity
+{
+	scene::Node* node = nullptr;
+	Entity* entity = nullptr;
+};
+
+std::vector<SelectedPresetEntity> selected_preset_entities(){
+	class SelectedPresetEntitiesVisitor : public SelectionSystem::Visitor
+	{
+		std::vector<SelectedPresetEntity>& m_selected;
+		mutable std::unordered_set<scene::Node*> m_seenNodes;
+	public:
+		SelectedPresetEntitiesVisitor( std::vector<SelectedPresetEntity>& selected ) : m_selected( selected ){
+		}
+
+		void visit( scene::Instance& instance ) const override {
+			const scene::Path& path = instance.path();
+			Entity* entity = Node_getEntity( path.top() );
+			scene::Node* node = &path.top().get();
+			if( entity == nullptr && path.size() > 1 ){
+				entity = Node_getEntity( path.parent() );
+				node = &path.parent().get();
+			}
+
+			if( entity == nullptr || node == nullptr || !m_seenNodes.insert( node ).second ){
+				return;
+			}
+
+			m_selected.push_back( { node, entity } );
+		}
+	};
+
+	std::vector<SelectedPresetEntity> selected;
+	if( GlobalSelectionSystem().countSelected() == 0 ){
+		return selected;
+	}
+
+	SelectedPresetEntitiesVisitor visitor( selected );
+	GlobalSelectionSystem().foreachSelected( visitor );
+	return selected;
+}
+
 QString default_name_for_entity( const Entity& entity ){
 	const char* scriptName = entity.getKeyValue( "script_name" );
 	if( string_not_empty( scriptName ) ){
@@ -496,23 +539,35 @@ Vector3 preset_preview_angles( const EntityPresetEntity& presetEntity ){
 	return angles;
 }
 
-EntityPreset preset_from_entity( const Entity& entity, const QString& name, const QString& category, const QString& description ){
-	EntityPreset preset;
-	preset.name = qstring_to_copied_string( name );
-	preset.category = qstring_to_copied_string( category );
-	preset.description = qstring_to_copied_string( description );
-	preset.entities.push_back( EntityPresetEntity() );
-	EntityPresetEntity& presetEntity = preset.entities.back();
-
+EntityPresetEntity preset_entity_from_entity( const Entity& entity, const bool includeOrigin, const Vector3& originOffset ){
+	EntityPresetEntity presetEntity;
 	class CollectKeyValues : public Entity::Visitor
 	{
 		std::vector<EntityPresetKeyValue>& m_keyValues;
+		bool m_includeOrigin;
+		Vector3 m_originOffset;
 	public:
-		CollectKeyValues( std::vector<EntityPresetKeyValue>& keyValues ) : m_keyValues( keyValues ){
+		CollectKeyValues( std::vector<EntityPresetKeyValue>& keyValues, const bool includeOrigin, const Vector3& originOffset )
+			: m_keyValues( keyValues ), m_includeOrigin( includeOrigin ), m_originOffset( originOffset ){
 		}
 
 		void visit( const char* key, const char* value ) override {
 			if( string_equal( key, "origin" ) ){
+				if( !m_includeOrigin ){
+					return;
+				}
+
+				Vector3 origin;
+				if( !string_parse_vector3( value, origin ) ){
+					return;
+				}
+
+				EntityPresetKeyValue keyValue;
+				keyValue.key = key;
+				const Vector3 relativeOrigin = origin - m_originOffset;
+				const auto originString = StringStream<96>( relativeOrigin[0], ' ', relativeOrigin[1], ' ', relativeOrigin[2] );
+				keyValue.value = originString.c_str();
+				m_keyValues.push_back( std::move( keyValue ) );
 				return;
 			}
 
@@ -521,11 +576,50 @@ EntityPreset preset_from_entity( const Entity& entity, const QString& name, cons
 			keyValue.value = value;
 			m_keyValues.push_back( std::move( keyValue ) );
 		}
-	} collector( presetEntity.keyValues );
+	} collector( presetEntity.keyValues, includeOrigin, originOffset );
 
 	entity.forEachKeyValue( collector );
 	presetEntity.name = qstring_to_copied_string( default_name_for_entity( entity ) );
 	preset_normalize_key_order( presetEntity );
+	return presetEntity;
+}
+
+EntityPreset preset_from_entity( const Entity& entity, const QString& name, const QString& category, const QString& description ){
+	EntityPreset preset;
+	preset.name = qstring_to_copied_string( name );
+	preset.category = qstring_to_copied_string( category );
+	preset.description = qstring_to_copied_string( description );
+	preset.entities.push_back( preset_entity_from_entity( entity, false, g_vector3_identity ) );
+	return preset;
+}
+
+EntityPreset preset_from_selection( const std::vector<SelectedPresetEntity>& selected, const QString& name, const QString& category, const QString& description ){
+	EntityPreset preset;
+	preset.name = qstring_to_copied_string( name );
+	preset.category = qstring_to_copied_string( category );
+	preset.description = qstring_to_copied_string( description );
+
+	if( selected.empty() ){
+		return preset;
+	}
+
+	if( selected.size() == 1 ){
+		preset.entities.push_back( preset_entity_from_entity( *selected.front().entity, false, g_vector3_identity ) );
+		return preset;
+	}
+
+	Vector3 anchorOrigin( 0, 0, 0 );
+	if( !string_parse_vector3( selected.front().entity->getKeyValue( "origin" ), anchorOrigin ) ){
+		anchorOrigin = g_vector3_identity;
+	}
+
+	for( const SelectedPresetEntity& selectedEntity : selected ){
+		if( selectedEntity.entity == nullptr ){
+			continue;
+		}
+		preset.entities.push_back( preset_entity_from_entity( *selectedEntity.entity, true, anchorOrigin ) );
+	}
+
 	return preset;
 }
 
@@ -2121,13 +2215,14 @@ public:
 	}
 
 	void addSelectedEntityPreset(){
-		Entity* entity = selected_entity();
-		if( entity == nullptr ){
+		const auto selected = selected_preset_entities();
+		if( selected.empty() ){
 			QMessageBox::information( m_parent, "Entity Presets",
-				"Select an entity first, then use Add Selected to capture it as a preset." );
+				"Select one or more entities first, then use Add Selected to capture them as a preset." );
 			return;
 		}
 
+		Entity* entity = selected.front().entity;
 		const QString defaultName = default_name_for_entity( *entity );
 		bool ok = false;
 		const QString name = QInputDialog::getText( m_parent, "New Entity Preset",
@@ -2152,7 +2247,10 @@ public:
 			}
 		}
 
-		EntityPreset preset = preset_from_entity( *entity, name, category, QString() );
+		EntityPreset preset = preset_from_selection( selected, name, category, QString() );
+		if( preset.entities.empty() ){
+			return;
+		}
 		if( replaceIndex >= 0 ){
 			if( QMessageBox::question( m_parent, "Overwrite Entity Preset",
 				QString( "Replace preset \"%1\" in \"%2\"?" ).arg( name, category ) ) != QMessageBox::StandardButton::Yes ){
@@ -2177,19 +2275,22 @@ public:
 			return;
 		}
 
-		Entity* entity = selected_entity();
-		if( entity == nullptr ){
+		const auto selected = selected_preset_entities();
+		if( selected.empty() ){
 			QMessageBox::information( m_parent, "Entity Presets",
-				"Select an entity first, then use Update to overwrite the current preset." );
+				"Select one or more entities first, then use Update to overwrite the current preset." );
 			return;
 		}
 
 		const int presetIndex = currentPresetIndex();
-		EntityPreset updated = preset_from_entity(
-			*entity,
+		EntityPreset updated = preset_from_selection(
+			selected,
 			QString::fromUtf8( preset->name.c_str() ),
 			QString::fromUtf8( preset->category.c_str() ),
 			QString::fromUtf8( preset->description.c_str() ) );
+		if( updated.entities.empty() ){
+			return;
+		}
 		*preset = std::move( updated );
 		if( savePresetsToDisk() ){
 			rebuildTree( presetIndex );
@@ -2239,34 +2340,46 @@ public:
 		rightLayout->setSpacing( 4 );
 
 		{
-			auto* toolbar = new QToolBar;
-			toolbar->setMovable( false );
-			leftLayout->addWidget( toolbar );
+			auto* controls = new QWidget;
+			auto* controlsLayout = new QVBoxLayout( controls );
+			controlsLayout->setContentsMargins( 0, 0, 0, 0 );
+			controlsLayout->setSpacing( 4 );
+			leftLayout->addWidget( controls );
+
+			auto* buttonRow = new QHBoxLayout;
+			buttonRow->setContentsMargins( 0, 0, 0, 0 );
+			buttonRow->setSpacing( 4 );
+			controlsLayout->addLayout( buttonRow );
+
+			auto* filterRow = new QHBoxLayout;
+			filterRow->setContentsMargins( 0, 0, 0, 0 );
+			filterRow->setSpacing( 0 );
+			controlsLayout->addLayout( filterRow );
+
+			auto* reloadButton = new QPushButton( "Refresh JSON" );
+			reloadButton->setFlat( true );
+			reloadButton->setToolTip( "Re-read entity_presets.json from disk" );
+			buttonRow->addWidget( reloadButton );
+
+			auto* addButton = new QPushButton( "Add Selected" );
+			addButton->setFlat( true );
+			buttonRow->addWidget( addButton );
+
+			m_updateButton = new QPushButton( "Update" );
+			m_updateButton->setFlat( true );
+			buttonRow->addWidget( m_updateButton );
+
+			m_deleteButton = new QPushButton( "Delete" );
+			m_deleteButton->setFlat( true );
+			buttonRow->addWidget( m_deleteButton );
+
+			buttonRow->addStretch( 1 );
 
 			m_filterEntry = new QLineEdit;
 			m_filterEntry->setPlaceholderText( "Filter presets..." );
 			m_filterEntry->setClearButtonEnabled( true );
 			m_filterEntry->setMinimumWidth( 160 );
-			toolbar->addWidget( m_filterEntry );
-
-			toolbar->addSeparator();
-
-			auto* reloadButton = new QPushButton( "Refresh JSON" );
-			reloadButton->setFlat( true );
-			reloadButton->setToolTip( "Re-read entity_presets.json from disk" );
-			toolbar->addWidget( reloadButton );
-
-			auto* addButton = new QPushButton( "Add Selected" );
-			addButton->setFlat( true );
-			toolbar->addWidget( addButton );
-
-			m_updateButton = new QPushButton( "Update" );
-			m_updateButton->setFlat( true );
-			toolbar->addWidget( m_updateButton );
-
-			m_deleteButton = new QPushButton( "Delete" );
-			m_deleteButton->setFlat( true );
-			toolbar->addWidget( m_deleteButton );
+			filterRow->addWidget( m_filterEntry );
 
 			QObject::connect( m_filterEntry, &QLineEdit::textChanged, [this]( const QString& ){
 				rebuildTree();
