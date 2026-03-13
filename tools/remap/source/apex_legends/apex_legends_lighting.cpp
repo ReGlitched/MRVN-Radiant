@@ -55,7 +55,7 @@
     If no env_cubemap entities exist, creates a single default at world center
 */
 void ApexLegends::EmitCubemaps() {
-    Sys_Printf("--- EmitCubemaps ---\n");
+    Sys_FPrintf(SYS_VRB, "--- EmitCubemaps ---\n");
     
     ApexLegends::Bsp::cubemaps.clear();
     ApexLegends::Bsp::cubemapsAmbientRcp.clear();
@@ -128,7 +128,7 @@ void ApexLegends::EmitCubemaps() {
     - One emit_skylight (directional sun lighting)
 */
 void ApexLegends::EmitWorldLights() {
-    Sys_Printf("--- EmitWorldLights ---\n");
+    Sys_FPrintf(SYS_VRB, "--- EmitWorldLights ---\n");
     ApexLegends::Bsp::worldLights.clear();
 
     // Separate lists for proper ordering
@@ -395,7 +395,7 @@ void ApexLegends::EmitWorldLights() {
     Must be called AFTER EmitMeshes() since we use the mesh data.
 */
 void ApexLegends::EmitShadowMeshes() {
-    Sys_Printf("--- EmitShadowMeshes ---\n");
+    Sys_FPrintf(SYS_VRB, "--- EmitShadowMeshes ---\n");
     
     // Clear any existing data
     ApexLegends::Bsp::shadowMeshOpaqueVerts.clear();
@@ -604,7 +604,7 @@ void ApexLegends::EmitShadowMeshes() {
     to find emit_skylight entries which contain the sun direction.
 */
 void ApexLegends::EmitShadowEnvironments() {
-    Sys_Printf("--- EmitShadowEnvironments ---\n");
+    Sys_FPrintf(SYS_VRB, "--- EmitShadowEnvironments ---\n");
     ApexLegends::Bsp::shadowEnvironments.clear();
 
     // Count light environments by finding emit_skyambient lights
