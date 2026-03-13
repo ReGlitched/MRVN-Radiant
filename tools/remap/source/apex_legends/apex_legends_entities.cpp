@@ -37,6 +37,56 @@
 #include <algorithm>
 
 /*
+    EntityGoesToBSPLump()
+    Returns true if the entity will be stored in the BSP entity lump (lump 0x00)
+    rather than an external .ent file (_env, _fx, _script, _snd, _spawn).
+    
+    Entities in .ent files need *coll serialization for collision data;
+    entities in the BSP lump get collision via BSP lumps directly.
+*/
+bool ApexLegends::EntityGoesToBSPLump(const entity_t &e) {
+    const char *cls = e.valueForKey("classname");
+    
+    // env
+    if (striEqualPrefix(cls, "light")
+     || striEqualPrefix(cls, "color")
+     || striEqualPrefix(cls, "fog")
+     || striEqualPrefix(cls, "env")
+     || striEqualPrefix(cls, "sky")) {
+        return false;
+    }
+    // fx
+    if (striEqualPrefix(cls, "info_particle")) {
+        return false;
+    }
+    // script
+    if (striEqualPrefix(cls, "info_target")
+     || striEqualPrefix(cls, "prop_dynamic")
+     || striEqualPrefix(cls, "trigger_hurt")
+     || striEqualPrefix(cls, "trigger_out_of_bounds")
+     || striEqualPrefix(cls, "trigger_no_zipline")
+     || striEqualPrefix(cls, "trigger_multiple")
+     || striEqualPrefix(cls, "trigger_slip")
+     || striEqualPrefix(cls, "zipline")
+     || striEqualPrefix(cls, "trigger_teleport")
+     || striEqualPrefix(cls, "script_mover")) {
+        return false;
+    }
+    // snd
+    if (striEqualPrefix(cls, "ambient_generic")
+     || striEqualPrefix(cls, "trigger_soundscape")
+     || striEqualPrefix(cls, "soundscape_")) {
+        return false;
+    }
+    // spawn
+    if (striEqualPrefix(cls, "info_")) {
+        return false;
+    }
+    // Everything else goes to BSP entity lump
+    return true;
+}
+
+/*
     EmitEntity()
     Saves an entity into its corresponding .ent file or the lump in the .bsp
     
@@ -72,6 +122,7 @@ void ApexLegends::EmitEntity(const entity_t &e) {
     } else if (striEqualPrefix(e.valueForKey("classname"), "info_target")
             || striEqualPrefix(e.valueForKey("classname"), "prop_dynamic")
             || striEqualPrefix(e.valueForKey("classname"), "trigger_hurt")
+            || striEqualPrefix(e.valueForKey("classname"), "trigger_out_of_bounds")
             || striEqualPrefix(e.valueForKey("classname"), "zipline") 
             || striEqualPrefix(e.valueForKey("classname"), "trigger_teleport")
             || striEqualPrefix(e.valueForKey("classname"), "script_mover")
