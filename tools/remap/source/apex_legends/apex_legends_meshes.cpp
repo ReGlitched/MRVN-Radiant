@@ -45,8 +45,6 @@
     - Mesh bounds
 */
 void ApexLegends::EmitMeshes(const entity_t &e) {
-    // Setup lightmaps first so we can get UV coordinates for lit vertices
-    ApexLegends::SetupSurfaceLightmaps();
 
     Sys_FPrintf(SYS_VRB, "--- Emitting Meshes ---\n");
 

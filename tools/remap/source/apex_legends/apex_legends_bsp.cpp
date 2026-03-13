@@ -266,6 +266,7 @@ void CompileR5BSPFile() {
                 Sys_Printf("\n--- Model %d: worldspawn ---\n", modelIndex);
                 ApexLegends::BeginModel(entity);
                 Shared::MakeMeshes(entity);
+                ApexLegends::SetupSurfaceLightmaps();
                 ApexLegends::EmitMeshes(entity);
                 ApexLegends::EmitBVHNode();
                 ApexLegends::EndModel();
@@ -285,6 +286,14 @@ void CompileR5BSPFile() {
                     ApexLegends::EndModel();
                     modelIndex++;
                     brushEntityCount++;
+
+                    /* Entities routed to .ent files need their collision BVH
+                    serialized as *coll key-value pairs, since the engine
+                    loads collision for these from the entity string rather
+                    than from BSP lumps. */
+                    if (!ApexLegends::EntityGoesToBSPLump(entity)) {
+                        ApexLegends::SerializeCollisionToEntity(entity);
+                    }
                 }
             }
 

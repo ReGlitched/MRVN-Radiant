@@ -1235,3 +1235,353 @@ void ApexLegends::AddCollisionStaticProp(uint32_t propIndex, const MinMax& world
     sp.bounds = worldBounds;
     g_collisionStaticProps.push_back(sp);
 }
+
+
+/*
+    SerializeCollisionToEntity()
+    Builds and serializes collision data directly from an entity's brush geometry
+    into base64-encoded *coll0, *coll1, ... key-value pairs.
+
+    Entities in .ent files (e.g. triggers in _script.ent) need their collision
+    data embedded as *coll key-value pairs.  The format is a self-contained
+    CollBvhSerializedHeader47_s blob with one BVH4 node whose children are
+    convex hull leaves built from the entity's brushes.
+
+    This is independent of the global BVH lump arrays – it reads directly from
+    entity.brushes side windings.
+*/
+void ApexLegends::SerializeCollisionToEntity(entity_t &entity) {
+    if (entity.brushes.empty()) {
+        return;
+    }
+
+    /* ---- determine contents mask and surface name from entity class ---- */
+    // 0x00EB1280 = trigger contents mask from official Apex maps
+    // Allows traces from players, NPCs, titans, bullets, physics, etc.
+    constexpr uint32_t TRIGGER_CONTENTS_MASK = 0x00EB1280;
+    uint32_t contentsMask = TRIGGER_CONTENTS_MASK;
+    std::string surfaceName = "TOOLS\\TOOLSTRIGGER";
+
+    /* ---- collect per-brush convex hull geometry ---- */
+    struct BrushHull {
+        std::vector<Vector3> vertices;
+        std::vector<std::array<int, 3>> faces;   // triangulated
+        MinMax bounds;
+    };
+
+    std::vector<BrushHull> hulls;
+
+    for (const brush_t &brush : entity.brushes) {
+        BrushHull hull;
+        std::map<std::tuple<float, float, float>, int> vertexMap;
+
+        for (const side_t &side : brush.sides) {
+            if (side.winding.size() < 3) continue;
+
+            /* collect unique vertices and fan-triangulate the winding */
+            std::vector<int> sideIndices;
+            for (const Vector3 &v : side.winding) {
+                auto key = std::make_tuple(v.x(), v.y(), v.z());
+                auto it = vertexMap.find(key);
+                if (it == vertexMap.end()) {
+                    int idx = static_cast<int>(hull.vertices.size());
+                    vertexMap[key] = idx;
+                    hull.vertices.push_back(v);
+                    hull.bounds.extend(v);
+                    sideIndices.push_back(idx);
+                } else {
+                    sideIndices.push_back(it->second);
+                }
+            }
+
+            for (size_t i = 1; i + 1 < sideIndices.size(); i++) {
+                hull.faces.push_back({ sideIndices[0],
+                                       sideIndices[i],
+                                       sideIndices[i + 1] });
+            }
+        }
+
+        if (!hull.vertices.empty() && !hull.faces.empty()) {
+            hulls.push_back(std::move(hull));
+        }
+    }
+
+    if (hulls.empty()) {
+        return;
+    }
+
+    /* BVH4 nodes support at most 4 children */
+    if (hulls.size() > 4) {
+        Sys_FPrintf(SYS_WRN,
+            "Warning: Entity %s has %zu brushes, only the first 4 will "
+            "have collision in *coll\n",
+            entity.classname(), hulls.size());
+        hulls.resize(4);
+    }
+
+    /* ---- compute overall bounds for the BVH node decode origin/scale ---- */
+    MinMax overallBounds;
+    for (const auto &h : hulls) {
+        overallBounds.extend(h.bounds);
+    }
+
+    Vector3 center  = (overallBounds.mins + overallBounds.maxs) * 0.5f;
+    Vector3 extents = (overallBounds.maxs - overallBounds.mins) * 0.5f;
+    float maxExtent = std::max({ extents.x(), extents.y(), extents.z(), 1.0f });
+
+    float bvhScale = (maxExtent <= 32000.0f)
+                   ? 1.0f / 65536.0f
+                   : maxExtent / (32000.0f * 65536.0f);
+
+    float invBvhScale = 1.0f / (bvhScale * 65536.0f);
+
+    /* ---- build convex-hull leaf data for every brush ---- */
+    // Leaf data is serialised as a byte stream; offsets in uint32 units are
+    // stored in the BVH node later.
+    std::vector<uint8_t> leafDataBytes;
+    std::vector<uint32_t> leafDataOffsets;   // byte offset per hull
+
+    auto pushU32 = [&leafDataBytes](uint32_t val) {
+        uint8_t b[4];
+        memcpy(b, &val, 4);
+        leafDataBytes.insert(leafDataBytes.end(), b, b + 4);
+    };
+    auto pushF32 = [&leafDataBytes](float val) {
+        uint8_t b[4];
+        memcpy(b, &val, 4);
+        leafDataBytes.insert(leafDataBytes.end(), b, b + 4);
+    };
+
+    for (const auto &hull : hulls) {
+        leafDataOffsets.push_back(static_cast<uint32_t>(leafDataBytes.size()));
+
+        int numVerts = std::min(static_cast<int>(hull.vertices.size()), 255);
+        int numFaces = std::min(static_cast<int>(hull.faces.size()), 255);
+        int numTriSets = 1;
+
+        /* header: numVerts | (numFaces << 8) | (numTriSets << 16) */
+        pushU32((numVerts & 0xFF)
+              | ((numFaces & 0xFF) << 8)
+              | ((numTriSets & 0xFF) << 16));
+
+        /* hull-local origin + scale for packed-vertex decoding */
+        Vector3 hCenter  = (hull.bounds.mins + hull.bounds.maxs) * 0.5f;
+        Vector3 hExtents = (hull.bounds.maxs - hull.bounds.mins) * 0.5f;
+        float hMaxExt = std::max({ hExtents.x(), hExtents.y(), hExtents.z(), 1.0f });
+        float hScale  = hMaxExt / 32767.0f;
+        if (hScale < 1e-6f) hScale = 1.0f;
+        float invHScale = 1.0f / (hScale * 65536.0f);
+
+        pushF32(hCenter.x());
+        pushF32(hCenter.y());
+        pushF32(hCenter.z());
+        pushF32(hScale);
+
+        /* pack vertices as int16 triplets, stored in uint32 pairs */
+        std::vector<int16_t> packed;
+        packed.reserve(numVerts * 3);
+        for (int i = 0; i < numVerts; i++) {
+            const Vector3 &v = hull.vertices[i];
+            packed.push_back(static_cast<int16_t>(
+                std::clamp((v.x() - hCenter.x()) * invHScale, -32768.0f, 32767.0f)));
+            packed.push_back(static_cast<int16_t>(
+                std::clamp((v.y() - hCenter.y()) * invHScale, -32768.0f, 32767.0f)));
+            packed.push_back(static_cast<int16_t>(
+                std::clamp((v.z() - hCenter.z()) * invHScale, -32768.0f, 32767.0f)));
+        }
+        for (size_t i = 0; i < packed.size(); i += 2) {
+            uint32_t word = static_cast<uint16_t>(packed[i]);
+            if (i + 1 < packed.size())
+                word |= static_cast<uint32_t>(static_cast<uint16_t>(packed[i + 1])) << 16;
+            pushU32(word);
+        }
+
+        /* face indices – 3 bytes per face, padded to uint32 */
+        std::vector<uint8_t> faceBytes;
+        faceBytes.reserve(numFaces * 3);
+        for (int i = 0; i < numFaces; i++) {
+            faceBytes.push_back(static_cast<uint8_t>(hull.faces[i][0]));
+            faceBytes.push_back(static_cast<uint8_t>(hull.faces[i][1]));
+            faceBytes.push_back(static_cast<uint8_t>(hull.faces[i][2]));
+        }
+        while (faceBytes.size() % 4 != 0) faceBytes.push_back(0);
+        for (size_t i = 0; i < faceBytes.size(); i += 4) {
+            pushU32(faceBytes[i]
+                  | (faceBytes[i + 1] << 8)
+                  | (faceBytes[i + 2] << 16)
+                  | (faceBytes[i + 3] << 24));
+        }
+
+        /* tri-set: required for ray-vs-hull traces that miss the GJK path */
+        int trisToEmit = std::min(numFaces, 16);
+        // header: surfPropIdx(12) | triCountMinusOne(4) | baseVertex(16)
+        pushU32(static_cast<uint32_t>((trisToEmit - 1) & 0xF) << 12);
+
+        uint32_t runBase = 0;
+        for (int i = 0; i < trisToEmit; i++) {
+            uint32_t v0 = hull.faces[i][0];
+            uint32_t v1 = hull.faces[i][1];
+            uint32_t v2 = hull.faces[i][2];
+
+            uint32_t v0ofs = v0 - runBase;
+            int32_t d1 = static_cast<int32_t>(v1) - static_cast<int32_t>(v0) - 1;
+            int32_t d2 = static_cast<int32_t>(v2) - static_cast<int32_t>(v0) - 1;
+            d1 = std::clamp(d1, -256, 255);
+            d2 = std::clamp(d2, -256, 255);
+
+            pushU32((v0ofs & 0x7FF)
+                  | ((static_cast<uint32_t>(d1) & 0x1FF) << 11)
+                  | ((static_cast<uint32_t>(d2) & 0x1FF) << 20));
+            runBase = v0;
+        }
+
+        /* trailing surface-property word (engine reads low 12 bits) */
+        pushU32(0);   // surfProp index 0 in our local array
+    }
+
+    /* pad leaf data to 4-byte alignment */
+    while (leafDataBytes.size() % 4 != 0) leafDataBytes.push_back(0);
+
+    /* ---- build the single BVH4 node ---- */
+    ApexLegends::BVHNode_t bvhNode;
+    memset(&bvhNode, 0, sizeof(bvhNode));
+
+    for (int c = 0; c < 4; c++) {
+        int16_t bMinX, bMaxX, bMinY, bMaxY, bMinZ, bMaxZ;
+        if (c < static_cast<int>(hulls.size())) {
+            const MinMax &hb = hulls[c].bounds;
+            auto clampI16 = [](double v) -> int16_t {
+                if (v < -32768.0) v = -32768.0;
+                if (v >  32767.0) v =  32767.0;
+                return static_cast<int16_t>(v);
+            };
+            bMinX = clampI16(std::floor((hb.mins.x() - center.x()) * invBvhScale));
+            bMaxX = clampI16(std::ceil ((hb.maxs.x() - center.x()) * invBvhScale));
+            bMinY = clampI16(std::floor((hb.mins.y() - center.y()) * invBvhScale));
+            bMaxY = clampI16(std::ceil ((hb.maxs.y() - center.y()) * invBvhScale));
+            bMinZ = clampI16(std::floor((hb.mins.z() - center.z()) * invBvhScale));
+            bMaxZ = clampI16(std::ceil ((hb.maxs.z() - center.z()) * invBvhScale));
+        } else {
+            /* unused child – inverted bounds so traversal never enters */
+            bMinX = bMinY = bMinZ = 32767;
+            bMaxX = bMaxY = bMaxZ = -32768;
+        }
+        bvhNode.bounds[c]      = bMinX;
+        bvhNode.bounds[4  + c] = bMaxX;
+        bvhNode.bounds[8  + c] = bMinY;
+        bvhNode.bounds[12 + c] = bMaxY;
+        bvhNode.bounds[16 + c] = bMinZ;
+        bvhNode.bounds[20 + c] = bMaxZ;
+    }
+
+    /* set child types and leaf-data indices (uint32 offset from leaf start) */
+    for (int c = 0; c < 4; c++) {
+        int childType, childIdx;
+        if (c < static_cast<int>(hulls.size())) {
+            childType = BVH_CHILD_CONVEXHULL;
+            childIdx  = static_cast<int>(leafDataOffsets[c] / 4);
+        } else {
+            childType = BVH_CHILD_NONE;
+            childIdx  = 0;
+        }
+        switch (c) {
+            case 0: bvhNode.childType0 = childType; bvhNode.index0 = childIdx; break;
+            case 1: bvhNode.childType1 = childType; bvhNode.index1 = childIdx; break;
+            case 2: bvhNode.childType2 = childType; bvhNode.index2 = childIdx; break;
+            case 3: bvhNode.childType3 = childType; bvhNode.index3 = childIdx; break;
+        }
+    }
+
+    bvhNode.cmIndex = 0;   // contents-mask index 0 in our local array
+
+    /* ---- build the surface-property entry ---- */
+    ApexLegends::CollSurfProps_t surfProp{};
+    surfProp.surfFlags   = 0;
+    surfProp.surfTypeID  = 0;
+    surfProp.contentsIdx = 0;   // index 0 in contents-mask array
+    surfProp.nameOffset  = 0;   // offset 0 in surface-name buffer
+
+    /* surface-name buffer (null-terminated, 4-byte padded) */
+    std::vector<uint8_t> surfNameBuf(surfaceName.begin(), surfaceName.end());
+    surfNameBuf.push_back(0);
+    while (surfNameBuf.size() % 4 != 0) surfNameBuf.push_back(0);
+
+    /* ---- calculate blob layout ---- */
+    const uint32_t headerSize = 0x30;            // 0x10 + 1 part * 0x20
+
+    uint32_t leafDataOfs  = headerSize;
+    uint32_t leafDataSize = static_cast<uint32_t>(leafDataBytes.size());
+
+    uint32_t nodesOfs = (leafDataOfs + leafDataSize + 63) & ~63u;   // 64-byte align
+    uint32_t nodesSize = sizeof(ApexLegends::BVHNode_t);            // 64 bytes
+
+    uint32_t contentsMaskOfs  = nodesOfs + nodesSize;
+    uint32_t surfPropsOfs     = contentsMaskOfs + sizeof(uint32_t);
+    uint32_t surfNameBufOfs   = surfPropsOfs + sizeof(ApexLegends::CollSurfProps_t);
+    uint32_t surfNameBufSize  = static_cast<uint32_t>(surfNameBuf.size());
+
+    uint32_t totalBlobSize = (surfNameBufOfs + surfNameBufSize + 3) & ~3u;
+
+    /* ---- assemble the blob ---- */
+    std::vector<uint8_t> blob(totalBlobSize, 0);
+
+    auto wr32 = [&blob](uint32_t ofs, uint32_t v) { memcpy(blob.data()+ofs, &v, 4); };
+    auto wrf  = [&blob](uint32_t ofs, float   v) { memcpy(blob.data()+ofs, &v, 4); };
+
+    /* header */
+    wr32(0x00, contentsMaskOfs);
+    wr32(0x04, surfPropsOfs);
+    wr32(0x08, surfNameBufOfs);
+    wr32(0x0C, 1);                        // numParts
+
+    /* part 0 */
+    wr32(0x10, 0);                         // bvhFlags
+    wr32(0x14, nodesOfs);
+    wr32(0x18, leafDataOfs);               // vertsOfs  (hull verts live in leaf data)
+    wr32(0x1C, leafDataOfs);               // leafDataOfs
+    wrf (0x20, center.x());
+    wrf (0x24, center.y());
+    wrf (0x28, center.z());
+    wrf (0x2C, bvhScale);
+
+    /* payload sections */
+    memcpy(blob.data() + leafDataOfs,     leafDataBytes.data(), leafDataSize);
+    memcpy(blob.data() + nodesOfs,        &bvhNode, sizeof(bvhNode));
+    wr32(contentsMaskOfs, contentsMask);
+    memcpy(blob.data() + surfPropsOfs,    &surfProp, sizeof(surfProp));
+    memcpy(blob.data() + surfNameBufOfs,  surfNameBuf.data(), surfNameBufSize);
+
+    /* ---- base64 encode ---- */
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string base64;
+    base64.reserve((totalBlobSize + 2) / 3 * 4);
+
+    for (uint32_t i = 0; i < totalBlobSize; i += 3) {
+        uint32_t n = static_cast<uint32_t>(blob[i]) << 16;
+        if (i + 1 < totalBlobSize) n |= static_cast<uint32_t>(blob[i + 1]) << 8;
+        if (i + 2 < totalBlobSize) n |= static_cast<uint32_t>(blob[i + 2]);
+
+        base64 += b64[(n >> 18) & 0x3F];
+        base64 += b64[(n >> 12) & 0x3F];
+        base64 += (i + 1 < totalBlobSize) ? b64[(n >>  6) & 0x3F] : '=';
+        base64 += (i + 2 < totalBlobSize) ? b64[(n      ) & 0x3F] : '=';
+    }
+
+    /* ---- split into *coll key-value pairs ---- */
+    // Each line must be a multiple of 4 chars for valid standalone base64.
+    constexpr size_t COLL_LINE_LEN = 196;
+
+    int lineNum = 0;
+    for (size_t pos = 0; pos < base64.size(); pos += COLL_LINE_LEN) {
+        size_t len = std::min(COLL_LINE_LEN, base64.size() - pos);
+        char keyBuf[16];
+        snprintf(keyBuf, sizeof(keyBuf), "*coll%d", lineNum);
+        entity.setKeyValue(keyBuf, base64.substr(pos, len).c_str());
+        lineNum++;
+    }
+
+    Sys_FPrintf(SYS_VRB,
+        "  Serialized %u bytes collision (%zu hulls) into %d *coll keys for %s\n",
+        totalBlobSize, hulls.size(), lineNum, entity.classname());
+}

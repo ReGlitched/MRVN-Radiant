@@ -252,12 +252,14 @@ namespace ApexLegends {
     void        SetupGameLump();
     void        EmitStaticProp(entity_t &e);
     void        EmitEntity(const entity_t &e);
+    bool        EntityGoesToBSPLump(const entity_t &e);
     void        BeginModel(entity_t &entity);
     void        EndModel();
     void        EmitBVHNode();
     int         EmitBVHDataleaf();
     int         EmitContentsMask( int mask );
     void        AddCollisionStaticProp( uint32_t propIndex, const MinMax& worldBounds );
+    void        SerializeCollisionToEntity( entity_t &entity );
     void        EmitMeshes(const entity_t &e);
     uint32_t    EmitTextureData(shaderInfo_t shader);
     uint16_t    EmitMaterialSort(uint32_t index, int offset, int count, int16_t lightmapIdx);
