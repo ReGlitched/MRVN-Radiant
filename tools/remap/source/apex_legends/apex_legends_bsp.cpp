@@ -30,8 +30,9 @@
 
 #include "../remap.h"
 #include "../bspfile_abstract.h"
-#include "../embree_trace.h"
+#include "../hiprt_trace.h"
 #include <ctime>
+#include <chrono>
 #include <cstdio>
 #include <unordered_map>
 #include <cfloat>
@@ -233,61 +234,69 @@ void WriteR5BSPFile(const char *filename) {
     It orchestrates all lump generation in the correct order.
 */
 void CompileR5BSPFile() {
+    auto compileStart = std::chrono::steady_clock::now();
     ApexLegends::SetupGameLump();
 
-    /* First pass: emit static props so they're available for the collision BVH */
-    for (entity_t &entity : entities) {
-        if (striEqual(entity.classname(), "prop_static")) {
-            ApexLegends::EmitStaticProp(entity);
-        }
-    }
-    
-    /* Second pass: worldspawn, other entities */
-    for (entity_t &entity : entities) {
-        const char *pszClassname = entity.classname();
-
-        #define ENT_IS(classname) striEqual(pszClassname, classname)
-
-        /* Visible geo */
-        if (ENT_IS("worldspawn")) {
-            ApexLegends::BeginModel(entity);
-
-            /* Generate bsp meshes from map brushes */
-            Shared::MakeMeshes(entity);
-            ApexLegends::EmitMeshes(entity);
-
-            ApexLegends::EmitBVHNode();
-
-            ApexLegends::EndModel();
-        } else if (ENT_IS("prop_static")) {
-            continue; // Already processed in first pass
-        } else if (ENT_IS("func_occluder")) {
-            Titanfall::EmitOcclusionMeshes(entity);
-            continue; // Don't emit as entity
-        } else {
-            /* Brush entities (func_brush, etc.) - compile their geometry into a submodel */
-            if (!entity.brushes.empty()) {
-                ApexLegends::BeginModel(entity);
-
-                Shared::MakeMeshes(entity);
-                ApexLegends::EmitMeshes(entity);
-
-                ApexLegends::EmitBVHNode();
-
-                ApexLegends::EndModel();
+    /* ================================================================ */
+    Sys_Printf("\n============ Phase 1: Static Props ============\n");
+    /* ================================================================ */
+    {
+        int propCount = 0;
+        for (entity_t &entity : entities) {
+            if (striEqual(entity.classname(), "prop_static")) {
+                ApexLegends::EmitStaticProp(entity);
+                propCount++;
             }
         }
-
-        ApexLegends::EmitEntity(entity);
-
-        #undef ENT_IS
+        Sys_Printf("     %9d static props\n", propCount);
     }
 
-    /* Fix up model.vertexIndex for all models.
-       EmitBVHNode() stored only the collision vertex base; now that all
-       entities have been processed we know the final render vertex count
-       and can compute the correct offset into the combined vertex buffer
-       (render verts followed by collision verts in lump 3). */
+    /* ================================================================ */
+    Sys_Printf("\n============ Phase 2: Models & Geometry ============\n");
+    /* ================================================================ */
+    {
+        int modelIndex = 0;
+        int brushEntityCount = 0;
+        for (entity_t &entity : entities) {
+            const char *pszClassname = entity.classname();
+
+            #define ENT_IS(classname) striEqual(pszClassname, classname)
+
+            if (ENT_IS("worldspawn")) {
+                Sys_Printf("\n--- Model %d: worldspawn ---\n", modelIndex);
+                ApexLegends::BeginModel(entity);
+                Shared::MakeMeshes(entity);
+                ApexLegends::EmitMeshes(entity);
+                ApexLegends::EmitBVHNode();
+                ApexLegends::EndModel();
+                modelIndex++;
+            } else if (ENT_IS("prop_static")) {
+                continue; // Already processed in Phase 1
+            } else if (ENT_IS("func_occluder")) {
+                Titanfall::EmitOcclusionMeshes(entity);
+                continue; // Don't emit as entity
+            } else {
+                if (!entity.brushes.empty()) {
+                    Sys_FPrintf(SYS_VRB, "--- Model %d: %s ---\n", modelIndex, pszClassname);
+                    ApexLegends::BeginModel(entity);
+                    Shared::MakeMeshes(entity);
+                    ApexLegends::EmitMeshes(entity);
+                    ApexLegends::EmitBVHNode();
+                    ApexLegends::EndModel();
+                    modelIndex++;
+                    brushEntityCount++;
+                }
+            }
+
+            ApexLegends::EmitEntity(entity);
+
+            #undef ENT_IS
+        }
+        Sys_Printf("     %9d models (%d worldspawn + %d brush entities)\n",
+                    modelIndex, 1, brushEntityCount);
+    }
+
+    /* Fix up model.vertexIndex for all models */
     {
         uint32_t totalRenderVerts = static_cast<uint32_t>(Titanfall::Bsp::vertices.size());
         for (ApexLegends::Model_t &model : ApexLegends::Bsp::models) {
@@ -295,37 +304,53 @@ void CompileR5BSPFile() {
         }
     }
 
-    /* Regenerate worldspawn meshes for vis/lighting passes
-       (Shared::MakeMeshes clears Shared::meshes each call, so the last
-        brush entity's meshes would be left over instead of worldspawn's) */
+    /* Regenerate worldspawn meshes for vis/lighting passes */
     Shared::MakeMeshes(entities[0]);
 
-    Shared::MakeVisReferences();
-    Shared::visRoot = Shared::MakeVisTree(Shared::visRefs, 1e30f);
-    Shared::MergeVisTree(Shared::visRoot);
-    ApexLegends::EmitVisTree();
+    /* ================================================================ */
+    Sys_Printf("\n============ Phase 3: Vis Tree ============\n");
+    /* ================================================================ */
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        Shared::MakeVisReferences();
+        Shared::visRoot = Shared::MakeVisTree(Shared::visRefs, 1e30f);
+        Shared::MergeVisTree(Shared::visRoot);
+        ApexLegends::EmitVisTree();
+        auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        Sys_Printf("     Vis tree built (%.2fs)\n", dt);
+    }
 
+    /* ================================================================ */
+    Sys_Printf("\n============ Phase 4: Entities & Lighting Setup ============\n");
+    /* ================================================================ */
     Titanfall::EmitEntityPartitions();
-
     ApexLegends::EmitLevelInfo();
     ApexLegends::EmitWorldLights();
-    ApexLegends::EmitCubemaps();           // Cubemap sample positions
+    ApexLegends::EmitCubemaps();
     ApexLegends::EmitShadowMeshes();
     ApexLegends::EmitShadowEnvironments();
-    
-    // Initialize Embree for accelerated ray tracing (used by lightmaps and light probes)
-    if (EmbreeTrace::Init()) {
-        EmbreeTrace::BuildScene(true);  // Build BVH, skip sky meshes for shadow rays
-    }
-    
-    ApexLegends::EmitLightmaps();
-    ApexLegends::EmitLightProbes();        // Light probes for ambient lighting
-    
-    // Clean up Embree resources
-    EmbreeTrace::Shutdown();
 
-    //TODO: Implement real-time lightmaps
-    //ApexLegends::EmitRealTimeLightmaps();  // Per-texel RTL data
+    /* ================================================================ */
+    Sys_Printf("\n============ Phase 5: GPU Ray Tracing Init ============\n");
+    /* ================================================================ */
+    if (HIPRTTrace::Init()) {
+        HIPRTTrace::BuildScene(true);
+    }
+
+    /* ================================================================ */
+    Sys_Printf("\n============ Phase 6: Lightmaps ============\n");
+    /* ================================================================ */
+    ApexLegends::EmitLightmaps();
+
+    /* ================================================================ */
+    Sys_Printf("\n============ Phase 7: Light Probes ============\n");
+    /* ================================================================ */
+    ApexLegends::EmitLightProbes();
+
+    HIPRTTrace::Shutdown();
 
     Titanfall::EmitStubs();
+
+    auto totalTime = std::chrono::duration<double>(std::chrono::steady_clock::now() - compileStart).count();
+    Sys_Printf("\n============ Compile Complete (%.2fs) ============\n\n", totalTime);
 }
