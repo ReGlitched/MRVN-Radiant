@@ -23,6 +23,9 @@
 
 #include <set>
 #include <deque>
+#include <QApplication>
+#include <QDrag>
+#include <QMimeData>
 #include "ifiletypes.h"
 #include "ifilesystem.h"
 #include "iarchive.h"
@@ -60,10 +63,16 @@
 
 #include "mainframe.h"
 #include "camwindow.h"
+#include "entity.h"
 #include "grid.h"
 #include "instancelib.h"
 #include "traverselib.h"
 #include "selectionlib.h"
+
+namespace
+{
+constexpr const char* c_ModelMimeType = "application/x-radiant-model-browser";
+}
 
 
 /* specialized copy of class CompiledGraph */
@@ -566,6 +575,59 @@ public:
 		if( m_currentModelId >= static_cast<int>( m_modelInstances.size() ) )
 			m_currentModelId = -1;
 	}
+	bool hasCurrentModel() const {
+		return m_currentFolder != nullptr
+			&& m_currentModelId >= 0
+			&& m_currentModelId < static_cast<int>( m_modelInstances.size() )
+			&& m_currentModelId < static_cast<int>( m_currentFolder->m_files.size() );
+	}
+	CopiedString currentModelPath() const {
+		if( !hasCurrentModel() ){
+			return "";
+		}
+		return StringStream<128>( m_currentFolderPath, std::next( m_currentFolder->m_files.begin(), m_currentModelId )->c_str() );
+	}
+	bool createModelAtOrigin( const char* modelPath, const Vector3& origin ) const {
+		if( string_empty( modelPath ) ){
+			return false;
+		}
+
+		EntityClass* entityClass = GlobalEntityClassManager().findOrInsert( "prop_static", false );
+		if( entityClass == nullptr ){
+			return false;
+		}
+
+		UndoableCommand undo( "insertModel" );
+		NodeSmartReference node( GlobalEntityCreator().createEntity( entityClass ) );
+		Node_getTraversable( GlobalSceneGraph().root() )->insert( node );
+
+		scene::Path entitypath( makeReference( GlobalSceneGraph().root() ) );
+		entitypath.push( makeReference( node.get() ) );
+		scene::Instance& instance = findInstance( entitypath );
+
+		if ( Transformable* transform = Instance_getTransformable( instance ) ) {
+			transform->setType( TRANSFORM_PRIMITIVE );
+			transform->setTranslation( origin );
+			transform->freezeTransform();
+		}
+
+		GlobalSelectionSystem().setSelectedAll( false );
+		Instance_setSelected( instance, true );
+		Node_getEntity( node )->setKeyValue( entityClass->miscmodel_key(), modelPath );
+		return true;
+	}
+	bool createCurrentModelAtOrigin( const Vector3& origin ) const {
+		const CopiedString modelPath = currentModelPath();
+		return createModelAtOrigin( modelPath.c_str(), origin );
+	}
+	bool modelPathFromMimeData( const QMimeData* mimeData, CopiedString& modelPath ) const {
+		if( mimeData == nullptr || !mimeData->hasFormat( c_ModelMimeType ) ){
+			return false;
+		}
+
+		modelPath = mimeData->data( c_ModelMimeType ).constData();
+		return string_not_empty( modelPath.c_str() );
+	}
 private:
 	int totalHeight() const {
 		return constructCellPos().totalHeight( m_height, m_modelInstances.size() );
@@ -601,11 +663,7 @@ public:
 private:
 	void trackingDelta( int x, int y, const QMouseEvent *event ){
 		m_move_amount += std::abs( x ) + std::abs( y );
-		if ( event->buttons() & Qt::MouseButton::RightButton && y != 0 ) { // scroll view
-			const int scale = event->modifiers().testFlag( Qt::KeyboardModifier::ShiftModifier )? 4 : 1;
-			setOriginZ( m_originZ + y * scale );
-		}
-		else if ( event->buttons() & Qt::MouseButton::LeftButton && ( x != 0 || y != 0 ) && m_currentModelId >= 0 ) { // rotate selected model
+		if ( event->buttons() & Qt::MouseButton::RightButton && ( x != 0 || y != 0 ) && m_currentModelId >= 0 ) { // rotate selected model
 			ASSERT_MESSAGE( m_currentModelId < static_cast<int>( m_modelInstances.size() ), "modelBrowser.m_currentModelId out of range" );
 			scene::Instance *instance = m_modelInstances[m_currentModelId];
 			if( TransformNode *transformNode = Node_getTransformNode( instance->path().parent() ) ){
@@ -621,7 +679,7 @@ private:
 	FreezePointer m_freezePointer;
 	bool m_move_started = false;
 public:
-	int m_move_amount;
+	int m_move_amount = 0;
 	void tracking_MouseUp(){
 		if( m_move_started ){
 			m_move_started = false;
@@ -954,6 +1012,8 @@ class ModelBrowserGLWidget : public QOpenGLWidget
 	FBO *m_fbo{};
 	qreal m_scale;
 	MousePresses m_mouse;
+	QPoint m_dragStartPos;
+	bool m_leftPressActive = false;
 public:
 	ModelBrowserGLWidget( ModelBrowser& modelBrowser ) : QOpenGLWidget(), m_modBro( modelBrowser )
 	{
@@ -996,66 +1056,51 @@ protected:
 		if( press == MousePresses::Left2x ){
 			mouseDoubleClick();
 		}
-		else if ( press == MousePresses::Left || press == MousePresses::Right ) {
-			m_modBro.tracking_MouseDown();
-			if ( press == MousePresses::Left ) {
-				m_modBro.testSelect( event->x() * m_scale, event->y() * m_scale );
-			}
+		else if ( press == MousePresses::Left ) {
+			m_leftPressActive = true;
+			m_dragStartPos = event->pos();
+			m_modBro.testSelect( event->x() * m_scale, event->y() * m_scale );
 		}
+		else if ( press == MousePresses::Right ) {
+			m_modBro.tracking_MouseDown();
+		}
+	}
+	void mouseMoveEvent( QMouseEvent *event ) override {
+		if( m_leftPressActive
+		 && ( event->buttons() & Qt::MouseButton::LeftButton )
+		 && m_modBro.hasCurrentModel()
+		 && ( event->pos() - m_dragStartPos ).manhattanLength() >= QApplication::startDragDistance() ){
+			m_leftPressActive = false;
+
+			auto* mimeData = new QMimeData;
+			const CopiedString modelPath = m_modBro.currentModelPath();
+			mimeData->setData( c_ModelMimeType, QByteArray( modelPath.c_str() ) );
+
+			QDrag* drag = new QDrag( this );
+			drag->setMimeData( mimeData );
+			drag->setHotSpot( QPoint( 12, 12 ) );
+			drag->exec( Qt::DropAction::CopyAction );
+			return;
+		}
+
+		QOpenGLWidget::mouseMoveEvent( event );
 	}
 	void mouseDoubleClick(){
 		/* create misc_model */
-		if ( m_modBro.m_currentFolder != nullptr && m_modBro.m_currentModelId >= 0 ) {
-			UndoableCommand undo( "insertModel" );
-			// todo
-			// GlobalEntityClassManager() search for "prop_static"
-			// otherwise search for entityClass->miscmodel_is
-			// otherwise go with GlobalEntityClassManager().findOrInsert( "prop_static", false );
-			EntityClass* entityClass = GlobalEntityClassManager().findOrInsert( "prop_static", false );
-			NodeSmartReference node( GlobalEntityCreator().createEntity( entityClass ) );
-
-			Node_getTraversable( GlobalSceneGraph().root() )->insert( node );
-
-			scene::Path entitypath( makeReference( GlobalSceneGraph().root() ) );
-			entitypath.push( makeReference( node.get() ) );
-			scene::Instance& instance = findInstance( entitypath );
-
-			if ( Transformable* transform = Instance_getTransformable( instance ) ) { // might be cool to consider model aabb here
-				transform->setType( TRANSFORM_PRIMITIVE );
-				transform->setTranslation( vector3_snapped( Camera_getOrigin( *g_pParentWnd->GetCamWnd() ) - Camera_getViewVector( *g_pParentWnd->GetCamWnd() ) * 128.f, GetSnapGridSize() ) );
-				transform->freezeTransform();
-			}
-
-			GlobalSelectionSystem().setSelectedAll( false );
-			Instance_setSelected( instance, true );
-
-			const auto sstream = StringStream<128>( m_modBro.m_currentFolderPath, std::next( m_modBro.m_currentFolder->m_files.begin(), m_modBro.m_currentModelId )->c_str() );
-			Node_getEntity( node )->setKeyValue( entityClass->miscmodel_key(), sstream );
+		if ( m_modBro.hasCurrentModel() ) {
+			m_modBro.createCurrentModelAtOrigin(
+				vector3_snapped( Camera_getOrigin( *g_pParentWnd->GetCamWnd() ) - Camera_getViewVector( *g_pParentWnd->GetCamWnd() ) * 128.f, GetSnapGridSize() ) );
 		}
 	}
 	void mouseReleaseEvent( QMouseEvent *event ) override {
 		const auto release = m_mouse.release( event );
+		if ( release == MousePresses::Left ) {
+			m_leftPressActive = false;
+		}
 		if ( release == MousePresses::Left || release == MousePresses::Right ) {
 			m_modBro.tracking_MouseUp();
 		}
-		if ( release == MousePresses::Left && m_modBro.m_move_amount < 16 && m_modBro.m_currentFolder != nullptr && m_modBro.m_currentModelId >= 0 ) { // assign model to selected entity nodes
-			const auto sstream = StringStream<128>( m_modBro.m_currentFolderPath, std::next( m_modBro.m_currentFolder->m_files.begin(), m_modBro.m_currentModelId )->c_str() );
-			class EntityVisitor : public SelectionSystem::Visitor
-			{
-				const char* m_filePath;
-			public:
-				EntityVisitor( const char* filePath ) : m_filePath( filePath ){
-				}
-				void visit( scene::Instance& instance ) const override {
-					if( Entity* entity = Node_getEntity( instance.path().top() ) ){
-						entity->setKeyValue( entity->getEntityClass().miscmodel_key(), m_filePath );
-					}
-				}
-			} visitor( sstream );
-			UndoableCommand undo( "entityAssignModel" );
-			GlobalSelectionSystem().foreachSelected( visitor );
-		}
-		else if( release == MousePresses::Right && m_modBro.m_move_amount < 16 && m_modBro.m_currentFolder != nullptr ){
+		if( release == MousePresses::Right && m_modBro.m_move_amount < 16 && m_modBro.m_currentFolder != nullptr ){
 			m_modBro.forEachModelInstance( models_set_transforms() );
 			m_modBro.queueDraw();
 		}
@@ -1384,4 +1429,17 @@ void ModelBrowser_Destroy(){
 void ModelBrowser_flushReferences(){
 	ModelGraph_clear();
 	g_ModelBrowser.queueDraw();
+}
+
+bool ModelBrowser_hasMimeData( const QMimeData* mimeData ){
+	CopiedString modelPath;
+	return g_ModelBrowser.modelPathFromMimeData( mimeData, modelPath );
+}
+
+bool ModelBrowser_dropMimeData( const QMimeData* mimeData, const Vector3& origin ){
+	CopiedString modelPath;
+	if( !g_ModelBrowser.modelPathFromMimeData( mimeData, modelPath ) ){
+		return false;
+	}
+	return g_ModelBrowser.createModelAtOrigin( modelPath.c_str(), origin );
 }

@@ -1568,8 +1568,13 @@ void Renderables_flush( OpenGLStateBucket::Renderables& renderables, OpenGLState
 		if ( !transform || ( transform != ( *i ).m_transform && !matrix4_affine_equal( *transform, *( *i ).m_transform ) ) ) {
 			count_transform();
 			transform = ( *i ).m_transform;
-			const Matrix4 combined = matrix4_multiplied_by_matrix4( viewMatrix, *transform );
-			gl().glLoadMatrixf( reinterpret_cast<const float*>( &combined ) );
+			if ( ( current.m_state & RENDER_TEXT ) != 0 ) {
+				gl().glLoadMatrixf( reinterpret_cast<const float*>( transform ) );
+			}
+			else{
+				const Matrix4 combined = matrix4_multiplied_by_matrix4( viewMatrix, *transform );
+				gl().glLoadMatrixf( reinterpret_cast<const float*>( &combined ) );
+			}
 			gl().glFrontFace( ( ( current.m_state & RENDER_CULLFACE ) != 0 && matrix4_handedness( *transform ) == MATRIX4_RIGHTHANDED ) ? GL_CW : GL_CCW );
 		}
 

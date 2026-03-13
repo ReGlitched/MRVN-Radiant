@@ -29,6 +29,7 @@
 
 #include "debugging/debugging.h"
 
+#include "ientity.h"
 #include "iscenegraph.h"
 #include "irender.h"
 #include "igl.h"
@@ -58,6 +59,9 @@
 #include "mainframe.h"
 #include "preferences.h"
 #include "commands.h"
+#include "entitypresetbrowser.h"
+#include "modelwindow.h"
+#include "select.h"
 #include "xywindow.h"
 #include "windowobservers.h"
 #include "renderstate.h"
@@ -70,8 +74,12 @@
 #include <QOpenGLWidget>
 
 #include <QApplication>
+#include <QDragEnterEvent>
+#include <QDragLeaveEvent>
+#include <QDropEvent>
 #include <QElapsedTimer>
 #include <QTimer>
+#include <algorithm>
 #include <set>
 
 // https://stackoverflow.com/questions/42566421/how-to-queue-lambda-function-into-qts-event-loop/42566867#42566867
@@ -791,15 +799,18 @@ static void Camera_motionDelta( int x, int y, const QMouseEvent *event, camera_t
 class CamDrawSize
 {
 	Vector3 _extents;
+	bool m_visible[3]{ false, false, false };
 	RenderTextLabel m_labels[3];
 public:
 	CamDrawSize() : _extents( -99.9f, -99.9f, -99.9f ){
 	}
-	void render( Renderer& renderer, Shader* shader, const View& view ){
+	void update( const View& view ){
+		for( std::size_t i = 0; i < 3; ++i ){
+			m_visible[i] = false;
+		}
+
 		const AABB bounds = GlobalSelectionSystem().getBoundsSelected();
 		if( bounds.extents.x() != 0 || bounds.extents.y() != 0 || bounds.extents.z() != 0 ){
-			renderer.SetState( shader, Renderer::eFullMaterials );
-
 			Vector4 points[3] = { Vector4( bounds.origin - g_vector3_axes[1] * bounds.extents - g_vector3_axes[2] * bounds.extents, 1 ),
 			                      Vector4( bounds.origin - g_vector3_axes[0] * bounds.extents - g_vector3_axes[2] * bounds.extents, 1 ),
 			                      Vector4( bounds.origin - g_vector3_axes[0] * bounds.extents - g_vector3_axes[1] * bounds.extents, 1 ),
@@ -814,12 +825,32 @@ public:
 
 			for( std::size_t i = 0; i < 3; ++i ){
 				if( points[i].w() > 0.005f ){
-					updateTex( i, bounds.extents[i] );
+					updateText( i, bounds.extents[i] );
+					m_visible[i] = true;
 					m_labels[i].screenPos = points[i].vec3().vec2();
-					renderer.addRenderable( m_labels[i], g_matrix4_identity );
 				}
 			}
 		}
+	}
+	void render( Renderer& renderer, Shader* textShader ) const {
+		if( textShader == nullptr ){
+			return;
+		}
+
+		renderer.PushState();
+		renderer.Highlight( Renderer::ePrimitive, false );
+		renderer.Highlight( Renderer::eFace, false );
+		renderer.SetState( textShader, Renderer::eWireframeOnly );
+		renderer.SetState( textShader, Renderer::eFullMaterials );
+
+		for( std::size_t i = 0; i < 3; ++i ){
+			if( !m_visible[i] || m_labels[i].tex == 0 ){
+				continue;
+			}
+			renderer.addRenderable( m_labels[i], g_matrix4_identity );
+		}
+
+		renderer.PopState();
 	}
 private:
 	const Vector3 getColor( const std::size_t i ) const {
@@ -833,7 +864,7 @@ private:
 			return Vector3( g_xywindow_globals.AxisColorZ.x(), 0.7f, g_xywindow_globals.AxisColorZ.z() ); //hack to make default blue visible better
 		}
 	}
-	void updateTex( const std::size_t i, const float extent ){
+	void updateText( const std::size_t i, const float extent ){
 		if( extent != _extents[i] ){
 			_extents[i] = extent;
 			m_labels[i].texFree();
@@ -1665,9 +1696,16 @@ class CamGLWidget : public QOpenGLWidget
 	CamWnd& m_camwnd;
 	FBO *m_fbo{};
 	qreal m_scale;
+	bool m_hasPresetDropIntersection = false;
+	Vector3 m_presetDropIntersection{ 0, 0, 0 };
+	bool m_presetPreviewActive = false;
+	Vector3 m_presetPreviewOrigin{ 0, 0, 0 };
+	std::vector<scene::Instance*> m_presetPreviewInstances;
+	std::vector<Entity*> m_presetPreviewEntities;
 public:
 	CamGLWidget( CamWnd& camwnd ) : QOpenGLWidget(), m_camwnd( camwnd ) {
 		setMouseTracking( true );
+		setAcceptDrops( true );
 	}
 
 	~CamGLWidget() override {
@@ -1775,12 +1813,196 @@ protected:
 		}
 		wheelmove_scroll( scaledEvent( event ), m_camwnd );
 	}
+	void dragEnterEvent( QDragEnterEvent* event ) override {
+		if( hasSpawnPreviewMimeData( event->mimeData() ) ){
+			if( beginOrMoveSpawnPreview( event->mimeData(), event->pos() ) ){
+				event->acceptProposedAction();
+				return;
+			}
+			event->ignore();
+			return;
+		}
+		QOpenGLWidget::dragEnterEvent( event );
+	}
+	void dragMoveEvent( QDragMoveEvent* event ) override {
+		if( hasSpawnPreviewMimeData( event->mimeData() ) ){
+			if( beginOrMoveSpawnPreview( event->mimeData(), event->pos() ) ){
+				event->acceptProposedAction();
+				return;
+			}
+			event->ignore();
+			return;
+		}
+		QOpenGLWidget::dragMoveEvent( event );
+	}
+	void dragLeaveEvent( QDragLeaveEvent* event ) override {
+		cancelPresetPreview();
+		QOpenGLWidget::dragLeaveEvent( event );
+	}
+	void dropEvent( QDropEvent* event ) override {
+		if( !hasSpawnPreviewMimeData( event->mimeData() ) ){
+			QOpenGLWidget::dropEvent( event );
+			return;
+		}
+
+		setFocus();
+		if( !m_camwnd.m_parent->isActiveWindow() ){
+			m_camwnd.m_parent->activateWindow();
+			m_camwnd.m_parent->raise();
+		}
+
+		if( !beginOrMoveSpawnPreview( event->mimeData(), event->pos() ) ){
+			event->ignore();
+			return;
+		}
+
+		m_hasPresetDropIntersection = false;
+		selectSpawnPreviewInstances();
+		m_presetPreviewActive = false;
+		m_presetPreviewInstances.clear();
+
+		event->acceptProposedAction();
+	}
 private:
 	QMouseEvent scaledEvent( const QMouseEvent *event ) const {
 		return QMouseEvent( event->type(), event->localPos() * m_scale, event->windowPos() * m_scale, event->screenPos() * m_scale, event->button(), event->buttons(), event->modifiers() );
 	}
 	QWheelEvent scaledEvent( const QWheelEvent *event ) const {
 		return QWheelEvent( event->position() * m_scale, event->globalPosition() * m_scale, event->pixelDelta(), event->angleDelta(), event->buttons(), event->modifiers(), event->phase(), false );
+	}
+	void buildPresetDropDevicePoint( const QPoint& pos, float devicePoint[2], float deviceEpsilon[2] ) const {
+		const float x = static_cast<float>( pos.x() * m_scale );
+		const float y = static_cast<float>( pos.y() * m_scale );
+		const float width = static_cast<float>( m_camwnd.getCamera().width );
+		const float height = static_cast<float>( m_camwnd.getCamera().height );
+
+		devicePoint[0] = ( 2.0f * x / width ) - 1.0f;
+		devicePoint[1] = ( 2.0f * ( height - 1.0f - y ) / height ) - 1.0f;
+
+		deviceEpsilon[0] = 1.0f / width;
+		deviceEpsilon[1] = 1.0f / height;
+	}
+	void updatePresetDropIntersection( const QPoint& pos ){
+		float devicePoint[2];
+		float deviceEpsilon[2];
+		buildPresetDropDevicePoint( pos, devicePoint, deviceEpsilon );
+		m_hasPresetDropIntersection = m_presetPreviewActive
+			? Scene_IntersectClosestNotSelected( *m_camwnd.getCamera().m_view, devicePoint, deviceEpsilon, m_presetDropIntersection )
+			: Scene_IntersectClosest( *m_camwnd.getCamera().m_view, devicePoint, deviceEpsilon, m_presetDropIntersection );
+	}
+	Vector3 presetDropOriginForPos( const QPoint& pos ){
+		updatePresetDropIntersection( pos );
+
+		float devicePoint[2];
+		float deviceEpsilon[2];
+		buildPresetDropDevicePoint( pos, devicePoint, deviceEpsilon );
+
+		Vector3 origin;
+		if( m_hasPresetDropIntersection ){
+			origin = m_presetDropIntersection;
+		}
+		else{
+			if( m_presetPreviewActive ){
+				return m_presetPreviewOrigin;
+			}
+			Scene_Intersect( *m_camwnd.getCamera().m_view, devicePoint, deviceEpsilon, origin );
+		}
+
+		return vector3_snapped( origin, GetSnapGridSize() );
+	}
+	bool hasSpawnPreviewMimeData( const QMimeData* mimeData ) const {
+		return EntityPresetBrowser_hasMimeData( mimeData ) || ModelBrowser_hasMimeData( mimeData );
+	}
+	bool spawnPreviewFromMimeData( const QMimeData* mimeData, const Vector3& origin ){
+		if( EntityPresetBrowser_hasMimeData( mimeData ) ){
+			return EntityPresetBrowser_dropMimeData( mimeData, origin );
+		}
+		if( ModelBrowser_hasMimeData( mimeData ) ){
+			return ModelBrowser_dropMimeData( mimeData, origin );
+		}
+		return false;
+	}
+	bool beginOrMoveSpawnPreview( const QMimeData* mimeData, const QPoint& pos ){
+		const Vector3 origin = presetDropOriginForPos( pos );
+		if( !m_presetPreviewActive ){
+			if( !spawnPreviewFromMimeData( mimeData, origin ) ){
+				return false;
+			}
+			captureSpawnPreviewInstances();
+			if( m_presetPreviewInstances.empty() ){
+				return false;
+			}
+			GlobalSelectionSystem().setSelectedAll( false );
+			m_presetPreviewActive = true;
+			m_presetPreviewOrigin = origin;
+			m_camwnd.queue_draw();
+			return true;
+		}
+
+		const Vector3 translation = vector3_subtracted( origin, m_presetPreviewOrigin );
+		if( translation[0] != 0 || translation[1] != 0 || translation[2] != 0 ){
+			translateSpawnPreviewInstances( translation );
+			SceneChangeNotify();
+			m_presetPreviewOrigin = origin;
+			m_camwnd.queue_draw();
+		}
+		return true;
+	}
+	void cancelPresetPreview(){
+		m_hasPresetDropIntersection = false;
+		if( !m_presetPreviewActive ){
+			return;
+		}
+
+		selectSpawnPreviewInstances();
+		m_presetPreviewActive = false;
+		m_presetPreviewInstances.clear();
+		m_presetPreviewEntities.clear();
+		Select_Delete();
+		m_camwnd.queue_draw();
+	}
+	void captureSpawnPreviewInstances(){
+		m_presetPreviewInstances.clear();
+		m_presetPreviewEntities.clear();
+		class PreviewSelectionVisitor : public SelectionSystem::Visitor
+		{
+			std::vector<scene::Instance*>& m_instances;
+			std::vector<Entity*>& m_entities;
+		public:
+			PreviewSelectionVisitor( std::vector<scene::Instance*>& instances, std::vector<Entity*>& entities ) : m_instances( instances ), m_entities( entities ){
+			}
+			void visit( scene::Instance& instance ) const override {
+				m_instances.push_back( &instance );
+				Entity* entity = Node_getEntity( instance.path().top() );
+				if( entity == nullptr && instance.path().size() > 1 ){
+					entity = Node_getEntity( instance.path().parent() );
+				}
+				if( entity != nullptr && std::find( m_entities.begin(), m_entities.end(), entity ) == m_entities.end() ){
+					m_entities.push_back( entity );
+				}
+			}
+		} visitor( m_presetPreviewInstances, m_presetPreviewEntities );
+		GlobalSelectionSystem().foreachSelected( visitor );
+	}
+	void selectSpawnPreviewInstances(){
+		GlobalSelectionSystem().setSelectedAll( false );
+		for( scene::Instance* instance : m_presetPreviewInstances ){
+			if( instance != nullptr ){
+				Instance_setSelected( *instance, true );
+			}
+		}
+	}
+	void translateSpawnPreviewInstances( const Vector3& translation ){
+		for( Entity* entity : m_presetPreviewEntities ){
+			if( entity == nullptr ){
+				continue;
+			}
+
+			Vector3 origin;
+			if( string_parse_vector3( entity->getKeyValue( "origin" ), origin ) ){
+				entity->setKeyValue( "origin", StringStream<96>( origin[0] + translation[0], ' ', origin[1] + translation[1], ' ', origin[2] + translation[2] ) );
+			}
+		}
 	}
 };
 
@@ -2225,7 +2447,8 @@ void CamWnd::Cam_Draw(){
 		}
 
 		if( g_camwindow_globals_private.m_bShowSize && GlobalSelectionSystem().countSelected() != 0 ){
-			m_draw_size.render( renderer, m_state_text, m_view );
+			m_draw_size.update( m_view );
+			m_draw_size.render( renderer, m_state_text );
 		}
 
 		renderer.render( m_Camera.modelview, m_Camera.projection );
