@@ -113,6 +113,7 @@
 #include "textures.h"
 #include "texwindow.h"
 #include "modelwindow.h"
+#include "entitypresetbrowser.h"
 #include "url.h"
 #include "xywindow.h"
 #include "windowobservers.h"
@@ -737,6 +738,12 @@ void ModelBrowser_ToggleShow(){
 	GroupDialog_showPage( g_page_models );
 }
 
+QWidget* g_page_entity_presets;
+
+void EntityPresetBrowser_ToggleShow(){
+	GroupDialog_showPage( g_page_entity_presets );
+}
+
 
 static class EverySecondTimer
 {
@@ -964,6 +971,7 @@ void create_view_menu( QMenuBar *menubar, MainFrame::EViewStyle style ){
 	create_menu_item_with_mnemonic( menu, "Entity Inspector", "ToggleEntityInspector" );
 	create_menu_item_with_mnemonic( menu, "&Surface Inspector", "SurfaceInspector" );
 	create_menu_item_with_mnemonic( menu, "Entity List", "EntityList" );
+	create_menu_item_with_mnemonic( menu, "Entity Presets", "ToggleEntityPresets" );
 
 	menu->addSeparator();
 	{
@@ -1688,6 +1696,7 @@ void MainFrame::Create(){
 	}
 
 	g_page_models = GroupDialog_addPage( "Models", ModelBrowser_constructWindow( GroupDialog_getWindow() ), RawStringExportCaller( "Models" ) );
+	g_page_entity_presets = GroupDialog_addPage( "Entity Presets", EntityPresetBrowser_constructWindow( GroupDialog_getWindow() ), RawStringExportCaller( "Entity Presets" ) );
 
 	window->show();
 
@@ -1932,6 +1941,7 @@ void MainFrame::Shutdown(){
 	delete std::exchange( m_pXZWnd, nullptr );
 
 	ModelBrowser_destroyWindow();
+	EntityPresetBrowser_destroyWindow();
 	TextureBrowser_destroyWindow();
 
 	DeleteCamWnd( m_pCamWnd );
@@ -2099,6 +2109,7 @@ void MainFrame_Construct(){
 	GlobalCommands_insert( "ToggleEntityInspector", FreeCaller<EntityInspector_ToggleShow>(), QKeySequence( "N" ) );
 	GlobalCommands_insert( "ToggleModelBrowser", FreeCaller<ModelBrowser_ToggleShow>(), QKeySequence( "/" ) );
 	GlobalCommands_insert( "EntityList", FreeCaller<EntityList_toggleShown>(), QKeySequence( "L" ) );
+	GlobalCommands_insert( "ToggleEntityPresets", FreeCaller<EntityPresetBrowser_ToggleShow>() );
 
 	Select_registerCommands();
 

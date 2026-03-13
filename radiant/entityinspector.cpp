@@ -94,6 +94,207 @@ namespace
 typedef std::map<CopiedString, CopiedString> KeyValues;
 KeyValues g_selectedKeyValues;
 KeyValues g_selectedDefaultKeyValues;
+extern bool g_entityInspector_windowConstructed;
+extern QTreeWidget* g_entprops_store;
+
+constexpr int c_ziplineRestPointMax = 32;
+constexpr int c_ziplineDefaultRestPointCount = 16;
+
+struct SelectedEntityRef
+{
+	scene::Node* node{};
+	Entity* entity{};
+};
+
+bool is_zipline_entity( const Entity& entity ){
+	return string_equal( entity.getClassName(), "zipline" );
+}
+
+Vector3 entity_origin( const Entity& entity ){
+	Vector3 origin( 0, 0, 0 );
+	string_parse_vector3( entity.getKeyValue( "origin" ), origin );
+	return origin;
+}
+
+int zipline_rest_point_count( const Entity& entity ){
+	int highestIndex = -1;
+	for( int i = 0; i < c_ziplineRestPointMax; ++i ){
+		if( string_not_empty( entity.getKeyValue( StringStream<64>( "_zipline_rest_point_", i ) ) ) ){
+			highestIndex = i;
+		}
+	}
+	return highestIndex + 1;
+}
+
+SelectedEntityRef selected_single_entity(){
+	class SelectedEntityVisitor : public SelectionSystem::Visitor
+	{
+	public:
+		mutable std::size_t m_count{ 0 };
+		mutable SelectedEntityRef m_selected;
+
+		void visit( scene::Instance& instance ) const override {
+			++m_count;
+			if( m_count != 1 ){
+				m_selected = {};
+				return;
+			}
+
+			const scene::Path& path = instance.path();
+			Entity* entity = Node_getEntity( path.top() );
+			scene::Node* node = &path.top().get();
+			if( entity == nullptr && path.size() > 1 ){
+				entity = Node_getEntity( path.parent() );
+				node = &path.parent().get();
+			}
+
+			m_selected = { node, entity };
+		}
+	} visitor;
+
+	GlobalSelectionSystem().foreachSelected( visitor );
+	return visitor.m_count == 1 ? visitor.m_selected : SelectedEntityRef{};
+}
+
+SelectedEntityRef find_linked_zipline( const SelectedEntityRef& source ){
+	if( source.entity == nullptr || !is_zipline_entity( *source.entity ) ){
+		return {};
+	}
+
+	const char* desiredGuid = source.entity->getKeyValue( "link_to_guid_0" );
+	const char* compareKey = "link_guid";
+	if( string_empty( desiredGuid ) ){
+		desiredGuid = source.entity->getKeyValue( "link_guid" );
+		compareKey = "link_to_guid_0";
+	}
+	if( string_empty( desiredGuid ) ){
+		return {};
+	}
+
+	class LinkedZiplineFinder : public scene::Graph::Walker
+	{
+		Entity* m_sourceEntity;
+		const char* m_compareKey;
+		const char* m_desiredGuid;
+	public:
+		mutable SelectedEntityRef m_match;
+
+		LinkedZiplineFinder( Entity* sourceEntity, const char* compareKey, const char* desiredGuid ) :
+			m_sourceEntity( sourceEntity ),
+			m_compareKey( compareKey ),
+			m_desiredGuid( desiredGuid ){
+		}
+
+		bool pre( const scene::Path& path, scene::Instance& instance ) const override {
+			(void)path;
+			(void)instance;
+			return m_match.entity == nullptr;
+		}
+		void post( const scene::Path& path, scene::Instance& instance ) const override {
+			(void)instance;
+			if( m_match.entity != nullptr ){
+				return;
+			}
+
+			Entity* entity = Node_getEntity( path.top() );
+			scene::Node* node = &path.top().get();
+			if( entity == nullptr && path.size() > 1 ){
+				entity = Node_getEntity( path.parent() );
+				node = &path.parent().get();
+			}
+			if( entity == nullptr || entity == m_sourceEntity || !is_zipline_entity( *entity ) ){
+				return;
+			}
+			if( string_equal( entity->getKeyValue( m_compareKey ), m_desiredGuid ) ){
+				m_match = { node, entity };
+			}
+		}
+	} finder( source.entity, compareKey, desiredGuid );
+
+	GlobalSceneGraph().traverse( finder );
+	return finder.m_match;
+}
+
+Entity* pick_zipline_rest_point_target( const SelectedEntityRef& selected, const SelectedEntityRef& linked, const bool allowCreate, int& count ){
+	const int selectedCount = selected.entity != nullptr ? zipline_rest_point_count( *selected.entity ) : 0;
+	if( selectedCount > 0 ){
+		count = selectedCount;
+		return selected.entity;
+	}
+
+	const int linkedCount = linked.entity != nullptr ? zipline_rest_point_count( *linked.entity ) : 0;
+	if( linkedCount > 0 ){
+		count = linkedCount;
+		return linked.entity;
+	}
+
+	if( !allowCreate || linked.entity == nullptr ){
+		count = 0;
+		return nullptr;
+	}
+
+	count = c_ziplineDefaultRestPointCount;
+	const Vector3 selectedOrigin = entity_origin( *selected.entity );
+	const Vector3 linkedOrigin = entity_origin( *linked.entity );
+	return selectedOrigin[2] <= linkedOrigin[2] ? selected.entity : linked.entity;
+}
+
+CopiedString format_vector3_precise( const Vector3& value ){
+	return StringStream<96>( value[0], ' ', value[1], ' ', value[2] );
+}
+
+void zipline_write_rest_points( Entity& target, const Vector3& start, const Vector3& end, int count ){
+	count = std::max( 2, std::min( count, c_ziplineRestPointMax ) );
+
+	for( int i = 0; i < c_ziplineRestPointMax; ++i ){
+		target.setKeyValue( StringStream<64>( "_zipline_rest_point_", i ), "" );
+	}
+
+	const Vector3 delta = vector3_subtracted( end, start );
+	for( int i = 0; i < count; ++i ){
+		const float t = count > 1 ? static_cast<float>( i ) / static_cast<float>( count - 1 ) : 0.f;
+		const Vector3 point = vector3_added( start, vector3_scaled( delta, t ) );
+		const CopiedString pointString = format_vector3_precise( point );
+		target.setKeyValue( StringStream<64>( "_zipline_rest_point_", i ), pointString.c_str() );
+	}
+}
+
+bool regenerate_zipline_rest_points_for_selection( const bool allowCreate, const bool showError ){
+	const SelectedEntityRef selected = selected_single_entity();
+	if( selected.entity == nullptr || !is_zipline_entity( *selected.entity ) ){
+		if( showError ){
+			qt_MessageBox( g_entityInspector_windowConstructed ? g_entprops_store->window() : nullptr,
+				"Select a single zipline entity first." );
+		}
+		return false;
+	}
+
+	const SelectedEntityRef linked = find_linked_zipline( selected );
+	if( linked.entity == nullptr ){
+		if( showError ){
+			qt_MessageBox( g_entityInspector_windowConstructed ? g_entprops_store->window() : nullptr,
+				"Could not find the linked zipline endpoint for this entity." );
+		}
+		return false;
+	}
+
+	int restPointCount = 0;
+	Entity* target = pick_zipline_rest_point_target( selected, linked, allowCreate, restPointCount );
+	if( target == nullptr ){
+		if( showError ){
+			qt_MessageBox( g_entityInspector_windowConstructed ? g_entprops_store->window() : nullptr,
+				"This zipline pair has no existing rest points. Use Generate Zipline Rest Points to create them." );
+		}
+		return false;
+	}
+
+	const Vector3 selectedOrigin = entity_origin( *selected.entity );
+	const Vector3 linkedOrigin = entity_origin( *linked.entity );
+	const Vector3 start = selectedOrigin[2] <= linkedOrigin[2] ? selectedOrigin : linkedOrigin;
+	const Vector3 end = selectedOrigin[2] <= linkedOrigin[2] ? linkedOrigin : selectedOrigin;
+	zipline_write_rest_points( *target, start, end, restPointCount );
+	return true;
+}
 }
 
 const char* SelectedEntity_getValueForKey( const char* key ){
@@ -705,6 +906,7 @@ QLineEdit* g_entityKeyEntry;
 QLineEdit* g_entityValueEntry;
 
 QToolButton* g_focusToggleButton;
+QPushButton* g_generateZiplineRestPointsButton = nullptr;
 
 QTreeWidget* g_entprops_store;
 QLineEdit* g_inlineEditor = nullptr;
@@ -712,6 +914,7 @@ QTreeWidgetItem* g_editingItem = nullptr;
 int g_editingColumn = -1;
 const EntityClass* g_current_flags = 0;
 const EntityClass* g_current_attributes = 0;
+bool g_updatingZiplineRestPoints = false;
 
 // the number of active spawnflags
 int g_spawnflag_count;
@@ -1309,6 +1512,13 @@ void EntityInspector_updateKeyValues(){
 	for ( EntityAttribute *attr : g_entityAttributes ){
 		attr->update();
 	}
+
+	const SelectedEntityRef selected = selected_single_entity();
+	const bool showZiplineControls = selected.entity != nullptr && is_zipline_entity( *selected.entity );
+	if( g_generateZiplineRestPointsButton != nullptr ){
+		g_generateZiplineRestPointsButton->setVisible( showZiplineControls );
+		g_generateZiplineRestPointsButton->setEnabled( showZiplineControls );
+	}
 }
 
 class EntityInspectorDraw
@@ -1324,12 +1534,43 @@ public:
 
 EntityInspectorDraw g_EntityInspectorDraw;
 
+void EntityInspector_generateZiplineRestPoints(){
+	if( g_updatingZiplineRestPoints ){
+		return;
+	}
+
+	g_updatingZiplineRestPoints = true;
+	{
+		UndoableCommand undo( "generateZiplineRestPoints" );
+		regenerate_zipline_rest_points_for_selection( true, true );
+	}
+	g_updatingZiplineRestPoints = false;
+	g_EntityInspectorDraw.queueDraw();
+}
+
+void EntityInspector_tryAutoUpdateZiplineRestPoints(){
+	if( g_updatingZiplineRestPoints ){
+		return;
+	}
+
+	const SelectedEntityRef selected = selected_single_entity();
+	if( selected.entity == nullptr || !is_zipline_entity( *selected.entity ) ){
+		return;
+	}
+
+	g_updatingZiplineRestPoints = true;
+	regenerate_zipline_rest_points_for_selection( false, false );
+	g_updatingZiplineRestPoints = false;
+}
 
 void EntityInspector_keyValueChanged(){
+	if( g_entityInspector_windowConstructed ){
+		EntityInspector_tryAutoUpdateZiplineRestPoints();
+	}
 	g_EntityInspectorDraw.queueDraw();
 }
 void EntityInspector_selectionChanged( const Selectable& ){
-	EntityInspector_keyValueChanged();
+	g_EntityInspectorDraw.queueDraw();
 }
 
 void EntityInspector_applyKeyValue(){
@@ -1448,6 +1689,8 @@ g_pressedKeysFilter;
 
 void EntityInspector_destroyWindow(){
 	g_entityInspector_windowConstructed = false;
+	g_generateZiplineRestPointsButton = nullptr;
+	g_updatingZiplineRestPoints = false;
 	GlobalEntityAttributes_clear();
 	MapEntitiesList_clear();
 }
@@ -1705,6 +1948,14 @@ QWidget* EntityInspector_constructWindow( QWidget* toplevel ){
 				auto b = new QPushButton( "✕ Delete" );
 				b->setToolTip( "Delete selected property" );
 				QObject::connect( b, &QAbstractButton::clicked, EntityInspector_clearKeyValue );
+				btnLayout->addWidget( b );
+			}
+			{
+				auto b = g_generateZiplineRestPointsButton = new QPushButton( "Generate Zipline Rest Points" );
+				b->setToolTip( "Regenerate existing zipline rest points, or create them if this linked pair has none." );
+				b->setVisible( false );
+				b->setEnabled( false );
+				QObject::connect( b, &QAbstractButton::clicked, EntityInspector_generateZiplineRestPoints );
 				btnLayout->addWidget( b );
 			}
 

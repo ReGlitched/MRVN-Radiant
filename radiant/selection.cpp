@@ -7714,6 +7714,50 @@ void Scene_TestSelect_Primitive( Selector& selector, SelectionTest& test, const 
 	Scene_forEachVisible( GlobalSceneGraph(), volume, testselect_primitive_visible( selector, test ) );
 }
 
+void Scene_TestSelect_Primitive_NotSelected( Selector& selector, SelectionTest& test, const VolumeTest& volume ){
+	class testselect_primitive_visible_world_only : public scene::Graph::Walker
+	{
+		Selector& m_selector;
+		SelectionTest& m_test;
+	public:
+		testselect_primitive_visible_world_only( Selector& selector, SelectionTest& test )
+			: m_selector( selector ), m_test( test ){
+		}
+		bool pre( const scene::Path& path, scene::Instance& instance ) const {
+			if( Instance_isSelected( instance ) || instance.childSelected() || instance.parentSelected() ){
+				return false;
+			}
+			if( Instance_getBrush( instance ) == 0 && Instance_getPatch( instance ) == 0 ){
+				return true;
+			}
+
+			Selectable* selectable = Instance_getSelectable( instance );
+			if ( selectable != 0 ) {
+				m_selector.pushSelectable( *selectable );
+			}
+
+			SelectionTestable* selectionTestable = Instance_getSelectionTestable( instance );
+			if ( selectionTestable ) {
+				selectionTestable->testSelect( m_selector, m_test );
+			}
+
+			return true;
+		}
+		void post( const scene::Path& path, scene::Instance& instance ) const {
+			if( Instance_getBrush( instance ) == 0 && Instance_getPatch( instance ) == 0 ){
+				return;
+			}
+
+			Selectable* selectable = Instance_getSelectable( instance );
+			if ( selectable != 0 ) {
+				m_selector.popSelectable();
+			}
+		}
+	};
+
+	Scene_forEachVisible( GlobalSceneGraph(), volume, testselect_primitive_visible_world_only( selector, test ) );
+}
+
 void Scene_TestSelect_Component_Selected( Selector& selector, SelectionTest& test, const VolumeTest& volume, SelectionSystem::EComponentMode componentMode ){
 	Scene_forEachVisible( GlobalSceneGraph(), volume, testselect_component_visible_selected( selector, test, componentMode ) );
 }
@@ -7738,7 +7782,7 @@ void RadiantSelectionSystem::Scene_TestSelect( Selector& selector, SelectionTest
 }
 
 
-void Scene_Intersect( const View& view, const float device_point[2], const float device_epsilon[2], Vector3& intersection ){
+bool Scene_IntersectClosest( const View& view, const float device_point[2], const float device_epsilon[2], Vector3& intersection ){
 	View scissored( view );
 	ConstructSelectionTest( scissored, SelectionBoxForPoint( device_point, device_epsilon ) );
 	SelectionVolume test( scissored );
@@ -7749,12 +7793,41 @@ void Scene_Intersect( const View& view, const float device_point[2], const float
 	test.BeginMesh( g_matrix4_identity, true );
 	if( bestPointSelector.isSelected() ){
 		intersection = vector4_projected( matrix4_transformed_vector4( test.getScreen2world(), Vector4( 0, 0, bestPointSelector.best().depth(), 1 ) ) );
+		return true;
 	}
-	else{
-		const Vector3 pnear = vector4_projected( matrix4_transformed_vector4( test.getScreen2world(), Vector4( 0, 0, -1, 1 ) ) );
-		const Vector3 pfar = vector4_projected( matrix4_transformed_vector4( test.getScreen2world(), Vector4( 0, 0, 1, 1 ) ) );
-		intersection = vector3_normalised( pfar - pnear ) * 256.f + pnear;
+
+	return false;
+}
+
+bool Scene_IntersectClosestNotSelected( const View& view, const float device_point[2], const float device_epsilon[2], Vector3& intersection ){
+	View scissored( view );
+	ConstructSelectionTest( scissored, SelectionBoxForPoint( device_point, device_epsilon ) );
+	SelectionVolume test( scissored );
+
+	BestPointSelector bestPointSelector;
+	Scene_TestSelect_Primitive_NotSelected( bestPointSelector, test, scissored );
+
+	test.BeginMesh( g_matrix4_identity, true );
+	if( bestPointSelector.isSelected() ){
+		intersection = vector4_projected( matrix4_transformed_vector4( test.getScreen2world(), Vector4( 0, 0, bestPointSelector.best().depth(), 1 ) ) );
+		return true;
 	}
+
+	return false;
+}
+
+void Scene_Intersect( const View& view, const float device_point[2], const float device_epsilon[2], Vector3& intersection ){
+	if( Scene_IntersectClosest( view, device_point, device_epsilon, intersection ) ){
+		return;
+	}
+
+	View scissored( view );
+	ConstructSelectionTest( scissored, SelectionBoxForPoint( device_point, device_epsilon ) );
+	SelectionVolume test( scissored );
+	test.BeginMesh( g_matrix4_identity, true );
+	const Vector3 pnear = vector4_projected( matrix4_transformed_vector4( test.getScreen2world(), Vector4( 0, 0, -1, 1 ) ) );
+	const Vector3 pfar = vector4_projected( matrix4_transformed_vector4( test.getScreen2world(), Vector4( 0, 0, 1, 1 ) ) );
+	intersection = vector3_normalised( pfar - pnear ) * 256.f + pnear;
 }
 
 class FreezeTransforms : public scene::Graph::Walker

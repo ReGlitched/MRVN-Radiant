@@ -22,6 +22,7 @@ add_executable(radiant
                eclass_xml.cpp
                entityinspector.cpp
                entitylist.cpp
+               entitypresetbrowser.cpp
                entity.cpp
                environment.cpp
                error.cpp

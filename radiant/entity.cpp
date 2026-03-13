@@ -375,6 +375,13 @@ AABB Doom3Light_getBounds( const AABB& workzone ){
 
 
 int g_iLastLightIntensity = 300;
+bool g_entityCreateSuppressModelPrompt = false;
+
+bool Entity_setSuppressModelPrompt( bool suppress ){
+	const bool previous = g_entityCreateSuppressModelPrompt;
+	g_entityCreateSuppressModelPrompt = suppress;
+	return previous;
+}
 
 void Entity_createFromSelection( const char* name, const Vector3& origin ){
 #if 0
@@ -488,7 +495,9 @@ void Entity_createFromSelection( const char* name, const Vector3& origin ){
 		}
 	}
 
-	if ( isModel && string_empty( EntityClass_valueForKey( *entityClass, entityClass->miscmodel_key() ) ) ) { // handle set default model key value : no dialog needed
+	if ( !g_entityCreateSuppressModelPrompt
+	  && isModel
+	  && string_empty( EntityClass_valueForKey( *entityClass, entityClass->miscmodel_key() ) ) ) { // handle set default model key value : no dialog needed
 		const char* model = misc_model_dialog( MainFrame_getWindow() );
 		if ( model != 0 ) {
 			entity->setKeyValue( entityClass->miscmodel_key(), model );

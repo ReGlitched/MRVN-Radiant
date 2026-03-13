@@ -21,6 +21,9 @@
 
 #pragma once
 
+template<typename Element> class BasicVector3;
+typedef BasicVector3<float> Vector3;
+class QMimeData;
 
 void ModelBrowser_Construct();
 void ModelBrowser_Destroy();
@@ -30,3 +33,6 @@ class QWidget* ModelBrowser_constructWindow( QWidget* toplevel );
 void ModelBrowser_destroyWindow();
 
 void ModelBrowser_flushReferences();
+
+bool ModelBrowser_hasMimeData( const QMimeData* mimeData );
+bool ModelBrowser_dropMimeData( const QMimeData* mimeData, const Vector3& origin );

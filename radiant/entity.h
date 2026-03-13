@@ -24,6 +24,7 @@
 template<typename Element> class BasicVector3;
 typedef BasicVector3<float> Vector3;
 void Entity_createFromSelection( const char* name, const Vector3& origin );
+bool Entity_setSuppressModelPrompt( bool suppress );
 
 void Scene_EntitySetKeyValue_Selected( const char* key, const char* value );
 void Scene_EntitySetClassname_Selected( const char* classname );
