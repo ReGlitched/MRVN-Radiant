@@ -21,7 +21,13 @@
 
 #include "entitypresetbrowser.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <QAbstractItemView>
@@ -64,6 +70,7 @@
 #include "grid.h"
 #include "gtkutil/glwidget.h"
 #include "gtkutil/guisettings.h"
+#include "ifilesystem.h"
 #include "igl.h"
 #include "imodel.h"
 #include "ientity.h"
@@ -90,6 +97,137 @@ namespace
 {
 constexpr int c_PresetIndexRole = Qt::ItemDataRole::UserRole;
 constexpr const char* c_PresetMimeType = "application/x-radiant-entity-preset";
+
+class PresetModelRotationOverrides
+{
+	std::unordered_map<std::string, Vector3> m_overrides;
+
+	static bool hasPrefix( const std::string& str, const char* prefix ){
+		const std::size_t prefixLen = std::strlen( prefix );
+		return str.size() >= prefixLen && str.compare( 0, prefixLen, prefix ) == 0;
+	}
+
+	static std::string normalisePath( const char* path ){
+		std::string result;
+		if( path != nullptr ){
+			result = path;
+		}
+
+		std::replace( result.begin(), result.end(), '\\', '/' );
+		std::transform( result.begin(), result.end(), result.begin(), []( unsigned char c ){
+			return static_cast<char>( std::tolower( c ) );
+		} );
+
+		while( hasPrefix( result, "./" ) ){
+			result.erase( 0, 2 );
+		}
+		return result;
+	}
+
+	static bool parseQuotedString( const std::string& text, std::size_t& pos, std::string& out ){
+		while( pos < text.size() && text[pos] != '"' ){
+			++pos;
+		}
+		if( pos >= text.size() ){
+			return false;
+		}
+
+		++pos;
+		out.clear();
+		while( pos < text.size() ){
+			const char c = text[pos++];
+			if( c == '"' ){
+				return true;
+			}
+
+			if( c == '\\' && pos < text.size() ){
+				const char escaped = text[pos];
+				switch( escaped ){
+				case '"': out.push_back( '"' ); ++pos; continue;
+				case '\\': out.push_back( '\\' ); ++pos; continue;
+				case '/': out.push_back( '/' ); ++pos; continue;
+				case 'n': out.push_back( '\n' ); ++pos; continue;
+				case 'r': out.push_back( '\r' ); ++pos; continue;
+				case 't': out.push_back( '\t' ); ++pos; continue;
+				default:
+					out.push_back( '\\' );
+					continue;
+				}
+			}
+
+			out.push_back( c );
+		}
+
+		return false;
+	}
+
+	static bool parseRotation( const std::string& value, Vector3& rotation ){
+		std::string cleaned = value;
+		std::replace( cleaned.begin(), cleaned.end(), ',', ' ' );
+
+		float x = 0.f;
+		float y = 0.f;
+		float z = 0.f;
+		if( std::sscanf( cleaned.c_str(), "%f %f %f", &x, &y, &z ) == 3 ){
+			rotation = Vector3( x, y, z );
+			return true;
+		}
+
+		return false;
+	}
+
+	void reload(){
+		m_overrides.clear();
+
+		void* buffer = nullptr;
+		const int size = vfsLoadFile( "models/rotation_overrides.json", &buffer );
+		if( size <= 0 || buffer == nullptr ){
+			return;
+		}
+
+		const std::string text( static_cast<const char*>( buffer ), static_cast<std::size_t>( size ) );
+		vfsFreeFile( buffer );
+
+		std::size_t pos = 0;
+		std::string modelPath;
+		std::string rotationText;
+		while( parseQuotedString( text, pos, modelPath ) && parseQuotedString( text, pos, rotationText ) ){
+			Vector3 rotation;
+			if( !parseRotation( rotationText, rotation ) ){
+				continue;
+			}
+
+			const std::string key = normalisePath( modelPath.c_str() );
+			if( key.empty() ){
+				continue;
+			}
+
+			m_overrides[key] = rotation;
+		}
+	}
+public:
+	static PresetModelRotationOverrides& instance(){
+		static PresetModelRotationOverrides overrides;
+		return overrides;
+	}
+
+	bool lookup( const char* modelPath, Vector3& rotation ){
+		reload();
+
+		const std::string key = normalisePath( modelPath );
+		if( key.empty() ){
+			return false;
+		}
+
+		const auto i = m_overrides.find( key );
+		if( i == m_overrides.end() ){
+			return false;
+		}
+
+		rotation = i->second;
+		return true;
+	}
+};
 
 class EntityPresetBrowser;
 
@@ -326,6 +464,36 @@ QString default_name_for_entity( const Entity& entity ){
 	}
 
 	return "Preset";
+}
+
+void normalize_preset_preview_angles( Vector3& angles ){
+	angles[0] = static_cast<float>( float_mod( angles[0], 360 ) );
+	angles[1] = static_cast<float>( float_mod( angles[1], 360 ) );
+	angles[2] = static_cast<float>( float_mod( angles[2], 360 ) );
+}
+
+Vector3 preset_preview_angles( const EntityPresetEntity& presetEntity ){
+	Vector3 angles( 0, 0, 0 );
+	const char* anglesValue = presetEntity.valueForKey( "angles" );
+	if( string_not_empty( anglesValue ) ){
+		Vector3 sourceAngles;
+		if( string_parse_vector3( anglesValue, sourceAngles ) ){
+			angles = Vector3( sourceAngles[2], sourceAngles[0], sourceAngles[1] );
+			normalize_preset_preview_angles( angles );
+			return angles;
+		}
+	}
+
+	const char* angleValue = presetEntity.valueForKey( "angle" );
+	if( string_not_empty( angleValue ) ){
+		if( string_parse_float( angleValue, angles[2] ) ){
+			angles[0] = 0;
+			angles[1] = 0;
+			normalize_preset_preview_angles( angles );
+		}
+	}
+
+	return angles;
 }
 
 EntityPreset preset_from_entity( const Entity& entity, const QString& name, const QString& category, const QString& description ){
@@ -1041,6 +1209,8 @@ struct PresetPreviewModel
 {
 	CopiedString modelPath;
 	Vector3 origin;
+	Vector3 angles;
+	Vector3 modelRotation;
 };
 
 class PresetModelPreviewWidget : public QOpenGLWidget
@@ -1217,7 +1387,11 @@ public:
 			const_cast<Matrix4&>( transformNode->localToParent() ) =
 				matrix4_multiplied_by_matrix4(
 					globalTransform,
-					matrix4_translation_for_vec3( m_models[i].origin ) );
+					matrix4_multiplied_by_matrix4(
+						matrix4_translation_for_vec3( m_models[i].origin ),
+						matrix4_multiplied_by_matrix4(
+							matrix4_rotation_for_euler_xyz_degrees( m_models[i].angles ),
+							matrix4_rotation_for_euler_xyz_degrees( m_models[i].modelRotation ) ) ) );
 			m_instances[i]->parent()->transformChangedLocal();
 			m_instances[i]->transformChangedLocal();
 		}
@@ -1618,6 +1792,9 @@ class EntityPresetBrowser
 				PresetPreviewModel previewModel;
 				previewModel.modelPath = modelPath;
 				previewModel.origin = vector3_subtracted( origin, anchorOrigin );
+				previewModel.angles = preset_preview_angles( presetEntity );
+				previewModel.modelRotation = g_vector3_identity;
+				PresetModelRotationOverrides::instance().lookup( modelPath, previewModel.modelRotation );
 				previewModels.push_back( std::move( previewModel ) );
 			}
 
